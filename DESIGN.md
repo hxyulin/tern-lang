@@ -1615,6 +1615,18 @@ in `toolchain/stage1`. Its lexer follows this document: Go's semicolon
 rule, nested block comments, and `StrStart`, `StrMid` and `StrEnd` tokens
 for interpolation. A line may not end inside an interpolation.
 
+Decided the same day:
+
+- **Parser:** hand-written recursive descent, one function per rule of
+  the tree-sitter grammar. It prints its tree in tree-sitter's
+  S-expression form, so the tests compare it with every corpus tree, and
+  every `:error` input must produce a diagnostic. The grammar is the
+  specification and the corpus is the parser's test suite.
+- **Syntax tree:** expressions, types, statements and patterns live in
+  arenas and refer to each other by index.
+- **Scope:** the whole language except concurrency and the details of C
+  interop, aiming first to compile `examples/ini`.
+
 ## Deferred
 
 ### Nested functions

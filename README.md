@@ -30,13 +30,15 @@ npm test
 ## Compiler
 
 [toolchain/](toolchain) is a Cargo workspace. `stage1` is the bootstrap
-compiler, written in Rust. So far it only lexes:
+compiler, written in Rust. So far it lexes and parses:
 
 ```
 cd toolchain
 cargo test
-cargo run -- lex ../examples/uart/main.tern
+cargo run -- parse ../examples/uart/main.tern
 ```
 
-The tests lex every program in `examples/` and every corpus input the
-grammar accepts.
+`parse` prints the tree in tree-sitter's S-expression form. The tests
+parse every program in `examples/`, compare the tree for every corpus
+input the grammar accepts with tree-sitter's, and check that every input
+the grammar rejects gets an error.
