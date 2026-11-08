@@ -16,7 +16,7 @@ LR(1) conflicts. The tests in `tree-sitter/test/corpus` include code the
 grammar must reject.
 
 [examples/](examples) holds small programs written in the designed syntax.
-`npm test` also parses them. Nothing type-checks them yet.
+`npm test` also parses them, and the compiler's tests type-check them.
 
 The flake provides the tree-sitter CLI. Generating the parser also needs
 Node.js on the `PATH`.
@@ -30,21 +30,23 @@ npm test
 ## Compiler
 
 [toolchain/](toolchain) is a Cargo workspace. `stage1` is the bootstrap
-compiler, written in Rust. So far it lexes and parses:
+compiler, written in Rust. So far it parses and checks; it does not
+generate code yet.
 
 ```
 cd toolchain
 cargo test
+cargo run -- check ../examples/ini
 cargo run -- parse ../examples/uart/main.tern
 ```
 
-`parse` prints the tree in tree-sitter's S-expression form. `check DIR`
-loads the package in `DIR` and every package it imports; so far it
-reports parse, import, name and type errors.
+- `check DIR` loads the package in `DIR` and every package it imports,
+  and reports parse, import, name and type errors.
+- `parse FILE` prints the syntax tree in tree-sitter's S-expression form.
+
+The tests parse every program in `examples/`, compare the tree for every
+corpus input the grammar accepts with tree-sitter's, check that every
+input the grammar rejects gets an error, and type-check the examples.
 
 [toolchain/std](toolchain/std) is the standard library, written in tern
-over the C library. Nothing compiles it to machine code yet; the tests check that it and
-the examples parse, resolve and type-check. The tests
-parse every program in `examples/`, compare the tree for every corpus
-input the grammar accepts with tree-sitter's, and check that every input
-the grammar rejects gets an error.
+over the C library.
