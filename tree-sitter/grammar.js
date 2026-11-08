@@ -58,6 +58,7 @@ module.exports = grammar({
       'import',
       'as',
       'pub',
+      'unsafe',
     ],
   },
 
@@ -93,9 +94,11 @@ module.exports = grammar({
 
 
     // fn name(params) -> Result { ... }
+    // An unsafe fn can be called only inside an unsafe block.
     function_declaration: ($) =>
       seq(
         optional(field('visibility', $.visibility)),
+        optional(field('safety', $.unsafe)),
         'fn',
         field('name', $.identifier),
         field('parameters', $.parameter_list),
@@ -241,6 +244,7 @@ module.exports = grammar({
         $.break_statement,
         $.continue_statement,
         $.defer_statement,
+        $.unsafe_statement,
         $.assignment_statement,
         $.expression_statement,
       ),
@@ -296,6 +300,11 @@ module.exports = grammar({
     // inclusive form.
     range: ($) => seq(field('start', $._additive_level), '..', field('end', $._additive_level)),
 
+    unsafe: (_) => 'unsafe',
+
+    // unsafe { ... }: a block where unchecked operations are allowed.
+    unsafe_statement: ($) => seq('unsafe', field('body', $.block)),
+
     // Runs the call when the enclosing block ends.
     defer_statement: ($) => seq('defer', field('call', $.call_expression)),
 
@@ -342,7 +351,12 @@ module.exports = grammar({
         $.or_expression,
         $.if_expression,
         $.match_expression,
+        $.unsafe_expression,
+        $.array_literal,
       ),
+
+    // let p: *u32 = unsafe { from_address[*u32](0x4000_0000) }
+    unsafe_expression: ($) => seq('unsafe', field('body', $.branch)),
 
     // Each arm is one expression, as in an if expression.
     match_expression: ($) =>
@@ -449,7 +463,7 @@ module.exports = grammar({
     try_expression: ($) => seq('try', field('operand', $._unary_level)),
 
     unary_expression: ($) =>
-      seq(field('operator', choice('-', '!', '~')), field('operand', $._unary_level)),
+      seq(field('operator', choice('-', '!', '~', '&')), field('operand', $._unary_level)),
 
     _postfix: ($) =>
       choice(
@@ -458,7 +472,11 @@ module.exports = grammar({
         $.field_expression,
         $.construct_expression,
         $.index_expression,
+        $.dereference_expression,
       ),
+
+    // p.* reads or writes through a raw pointer, inside unsafe. From Zig.
+    dereference_expression: ($) => seq(field('pointer', $._postfix), '.*'),
 
     _primary: ($) =>
       choice(
@@ -469,7 +487,6 @@ module.exports = grammar({
         $.tuple_literal,
         $.string_literal,
         $.char_literal,
-        $.array_literal,
       ),
 
     // "count: {n}\n". Printable ASCII only; other bytes need escapes.
@@ -523,10 +540,29 @@ module.exports = grammar({
         field('value', choice($.tuple_literal, $.parenthesized_expression)),
       ),
 
-    // v[i]. Also type arguments to built-ins, as in truncate[u8](x); the
-    // checker tells them apart, as Go's does.
+    // v[i], s[a..b], and type arguments: truncate[u8](x),
+    // from_address[*u32](a). A named type parses as an expression and the
+    // checker reads it as a type. Other types are accepted directly when
+    // they cannot start an expression; a tuple type can, so it needs a
+    // named type here.
     index_expression: ($) =>
-      seq(field('value', $._postfix), '[', field('index', choice($._expression, $.slice)), ']'),
+      seq(
+        field('value', $._postfix),
+        '[',
+        field(
+          'index',
+          choice(
+            $._expression,
+            $.slice,
+            $.pointer_type,
+            $.optional_type,
+            $.view_type,
+            $.array_type,
+            $.function_type,
+          ),
+        ),
+        ']',
+      ),
 
     // s[a..b], s[a..], s[..b]. Ends can be omitted only here.
     slice: ($) =>
@@ -535,8 +571,11 @@ module.exports = grammar({
         seq('..', field('end', $._additive_level)),
       ),
 
-    // [1, 2, 3], typed from context.
-    array_literal: ($) => seq('[', commaSep($._expression), ']'),
+    // [1, 2, 3], typed from context. Like an if expression, it sits at the
+    // top of an expression only. As an operand, `[4]*u8` and `[2](x)` would
+    // be ambiguous with array types in a type argument. At least one
+    // element: `[]` would be ambiguous with the view type `[]T`.
+    array_literal: ($) => seq('[', commaSep1($._expression), ']'),
 
     // Tokens
 

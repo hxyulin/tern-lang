@@ -98,6 +98,7 @@ The running list. Each new keyword needs a reason.
 | `try` | return early on `err` or `none` |
 | `import`, `as` | import a package, renaming it on a clash |
 | `pub` | visible outside the package |
+| `unsafe` | unchecked operations, and functions with unchecked preconditions |
 
 Planned by earlier decisions: `unsafe`. `true` and `false` are predeclared
 names, not keywords, as in Go.
@@ -476,6 +477,12 @@ patterns.
 them apart, as in Go. A highlighter cannot color a type argument
 differently without name resolution.
 
+A named type in brackets parses as a name. Types that cannot start an
+expression are accepted directly: `from_address[*u32](a)`,
+`cast[[]u8](x)`, `cast[?*u8](x)`, `cast[fn(i32) -> bool](f)`. A tuple type
+can start an expression, so a tuple type argument needs a named type.
+Found when `from_address[*u32]` failed to parse on 2026-11-08.
+
 ### Errors as values
 
 **Decided (2026-11-08).** A built-in result type and one propagation
@@ -849,7 +856,12 @@ var table: [256]u8 = fill[256](0)
 ```
 
 - An array literal `[a, b, c]` takes its type from context, like a number
-  literal.
+  literal. It has at least one element.
+- Like an `if` expression, an array literal sits at the top of an
+  expression only: no `[1, 2][i]`, and `a == ([1, 2])` needs parentheses.
+  Found by the grammar on 2026-11-08: as an operand, `[4]*u8` and
+  `[2](x)` read as either a literal or an array type in a type argument,
+  and an empty `[]` reads as the start of a view type.
 - A repeated value uses the built-in `fill[N](value)`. Rust's `[0; 256]`
   would put a `;` inside brackets, which reads badly next to the semicolon
   rule.
@@ -893,6 +905,42 @@ interop and intrusive lists. Creating, storing and comparing a raw pointer
 is safe. Dereferencing one requires `unsafe`. Volatile loads and stores are
 intrinsics on raw pointers, not a separate pointer type. From Rust's raw
 pointers and Zig's pointers.
+
+**Decided (2026-11-08), syntax from Zig:**
+
+```
+var x: u32 = 0
+let p: *u32 = &x
+let uart: *u32 = unsafe { from_address[*u32](0x4000_0000) }
+unsafe {
+    p.* = 5
+    h.*.next.*.len = 0
+}
+```
+
+- `&x` makes a `*T`. `p.*` dereferences; it is postfix, so it chains left
+  to right. `.*` is one token, so `p.*= 1` cannot lex as `.` and `*=`.
+- A `*T` is never null. `?*T` is the nullable pointer, the same size as
+  `*T`, and null checks go through `match`.
+- An integer address becomes a pointer through the built-in
+  `from_address[*T](n)`. Offsets use `offset(p, n)`; `+` never applies to
+  pointers.
+
+### `unsafe`
+
+**Decided (2026-11-08).**
+
+- `unsafe { ... }` is a block where unchecked operations are allowed.
+  Like `if`, it also has an expression form holding one expression:
+  `let p: *u32 = unsafe { from_address[*u32](a) }`.
+- An `unsafe fn` has preconditions the compiler cannot check, and can be
+  called only inside `unsafe`.
+- A lint requires a `// SAFETY:` comment above each `unsafe` block, so the
+  reviewer reads why it is sound. From Rust's lints.
+
+**Deferred** to a part on C interop and layout: untagged unions, and an
+attribute syntax for packed and aligned layout, interrupt handlers and
+`extern` functions.
 
 The user asked whether a systems language needs storable references. The
 answer recorded here: safe code covers passing, returning, views and

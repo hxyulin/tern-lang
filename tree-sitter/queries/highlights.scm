@@ -1,4 +1,6 @@
-["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as"] @keyword
+["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as" "unsafe"] @keyword
+
+(unsafe) @keyword
 
 (visibility) @keyword
 
@@ -33,7 +35,7 @@
 
 [(line_comment) (block_comment)] @comment
 
-["?" "+" "-" "*" "/" "%" "&" "|" "^" "<<" ">>" "~" "!" "&&" "||"
+[".*" "?" "+" "-" "*" "/" "%" "&" "|" "^" "<<" ">>" "~" "!" "&&" "||"
  "==" "!=" "<" "<=" ">" ">="
  "=" "+=" "-=" "*=" "/=" "%=" "&=" "|=" "^=" "<<=" ">>="] @operator
 

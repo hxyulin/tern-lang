@@ -1,0 +1,118 @@
+================================================================================
+Unsafe blocks, functions and pointers
+================================================================================
+
+pub unsafe fn write_reg(p: *u32, v: u32) {
+    volatile_store(p, v)
+}
+
+fn f() {
+    var x: u32 = 0
+    let p: *u32 = &x
+    let q: ?*u32 = none
+    let uart: *u32 = unsafe { from_address[*u32](0x4000_0000) }
+    // SAFETY: p points to x, which is live.
+    unsafe {
+        p.* = 5
+        p.* += 1
+        h.*.next.*.len = 0
+        write_reg(uart, p.* & 0xFF)
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (visibility)
+    (unsafe)
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (pointer_type
+          (type_name
+            (identifier))))
+      (parameter
+        (identifier)
+        (type_name
+          (identifier))))
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (identifier))
+            (argument
+              (identifier)))))))
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (var_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (integer_literal))
+      (let_declaration
+        (identifier)
+        (pointer_type
+          (type_name
+            (identifier)))
+        (unary_expression
+          (identifier)))
+      (let_declaration
+        (identifier)
+        (optional_type
+          (pointer_type
+            (type_name
+              (identifier))))
+        (identifier))
+      (let_declaration
+        (identifier)
+        (pointer_type
+          (type_name
+            (identifier)))
+        (unsafe_expression
+          (branch
+            (call_expression
+              (index_expression
+                (identifier)
+                (pointer_type
+                  (type_name
+                    (identifier))))
+              (argument_list
+                (argument
+                  (integer_literal)))))))
+      (line_comment)
+      (unsafe_statement
+        (block
+          (assignment_statement
+            (dereference_expression
+              (identifier))
+            (integer_literal))
+          (assignment_statement
+            (dereference_expression
+              (identifier))
+            (integer_literal))
+          (assignment_statement
+            (field_expression
+              (dereference_expression
+                (field_expression
+                  (dereference_expression
+                    (identifier))
+                  (identifier)))
+              (identifier))
+            (integer_literal))
+          (expression_statement
+            (call_expression
+              (identifier)
+              (argument_list
+                (argument
+                  (identifier))
+                (argument
+                  (bit_and_expression
+                    (dereference_expression
+                      (identifier))
+                    (integer_literal)))))))))))

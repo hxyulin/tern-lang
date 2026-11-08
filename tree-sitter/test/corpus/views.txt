@@ -225,3 +225,98 @@ fn f() {
           (identifier)
           (integer_literal))
         (integer_literal)))))
+
+================================================================================
+Type arguments
+================================================================================
+
+fn f() {
+    let a: []u8 = cast[[]u8](x)
+    let b: [4]u8 = cast[[4]u8](x)
+    let c: ?*u8 = cast[?*u8](x)
+    let d: Less = cast[fn(i32, i32) -> bool](x)
+    let e: [2][]u8 = [p, q]
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_declaration
+        (identifier)
+        (view_type
+          (type_name
+            (identifier)))
+        (call_expression
+          (index_expression
+            (identifier)
+            (view_type
+              (type_name
+                (identifier))))
+          (argument_list
+            (argument
+              (identifier)))))
+      (let_declaration
+        (identifier)
+        (array_type
+          (integer_literal)
+          (type_name
+            (identifier)))
+        (call_expression
+          (index_expression
+            (identifier)
+            (array_type
+              (integer_literal)
+              (type_name
+                (identifier))))
+          (argument_list
+            (argument
+              (identifier)))))
+      (let_declaration
+        (identifier)
+        (optional_type
+          (pointer_type
+            (type_name
+              (identifier))))
+        (call_expression
+          (index_expression
+            (identifier)
+            (optional_type
+              (pointer_type
+                (type_name
+                  (identifier)))))
+          (argument_list
+            (argument
+              (identifier)))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (call_expression
+          (index_expression
+            (identifier)
+            (function_type
+              (function_type_parameter
+                (type_name
+                  (identifier)))
+              (function_type_parameter
+                (type_name
+                  (identifier)))
+              (type_name
+                (identifier))))
+          (argument_list
+            (argument
+              (identifier)))))
+      (let_declaration
+        (identifier)
+        (array_type
+          (integer_literal)
+          (view_type
+            (type_name
+              (identifier))))
+        (array_literal
+          (identifier)
+          (identifier))))))
