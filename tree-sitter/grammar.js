@@ -55,14 +55,39 @@ module.exports = grammar({
       'match',
       'try',
       'defer',
+      'import',
+      'as',
+      'pub',
     ],
   },
 
   rules: {
-    source_file: ($) => lines($, $._declaration),
+    // Imports come first. A file's package is its directory, so files
+    // carry no package line.
+    source_file: ($) =>
+      seq(repeat(seq($.import_declaration, $._terminator)), lines($, $._declaration)),
+
+    // import std.io, import vendor.x.io as xio
+    import_declaration: ($) =>
+      seq(
+        'import',
+        field('path', $.import_path),
+        optional(seq('as', field('alias', $.identifier))),
+      ),
+
+    import_path: ($) => seq($.identifier, repeat(seq('.', $.identifier))),
 
     _declaration: ($) =>
-      choice($.function_declaration, $.type_declaration, $.let_declaration, $.var_declaration),
+      choice($.function_declaration, $.type_declaration, $.global_declaration),
+
+    // A top-level let or var. Only top-level declarations can be pub.
+    global_declaration: ($) =>
+      seq(
+        optional(field('visibility', $.visibility)),
+        field('binding', choice($.let_declaration, $.var_declaration)),
+      ),
+
+    visibility: (_) => 'pub',
 
     _terminator: ($) => choice(';', $._automatic_semicolon),
 
@@ -70,6 +95,7 @@ module.exports = grammar({
     // fn name(params) -> Result { ... }
     function_declaration: ($) =>
       seq(
+        optional(field('visibility', $.visibility)),
         'fn',
         field('name', $.identifier),
         field('parameters', $.parameter_list),
@@ -91,7 +117,12 @@ module.exports = grammar({
 
     // type Name T. An enum appears only here, so every enum has a name.
     type_declaration: ($) =>
-      seq('type', field('name', $.identifier), field('type', choice($._type, $.enum_type))),
+      seq(
+        optional(field('visibility', $.visibility)),
+        'type',
+        field('name', $.identifier),
+        field('type', choice($._type, $.enum_type)),
+      ),
 
     // enum { circle(radius: f32); empty }, enum u8 { nop = 0; halt = 1; _ }
     // A trailing `_` makes the enum open: every value of the integer type
@@ -124,11 +155,21 @@ module.exports = grammar({
 
     optional_type: ($) => seq('?', field('value', $._simple_type)),
 
-    type_name: ($) => $.identifier,
+    // i32, Point, io.File
+    type_name: ($) =>
+      seq(optional(seq(field('package', $.identifier), '.')), field('name', $.identifier)),
 
     tuple_type: ($) => seq('(', commaSep1($.tuple_type_field), ')'),
 
-    tuple_type_field: ($) => seq(field('name', $.identifier), ':', field('type', $._type)),
+    // Fields are private to the package unless marked pub. The checker
+    // allows pub only in the fields of a type declaration.
+    tuple_type_field: ($) =>
+      seq(
+        optional(field('visibility', $.visibility)),
+        field('name', $.identifier),
+        ':',
+        field('type', $._type),
+      ),
 
     view_type: ($) => seq('[', ']', field('element', $._simple_type)),
 

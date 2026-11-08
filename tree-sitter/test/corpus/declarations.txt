@@ -17,18 +17,18 @@ fn manhattan(a: Point, b: Point) -> i32 {
       (parameter
         name: (identifier)
         type: (type_name
-          (identifier)))
+          name: (identifier)))
       (parameter
         name: (identifier)
         type: (type_name
-          (identifier))))
+          name: (identifier))))
     result: (type_name
-      (identifier))
+      name: (identifier))
     body: (block
       (let_declaration
         name: (identifier)
         type: (type_name
-          (identifier))
+          name: (identifier))
         value: (call_expression
           function: (identifier)
           arguments: (argument_list
@@ -39,7 +39,7 @@ fn manhattan(a: Point, b: Point) -> i32 {
       (let_declaration
         name: (identifier)
         type: (type_name
-          (identifier))
+          name: (identifier))
         value: (call_expression
           function: (identifier)
           arguments: (argument_list
@@ -74,25 +74,25 @@ type Register *u32
       (tuple_type_field
         name: (identifier)
         type: (type_name
-          (identifier)))
+          name: (identifier)))
       (tuple_type_field
         name: (identifier)
         type: (type_name
-          (identifier)))))
+          name: (identifier)))))
   (type_declaration
     name: (identifier)
     type: (type_name
-      (identifier)))
+      name: (identifier)))
   (type_declaration
     name: (identifier)
     type: (view_type
       element: (type_name
-        (identifier))))
+        name: (identifier))))
   (type_declaration
     name: (identifier)
     type: (pointer_type
       pointee: (type_name
-        (identifier)))))
+        name: (identifier)))))
 
 ================================================================================
 Multi-line type with trailing comma
@@ -112,11 +112,11 @@ type Header (
       (tuple_type_field
         name: (identifier)
         type: (type_name
-          (identifier)))
+          name: (identifier)))
       (tuple_type_field
         name: (identifier)
         type: (type_name
-          (identifier))))))
+          name: (identifier))))))
 
 ================================================================================
 Named tuple return and tuple literal
@@ -135,20 +135,20 @@ fn divmod(a: u32, b: u32) -> (q: u32, r: u32) {
       (parameter
         name: (identifier)
         type: (type_name
-          (identifier)))
+          name: (identifier)))
       (parameter
         name: (identifier)
         type: (type_name
-          (identifier))))
+          name: (identifier))))
     result: (tuple_type
       (tuple_type_field
         name: (identifier)
         type: (type_name
-          (identifier)))
+          name: (identifier)))
       (tuple_type_field
         name: (identifier)
         type: (type_name
-          (identifier))))
+          name: (identifier))))
     body: (block
       (return_statement
         value: (tuple_literal
@@ -193,7 +193,7 @@ fn consume(f: sink File, _: Event) {
         name: (identifier)
         mode: (parameter_mode)
         type: (type_name
-          (identifier))))
+          name: (identifier))))
     body: (block
       (assignment_statement
         left: (field_expression
@@ -213,11 +213,11 @@ fn consume(f: sink File, _: Event) {
         name: (identifier)
         mode: (parameter_mode)
         type: (type_name
-          (identifier)))
+          name: (identifier)))
       (parameter
         name: (discard)
         type: (type_name
-          (identifier))))
+          name: (identifier))))
     body: (block
       (expression_statement
         (call_expression
@@ -247,7 +247,7 @@ fn f() {
       (var_declaration
         name: (identifier)
         type: (type_name
-          (identifier))
+          name: (identifier))
         value: (construct_expression
           type: (identifier)
           value: (tuple_literal
@@ -260,7 +260,7 @@ fn f() {
       (let_declaration
         name: (identifier)
         type: (type_name
-          (identifier))
+          name: (identifier))
         value: (construct_expression
           type: (identifier)
           value: (parenthesized_expression
@@ -268,7 +268,7 @@ fn f() {
       (let_declaration
         name: (identifier)
         type: (type_name
-          (identifier))
+          name: (identifier))
         value: (construct_expression
           type: (identifier)
           value: (parenthesized_expression
@@ -276,7 +276,7 @@ fn f() {
       (let_declaration
         name: (identifier)
         type: (type_name
-          (identifier))
+          name: (identifier))
         value: (construct_expression
           type: (field_expression
             value: (identifier)
@@ -312,11 +312,11 @@ fn f() {
           (destructuring_field
             name: (identifier)
             type: (type_name
-              (identifier)))
+              name: (identifier)))
           (destructuring_field
             name: (identifier)
             type: (type_name
-              (identifier))))
+              name: (identifier))))
         value: (call_expression
           function: (identifier)
           arguments: (argument_list
@@ -332,7 +332,7 @@ fn f() {
           (destructuring_field
             name: (identifier)
             type: (type_name
-              (identifier))))
+              name: (identifier))))
         value: (call_expression
           function: (identifier)
           arguments: (argument_list
@@ -345,16 +345,16 @@ fn f() {
           (destructuring_field
             name: (identifier)
             type: (type_name
-              (identifier)))
+              name: (identifier)))
           (destructuring_field
             name: (identifier)
             type: (type_name
-              (identifier))))
+              name: (identifier))))
         value: (identifier))
       (let_declaration
         name: (discard)
         type: (type_name
-          (identifier))
+          name: (identifier))
         value: (call_expression
           function: (identifier)
           arguments: (argument_list))))))

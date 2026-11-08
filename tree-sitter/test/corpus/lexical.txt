@@ -11,12 +11,12 @@ fn f() -> i32 { let x: i32 = 1; return x }
     name: (identifier)
     parameters: (parameter_list)
     result: (type_name
-      (identifier))
+      name: (identifier))
     body: (block
       (let_declaration
         name: (identifier)
         type: (type_name
-          (identifier))
+          name: (identifier))
         value: (integer_literal))
       (return_statement
         value: (identifier)))))
@@ -61,20 +61,20 @@ lines */ type D u8
   (type_declaration
     name: (identifier)
     type: (type_name
-      (identifier)))
+      name: (identifier)))
   (line_comment)
   (block_comment)
   (type_declaration
     name: (identifier)
     type: (type_name
-      (identifier)))
+      name: (identifier)))
   (block_comment)
   (type_declaration
     name: (identifier)
     type: (type_name
-      (identifier)))
+      name: (identifier)))
   (block_comment)
   (type_declaration
     name: (identifier)
     type: (type_name
-      (identifier))))
+      name: (identifier))))

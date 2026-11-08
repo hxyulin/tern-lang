@@ -96,6 +96,8 @@ The running list. Each new keyword needs a reason.
 | `enum` | sum types and integer enums |
 | `match` | branch on a value, as a statement or an expression |
 | `try` | return early on `err` or `none` |
+| `import`, `as` | import a package, renaming it on a clash |
+| `pub` | visible outside the package |
 
 Planned by earlier decisions: `unsafe`. `true` and `false` are predeclared
 names, not keywords, as in Go.
@@ -641,6 +643,57 @@ the same as an output parameter.
 
 Rejected: an `out` parameter mode (Ada, C#, Hylo's `set`). It would be a
 second way to return values.
+
+## Packages
+
+### Packages are directories
+
+**Decided (2026-11-08).** A package is a directory, as in Go. Files carry
+no `package` line: the directory already says which package a file
+belongs to.
+
+### Imports
+
+**Decided (2026-11-08).**
+
+```
+import std.io
+import vendor.x.io as xio
+
+let f: io.File = try io.open(path)
+```
+
+- Paths are dotted names, not strings. The package's last segment names
+  it.
+- `as` renames, for when two imports would share a name.
+- Every use is qualified. No unqualified imports (Rust's `use x::*`, Go's
+  dot import), so a reader always sees where a name comes from.
+- Imports come before every declaration in a file, enforced by the
+  grammar.
+- Packages cannot form import cycles (see
+  [Compiler design](#compiler-design)).
+
+### Visibility
+
+**Decided (2026-11-08).** `pub` marks a top-level declaration or a field
+as visible outside its package. There are two levels only: package-private
+and `pub`. No `pub(crate)`.
+
+```
+pub type Point (pub x: i32, pub y: i32)
+pub type Buffer (data: *u8, len: usize)
+```
+
+- Fields are private unless marked. Outside its package, `Buffer` cannot
+  be constructed or have its fields read, so a type can protect a safety
+  invariant, such as a generational arena's handles.
+- `pub` on a field appears only in a `type` declaration. Anonymous named
+  tuples, such as return values, are fully visible. The grammar accepts
+  `pub` on any tuple field and the checker enforces this: restricting it
+  in the grammar conflicts with types like `type R (x: i32) ! E`.
+
+Rejected: Go's capitalization. Exporting a name renames it at every use,
+which inflates the diff a reviewer reads.
 
 ## Memory model
 

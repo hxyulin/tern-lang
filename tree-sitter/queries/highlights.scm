@@ -1,4 +1,6 @@
-["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer"] @keyword
+["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as"] @keyword
+
+(visibility) @keyword
 
 (break_statement) @keyword
 (continue_statement) @keyword
@@ -8,7 +10,10 @@
 (parameter_mode) @keyword
 (argument "inout" @keyword)
 
-(type_name (identifier) @type)
+(type_name name: (identifier) @type)
+(type_name package: (identifier) @module)
+(import_path (identifier) @module)
+(import_declaration alias: (identifier) @module)
 (type_declaration name: (identifier) @type.definition)
 (construct_expression type: (identifier) @type)
 (construct_expression type: (field_expression field: (identifier) @type))

@@ -1,0 +1,127 @@
+================================================================================
+Imports, visibility and qualified names
+================================================================================
+
+import std.io
+import vendor.x.io as xio
+
+pub type Point (pub x: i32, pub y: i32)
+type Buffer (data: *u8, len: usize)
+pub let origin: Point = Point.(x: 0, y: 0)
+var count: u32 = 0
+
+pub fn open(path: str) -> io.File ! io.Error {
+    let f: io.File = try io.open(path)
+    return ok.(value: f)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (import_declaration
+    (import_path
+      (identifier)
+      (identifier)))
+  (import_declaration
+    (import_path
+      (identifier)
+      (identifier)
+      (identifier))
+    (identifier))
+  (type_declaration
+    (visibility)
+    (identifier)
+    (tuple_type
+      (tuple_type_field
+        (visibility)
+        (identifier)
+        (type_name
+          (identifier)))
+      (tuple_type_field
+        (visibility)
+        (identifier)
+        (type_name
+          (identifier)))))
+  (type_declaration
+    (identifier)
+    (tuple_type
+      (tuple_type_field
+        (identifier)
+        (pointer_type
+          (type_name
+            (identifier))))
+      (tuple_type_field
+        (identifier)
+        (type_name
+          (identifier)))))
+  (global_declaration
+    (visibility)
+    (let_declaration
+      (identifier)
+      (type_name
+        (identifier))
+      (construct_expression
+        (identifier)
+        (tuple_literal
+          (tuple_field
+            (identifier)
+            (integer_literal))
+          (tuple_field
+            (identifier)
+            (integer_literal))))))
+  (global_declaration
+    (var_declaration
+      (identifier)
+      (type_name
+        (identifier))
+      (integer_literal)))
+  (function_declaration
+    (visibility)
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (type_name
+          (identifier))))
+    (result_type
+      (type_name
+        (identifier)
+        (identifier))
+      (type_name
+        (identifier)
+        (identifier)))
+    (block
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier)
+          (identifier))
+        (try_expression
+          (call_expression
+            (field_expression
+              (identifier)
+              (identifier))
+            (argument_list
+              (argument
+                (identifier))))))
+      (return_statement
+        (construct_expression
+          (identifier)
+          (tuple_literal
+            (tuple_field
+              (identifier)
+              (identifier))))))))
+
+================================================================================
+File with only imports
+================================================================================
+
+import std.io
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (import_declaration
+    (import_path
+      (identifier)
+      (identifier))))
