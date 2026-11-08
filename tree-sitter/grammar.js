@@ -150,17 +150,17 @@ module.exports = grammar({
         optional(seq('else', field('alternative', choice($.block, $.if_statement)))),
       ),
 
-    // for { }, for cond { }, for x: T in xs { }, for i: u32 in 0..n { }
+    // for { }, for cond { }, for let x: T in xs { }, for let i: u32 in 0..n { }
     for_statement: ($) =>
       seq('for', optional(choice(field('condition', $._expression), $.for_in_clause)), field('body', $.block)),
 
-    // The loop variable is `name: Type`. A destructuring pattern here
-    // would be ambiguous with a tuple-literal condition until `in`.
+    // for let p: Point in points, for var (k: K, v: V) in pairs. The
+    // leading let or var tells a loop variable from a condition, which
+    // could otherwise start with a tuple literal.
     for_in_clause: ($) =>
       seq(
-        field('name', choice($.identifier, $.discard)),
-        ':',
-        field('type', $._type),
+        field('kind', choice('let', 'var')),
+        $._binding,
         'in',
         field('iterable', choice($._expression, $.range)),
       ),

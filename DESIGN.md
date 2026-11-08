@@ -347,20 +347,32 @@ let s: str = if n == 0 { "none" } else if n == 1 { "one" } else { "many" }
 **Decided (2026-11-08).** From Go.
 
 ```
-for { ... }                     // forever
-for i < n { ... }               // while
-for p: Point in points { ... }  // over an array or view
-for i: u32 in 0..n { ... }      // over a range
+for { ... }                                 // forever
+for i < n { ... }                           // while
+for let p: Point in points { ... }          // over an array or view
+for let (k: Key, v: Value) in pairs { ... } // with destructuring
+for let i: u32 in 0..n { ... }              // over a range
+for var line: str in lines { ... }          // the body may change its copy
 ```
 
 - No C-style three-part `for`.
 - `a..b` excludes `b`, and there is no inclusive form. A range appears
   only in a `for` header for now; slicing is part of the view design.
-- The loop variable is `name: Type`, following the rule that every
-  binding shows its type. A destructuring pattern is not allowed there:
-  `for (a: b, c: d) ...` reads as either a pattern before `in` or a
-  tuple-literal condition, and the parser cannot tell which until `in`.
-  The tree-sitter grammar found this conflict on 2026-11-08.
+- The loop variable starts with `let` or `var`, followed by anything a
+  `let` declaration accepts, including destructuring and `_`. So every
+  binding in the language starts with `let` or `var`.
+- After `for`, one token decides the form: `let` or `var` starts a loop
+  variable, `{` starts a forever loop, and anything else starts a
+  condition.
+- The loop variable's type is written out, which repeats the element
+  type. If the repetition becomes a problem, inferring it is a possible
+  later change.
+
+History: the first version was `for p: Point in points`. On 2026-11-08 the
+tree-sitter grammar showed that destructuring there was ambiguous:
+`for (a: b, c: d) ...` reads as a pattern before `in` or a tuple-literal
+condition, and the parser cannot tell until `in`. The user chose
+`for let` to fix it.
 
 ### `break` and `continue`
 

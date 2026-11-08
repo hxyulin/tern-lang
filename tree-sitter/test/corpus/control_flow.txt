@@ -135,14 +135,20 @@ fn f() {
         i += 1
         continue
     }
-    for p: Point in points {
+    for let p: Point in points {
         draw(p)
     }
-    for i: u32 in 0..n {
+    for let i: u32 in 0..n {
         g(i)
     }
-    for j: u32 in a + 1..len(v) - 1 {
+    for let j: u32 in a + 1..len(v) - 1 {
         g(j)
+    }
+    for var (k: Key, v: _) in pairs {
+        k += 1
+    }
+    for (a: 1) == b {
+        g()
     }
 }
 
@@ -215,4 +221,31 @@ fn f() {
               (identifier)
               (argument_list
                 (argument
-                  (identifier))))))))))
+                  (identifier)))))))
+      (for_statement
+        (for_in_clause
+          (destructuring_pattern
+            (destructuring_field
+              (identifier)
+              (type_name
+                (identifier)))
+            (destructuring_field
+              (identifier)
+              (discard)))
+          (identifier))
+        (block
+          (assignment_statement
+            (identifier)
+            (integer_literal))))
+      (for_statement
+        (comparison_expression
+          (tuple_literal
+            (tuple_field
+              (identifier)
+              (integer_literal)))
+          (identifier))
+        (block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (argument_list))))))))
