@@ -1,0 +1,189 @@
+================================================================================
+Plain strings keep spaces and comment-like text
+================================================================================
+
+fn f() {
+    print("  two spaces")
+    print("// not a comment /* nor this */")
+    print("")
+    print("a } is plain text")
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (string_literal
+                (string_content))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (string_literal
+                (string_content))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (string_literal)))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (string_literal
+                (string_content)))))))))
+
+================================================================================
+Escapes
+================================================================================
+
+fn f() {
+    print("tab\there\n\"quoted\" \\ \{literal} \x41\0")
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (string_literal
+                (string_content)
+                (escape_sequence)
+                (string_content)
+                (escape_sequence)
+                (escape_sequence)
+                (string_content)
+                (escape_sequence)
+                (string_content)
+                (escape_sequence)
+                (string_content)
+                (escape_sequence)
+                (string_content)
+                (escape_sequence)
+                (escape_sequence)))))))))
+
+================================================================================
+Interpolation
+================================================================================
+
+fn f() {
+    print("count: {n}, next: {n + 1}")
+    print("{hex(addr, 8)} and {name(f("inner {x}"))}")
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (string_literal
+                (string_content)
+                (interpolation
+                  (identifier))
+                (string_content)
+                (interpolation
+                  (additive_expression
+                    (identifier)
+                    (integer_literal))))))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (string_literal
+                (interpolation
+                  (call_expression
+                    (identifier)
+                    (argument_list
+                      (argument
+                        (identifier))
+                      (argument
+                        (integer_literal)))))
+                (string_content)
+                (interpolation
+                  (call_expression
+                    (identifier)
+                    (argument_list
+                      (argument
+                        (call_expression
+                          (identifier)
+                          (argument_list
+                            (argument
+                              (string_literal
+                                (string_content)
+                                (interpolation
+                                  (identifier))))))))))))))))))
+
+================================================================================
+Character literals
+================================================================================
+
+fn f() {
+    let a: u8 = 'a'
+    let q: u8 = '\''
+    let nl: u8 = '\n'
+    let del: u8 = '\x7F'
+    ok = c >= '0' && c <= '9'
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (char_literal))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (char_literal))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (char_literal))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (char_literal))
+      (assignment_statement
+        (identifier)
+        (and_expression
+          (comparison_expression
+            (identifier)
+            (char_literal))
+          (comparison_expression
+            (identifier)
+            (char_literal)))))))

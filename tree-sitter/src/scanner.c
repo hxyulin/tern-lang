@@ -1,6 +1,6 @@
 // External scanner for tern.
 //
-// It produces two tokens the generated lexer cannot:
+// It produces three tokens the generated lexer cannot:
 //
 // - Automatic semicolons. At a line end, a semicolon is inserted where the
 //   grammar can end a statement or declaration. The compiler's lexer uses
@@ -8,6 +8,9 @@
 //   The two agree on well-formed code. This scanner accepts some code that
 //   Go's rule rejects, such as `fn f()` with `{` on the next line.
 // - Nested block comments: `/* a /* b */ c */` is one comment.
+// - String content: a run of printable ASCII inside a string literal, up to
+//   a quote, backslash or `{`. The generated lexer would skip spaces there
+//   and read `//` as a comment.
 //
 // A block comment that contains a newline counts as a line end, as in Go.
 
@@ -19,6 +22,7 @@
 enum TokenType {
   AUTOMATIC_SEMICOLON,
   BLOCK_COMMENT,
+  STRING_CONTENT,
   ERROR_SENTINEL,
 };
 
@@ -69,6 +73,24 @@ static bool scan_block_comment_body(TSLexer *lexer, bool *has_newline) {
 bool tree_sitter_tern_external_scanner_scan(void *payload, TSLexer *lexer,
                                             const bool *valid_symbols) {
   (void)payload;
+
+  if (valid_symbols[STRING_CONTENT] && !valid_symbols[ERROR_SENTINEL]) {
+    bool has_content = false;
+    for (;;) {
+      int32_t c = lexer->lookahead;
+      if (c < 0x20 || c > 0x7E || c == '"' || c == '\\' || c == '{') {
+        break;
+      }
+      lexer->advance(lexer, false);
+      has_content = true;
+    }
+    if (has_content) {
+      lexer->mark_end(lexer);
+      lexer->result_symbol = STRING_CONTENT;
+      return true;
+    }
+    return false;
+  }
 
   // During error recovery every symbol is valid. Only lex comments then.
   bool want_semicolon =

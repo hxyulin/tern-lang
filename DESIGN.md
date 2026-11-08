@@ -235,6 +235,33 @@ every build (Swift), a trap only in checked builds (Rust), or a setting per
 package. Division by zero and out-of-range shifts need the same answer.
 Embedded targets care about the cost of each check.
 
+### Strings and text
+
+**Decided (2026-11-08).** String and character literals are ASCII only for
+now. UTF-8 and UTF-16 handling goes in the standard library until a need
+for language support shows up. ASCII is a subset of UTF-8, so every literal
+stays valid if UTF-8 moves into the language later.
+
+- `str` is a byte view with no encoding guarantee.
+- A string literal holds printable ASCII (`0x20` to `0x7E`). A tab, a
+  newline or any other control character must be an escape, so invisible
+  or direction-changing characters cannot hide in a literal (the "Trojan
+  Source" attack).
+- Escapes: `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\'`, `\{`, and `\x00`
+  to `\x7F`. Every escape uses a backslash; `{{` is not an escape.
+- Interpolation is `{expr}`. A `}` outside an interpolation is plain
+  text.
+- No format-specifier language. Formatting is an ordinary call:
+  `"addr={hex(a, 8)}"`, not `"addr={a:08x}"`.
+- `'a'` is an integer literal holding an ASCII code. Like a number, it
+  takes its type from context: `let b: u8 = 'a'`. There is no `char`
+  type.
+
+Discussed and set aside on 2026-11-08: `str` as guaranteed UTF-8 (Rust),
+with a `char` type for Unicode scalar values and character literals typed
+from context. Grapheme clusters (Swift's `Character`) need Unicode tables,
+too much for embedded targets.
+
 ## Expressions
 
 ### Operator precedence as a partial order
@@ -704,8 +731,8 @@ Not in the first version. `[T]` is reserved for type arguments.
 - Function value syntax: the type of a function and how a function is
   passed. Everything beyond the syntax is deferred.
 - Spelling of the view source annotation (`-> str from haystack`).
-- String interpolation format specifiers. If `:` starts a specifier, as in
-  `"{x:08x}"`, it cannot be an operator inside an interpolation.
+- What an interpolated string produces at runtime, which depends on the
+  allocator model.
 - Spelling of the error propagation operator.
 - The allocator model, and whether a built-in map exists.
 - `static str`, and how long-lived structs refer to input.

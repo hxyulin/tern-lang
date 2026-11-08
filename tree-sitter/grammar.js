@@ -15,9 +15,15 @@ const commaSep = (rule) => optional(commaSep1(rule));
 module.exports = grammar({
   name: 'tern',
 
-  // The scanner (src/scanner.c) inserts semicolons at line ends and
-  // lexes nested block comments.
-  externals: ($) => [$._automatic_semicolon, $.block_comment, $._error_sentinel],
+  // The scanner (src/scanner.c) inserts semicolons at line ends, lexes
+  // nested block comments and lexes the text between a string's escapes
+  // and interpolations.
+  externals: ($) => [
+    $._automatic_semicolon,
+    $.block_comment,
+    $.string_content,
+    $._error_sentinel,
+  ],
 
   extras: ($) => [/\s/, $.line_comment, $.block_comment],
 
@@ -249,6 +255,31 @@ module.exports = grammar({
         $.float_literal,
         $.parenthesized_expression,
         $.tuple_literal,
+        $.string_literal,
+        $.char_literal,
+      ),
+
+    // "count: {n}\n". Printable ASCII only; other bytes need escapes.
+    string_literal: ($) =>
+      seq(
+        '"',
+        repeat(choice($.string_content, $.escape_sequence, $.interpolation)),
+        token.immediate('"'),
+      ),
+
+    interpolation: ($) => seq(token.immediate('{'), field('value', $._expression), '}'),
+
+    escape_sequence: (_) =>
+      token.immediate(seq('\\', choice(/[ntr0\\"'{]/, /x[0-7][0-9a-fA-F]/))),
+
+    // An ASCII code, typed from context like a number: 'a', '\n', '\x7F'.
+    char_literal: (_) =>
+      token(
+        seq(
+          "'",
+          choice(/[\x20-\x26\x28-\x5B\x5D-\x7E]/, seq('\\', choice(/[ntr0\\"'{]/, /x[0-7][0-9a-fA-F]/))),
+          "'",
+        ),
       ),
 
     parenthesized_expression: ($) => seq('(', $._expression, ')'),

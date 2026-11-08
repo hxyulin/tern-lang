@@ -27,3 +27,8 @@
 ["+" "-" "*" "/" "%" "&" "|" "^" "<<" ">>" "~" "!" "&&" "||"
  "==" "!=" "<" "<=" ">" ">="
  "=" "+=" "-=" "*=" "/=" "%=" "&=" "|=" "^=" "<<=" ">>="] @operator
+
+(string_literal) @string
+(char_literal) @character
+(escape_sequence) @string.escape
+(interpolation ["{" "}"] @punctuation.special)
