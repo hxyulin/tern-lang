@@ -2,7 +2,6 @@
 // default panic handler. The compiler links it into every hosted program.
 
 import std.c
-import std.heap
 import std.io
 import std.libc
 
@@ -10,36 +9,48 @@ import std.libc
 // name.
 extern fn tern_main() -> u8
 
-// Set once, before tern_main runs.
-var arguments: ?[][]u8 = none
+// Set once, before tern_main runs: the views of the arguments, in memory
+// from malloc that is never freed. A view is not stored in a `var`
+// global, so args builds the view of the views inside `unsafe`.
+var argument_views: ?*[]u8 = none
+var argument_count: usize = 0
+
+// The size of a []u8: a pointer and a length.
+let view_size: usize = 16
 
 @export("main")
 fn c_main(argc: c.int, argv: **u8) -> c.int {
-    var all: [..][]u8 = make(heap.c_allocator)
     let count: usize = usize.(i32.(argc))
-    for let i: usize in 0..count {
-        // SAFETY: C passes argc pointers to NUL-terminated strings that
-        // live as long as the program.
-        let arg: []u8 = unsafe { libc.text(offset(argv, i).*) }
-        match push(inout all, arg) {
-            ok {
-            }
-            err(error: _) {
-                panic("out of memory reading the program's arguments")
+    // SAFETY: malloc returns at least the size asked for, or none.
+    let block: ?*u8 = unsafe { libc.malloc(c.size_t.(count * view_size + view_size)) }
+    match block {
+        none {
+            panic("out of memory reading the program's arguments")
+        }
+        some(value as p: *u8) {
+            // SAFETY: p holds count views. C passes argc pointers to
+            // NUL-terminated strings that live as long as the program.
+            unsafe {
+                let views: *[]u8 = cast[*[]u8](p)
+                for let i: usize in 0..count {
+                    offset(views, i).* = libc.text(offset(argv, i).*)
+                }
+                argument_views = some.(value: views)
             }
         }
     }
-    // all is never freed: the arguments live as long as the program.
-    arguments = some.(value: all)
+    argument_count = count
     // SAFETY: tern_main is the program's main, written in tern.
     let status: u8 = unsafe { tern_main() }
     return c.int.(i32.(status))
 }
 
 pub fn args() -> [][]u8 {
-    match arguments {
-        some(value: [][]u8) {
-            return value
+    match argument_views {
+        some(value as views: *[]u8) {
+            // SAFETY: c_main wrote argument_count views at views, and
+            // they are never freed.
+            return unsafe { from_pointer(views, argument_count) }
         }
         none {
             panic("os.args called before the runtime started")

@@ -5,7 +5,6 @@
 import check
 import keel
 import maps
-import program
 import resolve
 import syntax
 
@@ -50,13 +49,13 @@ fn global_data(input: Input, g: inout Gen, decl: maps.DeclRef, local: syntax.Loc
         try push(inout bytes.data, 0)
     }
     try constant(input, inout g, decl.file, local.value, ty, inout bytes, 0)
-    let name: []u8 = try symbol(input, inout g, decl)
+    let name: [..]u8 = try symbol(input, inout g, decl)
     let items: [..]keel.Item = try data_items(g.alloc, inout bytes)
     var flags: u32 = keel.local
     if !local.mutable {
         flags = flags | keel.constant
     }
-    let _: keel.Symbol = try define_data(inout g, name, items, u32.(layout.align), flags)
+    let _: keel.Symbol = try define_data(inout g, name, items, bytes.data, u32.(layout.align), flags)
     return ok
 }
 
@@ -87,7 +86,7 @@ fn builtin_named(res: ?resolve.Res, name: []u8) -> bool {
     return match res {
         some(value as r: resolve.Res) {
             match r {
-                builtin(name as n: []u8) { same_text(n, name) }
+                builtin(id: u32) { same_text(resolve.builtin_name(id), name) }
                 _ { false }
             }
         }
@@ -183,10 +182,11 @@ fn constant(input: Input, g: inout Gen, file: u32, e: syntax.ExprId, ty: check.T
             match file_res(input, file, target) {
                 some(value as r: resolve.Res) {
                     match r {
-                        builtin(name: []u8) {
+                        builtin(id as builtin_index: u32) {
+                            let name: []u8 = resolve.builtin_name(builtin_index)
                             match name {
                                 "some", "ok", "err" {
-                                    item = some.(value: check.Item.builtin.(name: name))
+                                    item = some.(value: check.Item.builtin.(id: resolve.builtin_id(name)))
                                 }
                                 _ {
                                 }
@@ -205,7 +205,8 @@ fn constant(input: Input, g: inout Gen, file: u32, e: syntax.ExprId, ty: check.T
                         variant(ty as enum_ty: check.TyId, index: u32) {
                             return variant_constant(input, inout g, file, enum_ty, usize.(index), some.(value: value), inout out, offset)
                         }
-                        builtin(name: []u8) {
+                        builtin(id as builtin_index: u32) {
+                            let name: []u8 = resolve.builtin_name(builtin_index)
                             match try shape_of(input, inout g, ty) {
                                 some(value as shape: EnumShape) {
                                     let index: usize = variant_index(g, shape, name)
@@ -290,7 +291,7 @@ fn constant(input: Input, g: inout Gen, file: u32, e: syntax.ExprId, ty: check.T
         }
         none {
             let text: []u8 = file_text(input, file, node.span)
-            try unsupported(inout g, try program.format_text(g.alloc, "code generation cannot evaluate the constant `{text}` yet"))
+            try unsupported(inout g, "code generation cannot evaluate the constant `{text}` yet")
         }
     }
     return ok
@@ -322,7 +323,8 @@ fn named_constant(input: Input, g: inout Gen, file: u32, e: syntax.ExprId, ty: c
                         }
                     }
                 }
-                builtin(name: []u8) {
+                builtin(id as builtin_index: u32) {
+                    let name: []u8 = resolve.builtin_name(builtin_index)
                     if same_text(name, "none") {
                         return ok.(value: true)
                     }
@@ -370,7 +372,7 @@ fn named_constant(input: Input, g: inout Gen, file: u32, e: syntax.ExprId, ty: c
 // The symbol of a function declaration, declared if it is not yet in the
 // module.
 fn decl_function_symbol(input: Input, g: inout Gen, decl: maps.DeclRef) -> keel.Symbol ! OutOfMemory {
-    let name: []u8 = try symbol(input, inout g, decl)
+    let name: [..]u8 = try symbol(input, inout g, decl)
     let abi: FnAbi = try decl_abi(input, inout g, decl)
     return function_symbol(inout g, name, abi.sig)
 }
@@ -575,7 +577,8 @@ fn named_int(input: Input, g: inout Gen, file: u32, e: syntax.ExprId, depth: u32
     match file_res(input, file, e) {
         some(value as r: resolve.Res) {
             match r {
-                builtin(name: []u8) {
+                builtin(id as builtin_index: u32) {
+                    let name: []u8 = resolve.builtin_name(builtin_index)
                     if same_text(name, "true") {
                         return ok.(value: some.(value: check.wide(1)))
                     }
@@ -657,7 +660,7 @@ fn named_int(input: Input, g: inout Gen, file: u32, e: syntax.ExprId, depth: u32
         some(value as shape: EnumShape) {
             for let i: usize in 0..usize.(shape.count) {
                 let v: VariantShape = shape_variant(g, shape, i)
-                if same_text(v.name, name) {
+                if same_text(check.name_of(g.types, v.name), name) {
                     return match shape.kind {
                         scalar_tag(tag: _) { ok.(value: some.(value: wide_from_i64(v.tag))) }
                         _ { ok.(value: none) }
@@ -774,13 +777,13 @@ fn data_items(alloc: Allocator, bytes: inout Bytes) -> [..]keel.Item ! OutOfMemo
     var at: usize = 0
     for let r: Reloc in bytes.relocs {
         if r.offset > at {
-            try push(inout items, keel.Item.bytes.(bytes: bytes.data[at..r.offset]))
+            try push(inout items, keel.Item.bytes.(at: at, len: r.offset - at))
         }
         try push(inout items, keel.Item.pointer.(symbol: r.symbol))
         at = r.offset + 8
     }
     if at < bytes.data.len {
-        try push(inout items, keel.Item.bytes.(bytes: bytes.data[at..]))
+        try push(inout items, keel.Item.bytes.(at: at, len: bytes.data.len - at))
     }
     return ok.(value: items)
 }

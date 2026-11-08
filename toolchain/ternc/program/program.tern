@@ -15,8 +15,8 @@ import std.utf8
 import syntax
 
 pub type File (
-    pub path: []u8,
-    pub text: []u8,
+    pub path: [..]u8,
+    pub text: [..]u8,
     pub starts: [..]u32,
     pub ast: syntax.Ast,
     pub package: u32,
@@ -24,8 +24,8 @@ pub type File (
 
 pub type Package (
     // The dotted import path, such as `std.io`. Empty for the root.
-    pub path: []u8,
-    pub dir: []u8,
+    pub path: [..]u8,
+    pub dir: [..]u8,
     pub files: [..]u32,
     // The packages this one imports, each once.
     pub imports: [..]u32,
@@ -36,7 +36,7 @@ pub type Package (
 pub type Message enum {
     lex(d: syntax.Diagnostic)
     parse(d: syntax.ParseDiagnostic)
-    text(start: u32, message: []u8)
+    text(start: u32, message: [..]u8)
 }
 
 pub type Diagnostic (pub file: u32, pub message: Message)
@@ -47,7 +47,7 @@ pub type Program (
     // Errors in a source file, in the order they were found.
     pub diagnostics: [..]Diagnostic,
     // Errors with no source location, such as an unreadable root.
-    pub errors: [..][]u8,
+    pub errors: [..][..]u8,
 )
 
 pub fn has_errors(p: Program) -> bool {
@@ -60,11 +60,18 @@ pub fn slice(f: File, start: u32, end: u32) -> []u8 {
 }
 
 // The text of a Format, allocated from alloc.
-pub fn format_text(alloc: Allocator, f: Format) -> []u8 ! OutOfMemory {
+pub fn format_text(alloc: Allocator, f: Format) -> [..]u8 ! OutOfMemory {
     var out: [..]u8 = make(alloc)
     for let chunk: []u8 in fmt.chunks(f) {
         try append(inout out, chunk)
     }
+    return ok.(value: out)
+}
+
+// An owned copy of s, allocated from alloc.
+pub fn own(alloc: Allocator, s: []u8) -> [..]u8 ! OutOfMemory {
+    var out: [..]u8 = make(alloc)
+    try append(inout out, s)
     return ok.(value: out)
 }
 
@@ -74,7 +81,7 @@ type Loader (
     std_dir: []u8,
     program: Program,
     // The packages being loaded, outermost first, to report cycles.
-    loading: [..][]u8,
+    loading: [..][..]u8,
 )
 
 // Loads the package in root and everything it imports. Standard library
@@ -93,13 +100,13 @@ pub fn load_hosted(alloc: Allocator, root: []u8, std_dir: []u8) -> Program ! Out
         none { true }
     }
     if !has_errors(l.program) && missing {
-        let dir: []u8 = try join(alloc, std_dir, "rt")
+        let dir: [..]u8 = try join(alloc, std_dir, "rt")
         match try read_package(inout l, "std.rt", dir) {
             loaded(id: _), empty {
             }
             unreadable {
-                let message: []u8 = try format_text(alloc, "cannot read {dir}")
-                try push(inout l.program.errors, message)
+                let shown: []u8 = dir
+                try push(inout l.program.errors, try format_text(alloc, "cannot read {shown}"))
             }
         }
     }
@@ -123,13 +130,11 @@ fn new_loader(alloc: Allocator, root: []u8, std_dir: []u8) -> Loader ! OutOfMemo
         loaded(id: _) {
         }
         empty {
-            let message: []u8 = try format_text(alloc, "{root} holds no .tern files")
-            try push(inout l.program.errors, message)
+            try push(inout l.program.errors, try format_text(alloc, "{root} holds no .tern files"))
         }
         unreadable {
             // Without errno there is no reason to give.
-            let message: []u8 = try format_text(alloc, "cannot read {root}")
-            try push(inout l.program.errors, message)
+            try push(inout l.program.errors, try format_text(alloc, "cannot read {root}"))
         }
     }
     return ok.(value: l)
@@ -143,7 +148,7 @@ type Read enum {
 }
 
 // dir/name, as Rust's Path::join writes it.
-fn join(alloc: Allocator, dir: []u8, name: []u8) -> []u8 ! OutOfMemory {
+fn join(alloc: Allocator, dir: []u8, name: []u8) -> [..]u8 ! OutOfMemory {
     var out: [..]u8 = make(alloc)
     try append(inout out, dir)
     if dir.len > 0 && dir[dir.len - 1] != '/' {
@@ -192,12 +197,12 @@ fn starts_with(s: []u8, prefix: []u8) -> bool {
 
 // Parses the package at dir and loads its imports.
 fn read_package(l: inout Loader, path: []u8, dir: []u8) -> Read ! OutOfMemory {
-    var names: [..][]u8 = make(l.alloc)
+    var names: [..][..]u8 = make(l.alloc)
     match fs.list(l.alloc, dir) {
-        ok(value as entries: [..]fs.Entry) {
-            for let e: fs.Entry in entries {
-                if is_tern_file(e) {
-                    try push(inout names, e.name)
+        ok(value as var entries: [..]fs.Entry) {
+            for let i: usize in 0..entries.len {
+                if is_tern_file(entries[i]) {
+                    try push(inout names, take(inout entries[i].name))
                 }
             }
         }
@@ -219,39 +224,40 @@ fn read_package(l: inout Loader, path: []u8, dir: []u8) -> Read ! OutOfMemory {
     for let i: usize in 1..names.len {
         var j: usize = i
         for j > 0 && bytes_less(names[j], names[j - 1]) {
-            let t: []u8 = names[j]
-            names[j] = names[j - 1]
-            names[j - 1] = t
+            var t: [..]u8 = take(inout names[j])
+            names[j] = take(inout names[j - 1])
+            names[j - 1] = take(inout t)
             j -= 1
         }
     }
     let id: u32 = u32.(l.program.packages.len)
     try push(inout l.program.packages, Package.(
-        path: path,
-        dir: dir,
+        path: try own(l.alloc, path),
+        dir: try own(l.alloc, dir),
         files: make(l.alloc),
         imports: make(l.alloc),
     ))
-    try push(inout l.loading, path)
+    try push(inout l.loading, try own(l.alloc, path))
     for let name: []u8 in names {
-        let file_path: []u8 = try join(l.alloc, dir, name)
-        let file: u32 = try parse_file(inout l, file_path, id)
+        var file_path: [..]u8 = try join(l.alloc, dir, name)
+        let file: u32 = try parse_file(inout l, inout file_path, id)
         try push(inout l.program.packages[usize.(id)].files, file)
         try load_imports(inout l, file, id)
     }
-    let _: ?[]u8 = pop(inout l.loading)
+    let _: ?[..]u8 = pop(inout l.loading)
     return ok.(value: Read.loaded.(id: id))
 }
 
-fn parse_file(l: inout Loader, path: []u8, package: u32) -> u32 ! OutOfMemory {
+// Parses the file at path, taking path.
+fn parse_file(l: inout Loader, path: inout [..]u8, package: u32) -> u32 ! OutOfMemory {
     let id: u32 = u32.(l.program.files.len)
-    var text: []u8 = ""
+    var text: [..]u8 = make(l.alloc)
     match io.open(path) {
         ok(value as var f: io.File) {
             defer io.close(inout f)
             match io.read_to_end(l.alloc, inout f) {
-                ok(value as bytes: [..]u8) {
-                    text = bytes
+                ok(value as var bytes: [..]u8) {
+                    text = take(inout bytes)
                 }
                 err(error: io.Error) {
                     try read_error(inout l, path, error)
@@ -265,14 +271,15 @@ fn parse_file(l: inout Loader, path: []u8, package: u32) -> u32 ! OutOfMemory {
     let valid: usize = utf8.valid_up_to(text)
     if valid < text.len {
         // Report the encoding alone, and parse nothing.
-        text = text[..valid]
-        let message: Message = Message.text.(
+        for text.len > valid {
+            let _: ?u8 = pop(inout text)
+        }
+        try push(inout l.program.diagnostics, Diagnostic.(file: id, message: Message.text.(
             start: u32.(valid),
-            message: "the file is not UTF-8 from here on; source files are UTF-8",
-        )
-        try push(inout l.program.diagnostics, Diagnostic.(file: id, message: message))
+            message: try own(l.alloc, "the file is not UTF-8 from here on; source files are UTF-8"),
+        )))
         var empty: syntax.Parsed = try syntax.parse(l.alloc, "")
-        try add_file(inout l, path, text, inout empty.ast, package)
+        try add_file(inout l, inout path, inout text, inout empty.ast, package)
         return ok.(value: id)
     }
     var parsed: syntax.Parsed = try syntax.parse(l.alloc, text)
@@ -282,22 +289,22 @@ fn parse_file(l: inout Loader, path: []u8, package: u32) -> u32 ! OutOfMemory {
     for let d: syntax.ParseDiagnostic in parsed.diagnostics {
         try push(inout l.program.diagnostics, Diagnostic.(file: id, message: Message.parse.(d: d)))
     }
-    try add_file(inout l, path, text, inout parsed.ast, package)
+    try add_file(inout l, inout path, inout text, inout parsed.ast, package)
     return ok.(value: id)
 }
 
 fn read_error(l: inout Loader, path: []u8, error: io.Error) -> ! OutOfMemory {
-    let message: []u8 = try format_text(l.alloc, "cannot read {path}: {io.describe(error)}")
-    try push(inout l.program.errors, message)
+    try push(inout l.program.errors, try format_text(l.alloc, "cannot read {path}: {io.describe(error)}"))
     return ok
 }
 
-// Adds a file, taking its tree from ast.
-fn add_file(l: inout Loader, path: []u8, text: []u8, ast: inout syntax.Ast, package: u32) -> ! OutOfMemory {
+// Adds a file, taking its path, text and tree.
+fn add_file(l: inout Loader, path: inout [..]u8, text: inout [..]u8, ast: inout syntax.Ast, package: u32) -> ! OutOfMemory {
+    var starts: [..]u32 = try syntax.line_starts(l.alloc, text)
     try push(inout l.program.files, File.(
-        path: path,
-        text: text,
-        starts: try syntax.line_starts(l.alloc, text),
+        path: take(inout path),
+        text: take(inout text),
+        starts: take(inout starts),
         ast: take(inout ast),
         package: package,
     ))
@@ -310,28 +317,29 @@ type ImportName (segments: []u32, local: []u8, start: u32)
 fn load_imports(l: inout Loader, file: u32, package: u32) -> ! OutOfMemory {
     let f: File = l.program.files[usize.(file)]
     // The local names so far, to report one imported twice.
-    var locals: [..][]u8 = make(l.alloc)
+    var locals: [..]syntax.Span = make(l.alloc)
     for let imp: syntax.Import in f.ast.imports {
         let segments: []u32 = syntax.items(f.ast.extra, imp.path)
         let last: syntax.Span = f.ast.names[usize.(segments[segments.len - 1])]
-        var local: []u8 = slice(f, last.start, last.end)
+        var named: syntax.Span = last
         match imp.alias {
             none {
             }
             some(value as alias: syntax.Span) {
-                local = slice(f, alias.start, alias.end)
+                named = alias
             }
         }
+        let local: []u8 = slice(f, named.start, named.end)
         var twice: bool = false
-        for let seen: []u8 in locals {
-            if bytes_equal(seen, local) {
+        for let seen: syntax.Span in locals {
+            if bytes_equal(slice(f, seen.start, seen.end), local) {
                 twice = true
             }
         }
         if twice {
-            try report(inout l, file, imp.span.start, try format_text(l.alloc, "`{local}` is imported twice; rename one with `as`"))
+            try report(inout l, file, imp.span.start, "`{local}` is imported twice; rename one with `as`")
         } else {
-            try push(inout locals, local)
+            try push(inout locals, named)
         }
         match try resolve_import(inout l, file, segments, imp.span.start) {
             none {
@@ -352,9 +360,8 @@ fn load_imports(l: inout Loader, file: u32, package: u32) -> ! OutOfMemory {
     return ok
 }
 
-fn report(l: inout Loader, file: u32, start: u32, message: []u8) -> ! OutOfMemory {
-    let d: Diagnostic = Diagnostic.(file: file, message: Message.text.(start: start, message: message))
-    try push(inout l.program.diagnostics, d)
+fn report(l: inout Loader, file: u32, start: u32, message: Format) -> ! OutOfMemory {
+    try push(inout l.program.diagnostics, Diagnostic.(file: file, message: Message.text.(start: start, message: try format_text(l.alloc, message))))
     return ok
 }
 
@@ -395,7 +402,8 @@ fn resolve_import(l: inout Loader, file: u32, segments: []u32, start: u32) -> ?u
                 try append(inout cycle, " -> ")
             }
             try append(inout cycle, path)
-            try report(inout l, file, start, cycle)
+            let shown: []u8 = cycle
+            try report(inout l, file, start, "{shown}")
             return ok.(value: none)
         }
     }
@@ -406,14 +414,14 @@ fn resolve_import(l: inout Loader, file: u32, segments: []u32, start: u32) -> ?u
             return ok.(value: some.(value: id))
         }
     }
-    var dir: []u8 = l.root
+    var dir: [..]u8 = try own(l.alloc, l.root)
     var rest: usize = 0
     if is_std {
         if segments.len == 1 {
             try report(inout l, file, start, "name a package inside `std`, such as `std.io`")
             return ok.(value: none)
         }
-        dir = l.std_dir
+        dir = try own(l.alloc, l.std_dir)
         rest = 1
     }
     for let i: usize in rest..segments.len {
@@ -426,11 +434,13 @@ fn resolve_import(l: inout Loader, file: u32, segments: []u32, start: u32) -> ?u
         }
         empty {
             let path_view: []u8 = path
-            try report(inout l, file, start, try format_text(l.alloc, "package `{path_view}` has no .tern files in {dir}"))
+            let dir_view: []u8 = dir
+            try report(inout l, file, start, "package `{path_view}` has no .tern files in {dir_view}")
         }
         unreadable {
             let path_view: []u8 = path
-            try report(inout l, file, start, try format_text(l.alloc, "no package `{path_view}`: {dir} does not exist"))
+            let dir_view: []u8 = dir
+            try report(inout l, file, start, "no package `{path_view}`: {dir_view} does not exist")
         }
     }
     return ok.(value: none)

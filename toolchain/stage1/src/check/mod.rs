@@ -56,6 +56,8 @@ pub fn check(program: &Program, names: &Resolution) -> Checked {
         types: Types::new(),
         fn_tys: HashMap::new(),
         owning: HashMap::new(),
+        views: HashMap::new(),
+        growables: Vec::new(),
         direct: HashMap::new(),
         values: Vec::new(),
         diagnostics: Vec::new(),
@@ -82,6 +84,7 @@ pub fn check(program: &Program, names: &Resolution) -> Checked {
             );
         }
     }
+    checker.no_views_in_growables();
     checker.check_effects();
     let mut diagnostics = checker.diagnostics;
     diagnostics.sort_by_key(|(file, d)| (file.0, d.span.start));
@@ -182,6 +185,11 @@ struct Checker<'a> {
     fn_tys: HashMap<DeclRef, TyId>,
     /// Which types hold a `[..]T`; see `owning`.
     owning: HashMap<TyId, bool>,
+    /// Which types hold a view; see `holds_view`.
+    views: HashMap<TyId, bool>,
+    /// Each written `[..]T`, with its element type, checked once every
+    /// type is known.
+    growables: Vec<(FileId, Span, TyId)>,
     /// What each function writes and calls directly, and the functions
     /// used as values; see [`effects`].
     direct: HashMap<DeclRef, effects::Direct>,
@@ -207,7 +215,12 @@ impl<'a> Checker<'a> {
     // Types.
 
     fn lower(&mut self, file: FileId, id: TypeId) -> TyId {
+        let first = self.files[file.0 as usize].types[id.index()].is_none();
         let ty = self.lower_type(file, id);
+        if let (true, Ty::Growable(elem)) = (first, self.types.get(ty)) {
+            let span = self.program.file(file).ast.ty(id).span;
+            self.growables.push((file, span, *elem));
+        }
         self.files[file.0 as usize].types[id.index()] = Some(ty);
         ty
     }
@@ -801,16 +814,20 @@ impl<'a> Checker<'a> {
             DeclKind::ExternVar { ty: ty_id, .. } => {
                 let ty = self.lower(file, *ty_id);
                 self.no_format(file, ast.ty(*ty_id).span, ty);
+                self.no_view(file, ast.ty(*ty_id).span, ty, "a C global");
             }
             DeclKind::Type { def, .. } => {
                 let ty = self.named(NamedId::Decl(decl));
                 self.no_format_in_type(file, def, ty);
             }
-            DeclKind::Global { local, .. } => {
+            DeclKind::Global { shared, local } => {
                 match &local.binding {
                     Binding::Name { ty: ty_id, .. } => {
                         let ty = self.lower(file, *ty_id);
                         self.no_format(file, ast.ty(*ty_id).span, ty);
+                        if local.mutable || *shared {
+                            self.no_view(file, ast.ty(*ty_id).span, ty, "a `var` global");
+                        }
                         self.check(&mut fx, local.value, ty);
                     }
                     Binding::Destructure(fields) => {
@@ -1684,12 +1701,13 @@ impl<'a> Checker<'a> {
                 let ok = self.types.as_int(ty).is_some()
                     || matches!(self.types.get(ty), Ty::Bool | Ty::Error | Ty::Never)
                     || ty == bytes
+                    || matches!(self.types.get(ty), Ty::Growable(e) if self.types.as_int(*e) == Some(IntTy::U8))
                     || self.is_named(ty, BuiltinNamed::Format)
                     || Some(ty) == part;
                 if !ok {
                     let span = fx.ast.expr(*e).span;
                     let message = format!(
-                        "`{}` cannot be interpolated; `{{}}` takes integers, `bool`, `[]u8`, a `Format` and `fmt.Part`",
+                        "`{}` cannot be interpolated; `{{}}` takes integers, `bool`, `[]u8`, `[..]u8`, a `Format` and `fmt.Part`",
                         self.show(ty)
                     );
                     self.error(fx.file, span, message);

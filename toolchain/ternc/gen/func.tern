@@ -96,7 +96,7 @@ fn gen_function(input: Input, g: inout Gen, decl: maps.DeclRef) -> ! OutOfMemory
 
 fn function_body(input: Input, g: inout Gen, decl: maps.DeclRef, name: syntax.Span, params: syntax.List, body: syntax.Block) -> ! OutOfMemory {
     let abi: FnAbi = try decl_abi(input, inout g, decl)
-    let sym_name: []u8 = try symbol(input, inout g, decl)
+    let sym_name: [..]u8 = try symbol(input, inout g, decl)
     let f: keel.Function = try define(inout g, sym_name, abi.sig)
     // The module is the whole program, so everything not exported is
     // local to it, which lets keel inline it.
@@ -1007,7 +1007,7 @@ fn for_in(input: Input, g: inout Gen, fx: inout Fx, body: syntax.Block, binding:
                     panic("internal error: next returns nothing")
                 }
             }
-            let next_name: []u8 = try symbol(input, inout g, next)
+            let next_name: [..]u8 = try symbol(input, inout g, next)
             var args: [..]CallArg = make(g.alloc)
             try push(inout args, CallArg.addr.(value: it))
             let item: V = try direct_call(input, inout g, inout fx, next_name, abi, args)

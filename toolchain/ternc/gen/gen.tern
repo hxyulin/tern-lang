@@ -49,8 +49,10 @@ pub type Gen (
     fields_cache: [..]FieldsSlot,
     shapes: [..]ShapeSlot,
     abi_layouts: [..]?keel.Layout,
-    // Per declaration, by number, once worked out.
-    decl_symbols: [..]?[]u8,
+    // Per declaration, by number, once worked out: its symbol's name in
+    // symbol_text.
+    decl_symbols: [..]?check.Range,
+    symbol_text: [..]u8,
     decl_abis: [..]?FnAbi,
     // Every symbol in the module by name, as a number in syms.
     symbols: maps.TextMap,
@@ -67,13 +69,13 @@ pub type Gen (
     // The `@panic_handler` function: the program's own, or std.rt's.
     handler: ?maps.DeclRef,
     // Features stage 1 does not lower either.
-    errors: [..][]u8,
+    errors: [..][..]u8,
 )
 
 // A module, or the first feature code generation does not support.
 pub type Generated enum {
     module(m: keel.Module)
-    unsupported(message: []u8)
+    unsupported(message: [..]u8)
 }
 
 // How one parameter crosses a call.
@@ -130,6 +132,7 @@ pub fn generate(alloc: Allocator, p: inout program.Program, names: inout resolve
         shapes: make(alloc),
         abi_layouts: make(alloc),
         decl_symbols: make(alloc),
+        symbol_text: make(alloc),
         decl_abis: make(alloc),
         symbols: maps.new_texts(alloc),
         syms: make(alloc),
@@ -159,7 +162,7 @@ pub fn generate(alloc: Allocator, p: inout program.Program, names: inout resolve
                     try gen_global(input, inout g, decl)
                 }
                 extern_var(mutable: _, name: _, ty: _) {
-                    let name: []u8 = try symbol(input, inout g, decl)
+                    let name: [..]u8 = try symbol(input, inout g, decl)
                     let _: keel.Symbol = try data_symbol(inout g, name)
                 }
                 extern_fn(name: _, params: _, variadic: _, result: _) {
@@ -251,41 +254,42 @@ fn has_attribute(input: Input, decl: maps.DeclRef, name: []u8) -> bool {
 
 // A package's prefix for symbols: `std.io`, or the root's directory name
 // and then the package's path.
-fn package_prefix(input: Input, g: Gen, package: u32) -> []u8 ! OutOfMemory {
+fn package_prefix(input: Input, g: Gen, package: u32) -> [..]u8 ! OutOfMemory {
     let path: []u8 = input.program.packages[usize.(package)].path
     if path.len == 0 {
-        return ok.(value: g.root_name)
+        return program.own(g.alloc, g.root_name)
     }
     if same_text(path, "std") || (path.len > 4 && same_text(path[..4], "std.")) {
-        return ok.(value: path)
+        return program.own(g.alloc, path)
     }
     return program.format_text(g.alloc, "{g.root_name}.{path}")
 }
 
 // The linker symbol of a function or global.
-fn symbol(input: Input, g: inout Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
+fn symbol(input: Input, g: inout Gen, decl: maps.DeclRef) -> [..]u8 ! OutOfMemory {
     let number: usize = usize.(check.decl_number(g.types, decl))
     match g.decl_symbols[number] {
-        some(value as known: []u8) {
-            return ok.(value: known)
+        some(value as known: check.Range) {
+            return program.own(g.alloc, g.symbol_text[usize.(known.start)..usize.(known.start + known.len)])
         }
         none {
         }
     }
-    let made: []u8 = try make_symbol(input, g, decl)
-    g.decl_symbols[number] = some.(value: made)
-    return ok.(value: made)
+    var made: [..]u8 = try make_symbol(input, g, decl)
+    g.decl_symbols[number] = some.(value: check.Range.(start: u32.(g.symbol_text.len), len: u32.(made.len)))
+    try append(inout g.symbol_text, made)
+    return ok.(value: take(inout made))
 }
 
-fn make_symbol(input: Input, g: Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
+fn make_symbol(input: Input, g: Gen, decl: maps.DeclRef) -> [..]u8 ! OutOfMemory {
     let name: []u8 = decl_name(input, decl)
     let package: u32 = input.program.files[usize.(decl.file)].package
     match decl_of(input, decl).kind {
         extern_fn(name: _, params: _, variadic: _, result: _) {
-            return ok.(value: name)
+            return program.own(g.alloc, name)
         }
         extern_var(mutable: _, name: _, ty: _) {
-            return ok.(value: name)
+            return program.own(g.alloc, name)
         }
         function(is_unsafe: _, name: _, params: _, result: _, body: _) {
             match attribute(input, decl, "export") {
@@ -293,7 +297,7 @@ fn make_symbol(input: Input, g: Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
                     let ast: syntax.Ast = input.program.files[usize.(decl.file)].ast
                     let args: []u32 = syntax.items(ast.extra, export.args)
                     if args.len == 0 {
-                        return ok.(value: name)
+                        return program.own(g.alloc, name)
                     }
                     var text: []u8 = file_text(input, decl.file, ast.exprs[usize.(args[0])].span)
                     for text.len > 0 && text[0] == '"' {
@@ -302,19 +306,19 @@ fn make_symbol(input: Input, g: Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
                     for text.len > 0 && text[text.len - 1] == '"' {
                         text = text[..text.len - 1]
                     }
-                    return ok.(value: text)
+                    return program.own(g.alloc, text)
                 }
                 none {
                 }
             }
             if input.program.packages[usize.(package)].path.len == 0 && same_text(name, "main") {
-                return ok.(value: "tern_main")
+                return program.own(g.alloc, "tern_main")
             }
         }
         _ {
         }
     }
-    let prefix: []u8 = try package_prefix(input, g, package)
+    let prefix: [..]u8 = try package_prefix(input, g, package)
     return program.format_text(g.alloc, "{prefix}.{name}")
 }
 
@@ -547,8 +551,8 @@ fn data_symbol(g: inout Gen, name: []u8) -> keel.Symbol ! OutOfMemory {
 
 // Defines a data object, in the place of its declaration if code
 // referred to it first.
-fn define_data(g: inout Gen, name: []u8, items: []keel.Item, align: u32, flags: u32) -> keel.Symbol ! OutOfMemory {
-    let s: keel.Symbol = try keel.add_global(g.alloc, g.m, name, items, align, flags)
+fn define_data(g: inout Gen, name: []u8, items: []keel.Item, data: []u8, align: u32, flags: u32) -> keel.Symbol ! OutOfMemory {
+    let s: keel.Symbol = try keel.add_global(g.alloc, g.m, name, items, data, align, flags)
     match find_symbol(g, name) {
         some(value: _) {
         }
@@ -573,8 +577,8 @@ fn string_symbol(g: inout Gen, bytes: []u8) -> keel.Symbol ! OutOfMemory {
     var with_nul: [..]u8 = make(g.alloc)
     try append(inout with_nul, bytes)
     try push(inout with_nul, 0)
-    let items: [1]keel.Item = [keel.Item.bytes.(bytes: with_nul)]
-    let s: keel.Symbol = try define_data(inout g, name, items, 1, keel.constant | keel.local)
+    let items: [1]keel.Item = [keel.Item.bytes.(at: 0, len: with_nul.len)]
+    let s: keel.Symbol = try define_data(inout g, name, items, with_nul, 1, keel.constant | keel.local)
     let key: []u8 = with_nul[..bytes.len]
     try maps.put_text(inout g.strings, key, u32.(g.syms.len - 1))
     return ok.(value: s)
@@ -677,7 +681,7 @@ type SiteField (offset: u64, items: [..]keel.Item)
 
 fn item_size(item: keel.Item) -> u64 {
     return match item {
-        bytes(bytes as b: []u8) { u64.(b.len) }
+        bytes(at: _, len: usize) { u64.(len) }
         zero(size: u32) { u64.(size) }
         integer(ty: keel.Type, value: _) { type_size(ty) }
         pointer(symbol: _) { 8 }
@@ -736,7 +740,7 @@ fn panic_site(input: Input, g: inout Gen, path: []u8, function: []u8, line: u32,
     }
     let name: []u8 = try program.format_text(g.alloc, "tern.panic_site.{g.panic_sites}")
     g.panic_sites += 1
-    return define_data(inout g, name, items, u32.(layout.align), keel.constant | keel.local)
+    return define_data(inout g, name, items, "", u32.(layout.align), keel.constant | keel.local)
 }
 
 // `std.fmt.Part`, if the program uses std.fmt.
@@ -793,7 +797,7 @@ fn find_panic_handler(input: Input) -> ?maps.DeclRef {
     return found
 }
 
-fn unsupported(g: inout Gen, what: []u8) -> ! OutOfMemory {
-    try push(inout g.errors, what)
+fn unsupported(g: inout Gen, what: Format) -> ! OutOfMemory {
+    try push(inout g.errors, try program.format_text(g.alloc, what))
     return ok
 }

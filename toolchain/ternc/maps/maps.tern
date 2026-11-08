@@ -5,13 +5,14 @@
 // A declaration: its file and its index in that file's declarations.
 pub type DeclRef (pub file: u32, pub index: u32)
 
-type NameSlot (used: bool, key: []u8, value: DeclRef)
+// A key is bytes at..at + len of the map's keys.
+type NameSlot (used: bool, at: u32, len: u32, value: DeclRef)
 
-// Names to declarations. The keys are views the caller keeps alive.
-pub type NameMap (alloc: Allocator, slots: [..]NameSlot, count: usize)
+// Names to declarations. The map keeps a copy of each key.
+pub type NameMap (alloc: Allocator, slots: [..]NameSlot, keys: [..]u8, count: usize)
 
 pub fn new_names(alloc: Allocator) -> NameMap {
-    return NameMap.(alloc: alloc, slots: make(alloc), count: 0)
+    return NameMap.(alloc: alloc, slots: make(alloc), keys: make(alloc), count: 0)
 }
 
 fn hash_bytes(key: []u8) -> u64 {
@@ -46,7 +47,7 @@ pub fn get_name(m: NameMap, key: []u8) -> ?DeclRef {
         if !slot.used {
             return none
         }
-        if same_bytes(slot.key, key) {
+        if same_bytes(m.keys[usize.(slot.at)..usize.(slot.at + slot.len)], key) {
             return some.(value: slot.value)
         }
         at = (at + 1) & mask
@@ -63,11 +64,13 @@ pub fn put_name(m: inout NameMap, key: []u8, value: DeclRef) -> ! OutOfMemory {
     for {
         let slot: NameSlot = m.slots[usize.(at)]
         if !slot.used {
-            m.slots[usize.(at)] = NameSlot.(used: true, key: key, value: value)
+            let start: u32 = u32.(m.keys.len)
+            try append(inout m.keys, key)
+            m.slots[usize.(at)] = NameSlot.(used: true, at: start, len: u32.(key.len), value: value)
             m.count += 1
             return ok
         }
-        if same_bytes(slot.key, key) {
+        if same_bytes(m.keys[usize.(slot.at)..usize.(slot.at + slot.len)], key) {
             m.slots[usize.(at)].value = value
             return ok
         }
@@ -80,18 +83,24 @@ fn grow_names(m: inout NameMap) -> ! OutOfMemory {
     if size < 16 {
         size = 16
     }
-    let old: [..]NameSlot = m.slots
+    var old: [..]NameSlot = take(inout m.slots)
     m.slots = make(m.alloc)
-    let empty: NameSlot = NameSlot.(used: false, key: "", value: DeclRef.(file: 0, index: 0))
+    let empty: NameSlot = NameSlot.(used: false, at: 0, len: 0, value: DeclRef.(file: 0, index: 0))
     for let _: usize in 0..size {
         try push(inout m.slots, empty)
     }
-    m.count = 0
+    // The keys stay where they are; only the slots move.
+    let mask: u64 = u64.(m.slots.len) - 1
     for let slot: NameSlot in old {
         if slot.used {
-            try put_name(inout m, slot.key, slot.value)
+            var at: u64 = hash_bytes(m.keys[usize.(slot.at)..usize.(slot.at + slot.len)]) & mask
+            for m.slots[usize.(at)].used {
+                at = (at + 1) & mask
+            }
+            m.slots[usize.(at)] = slot
         }
     }
+    free(inout old)
     return ok
 }
 
@@ -167,14 +176,15 @@ fn grow_ints(m: inout IntMap) -> ! OutOfMemory {
     return ok
 }
 
-type TextSlot (used: bool, key: []u8, value: u32)
+// A key is bytes at..at + len of the map's keys.
+type TextSlot (used: bool, at: u32, len: u32, value: u32)
 
 // Byte strings to u32 values, such as a symbol's name to its number. The
-// keys are views the caller keeps alive.
-pub type TextMap (alloc: Allocator, slots: [..]TextSlot, count: usize)
+// map keeps a copy of each key.
+pub type TextMap (alloc: Allocator, slots: [..]TextSlot, keys: [..]u8, count: usize)
 
 pub fn new_texts(alloc: Allocator) -> TextMap {
-    return TextMap.(alloc: alloc, slots: make(alloc), count: 0)
+    return TextMap.(alloc: alloc, slots: make(alloc), keys: make(alloc), count: 0)
 }
 
 pub fn get_text(m: TextMap, key: []u8) -> ?u32 {
@@ -188,7 +198,7 @@ pub fn get_text(m: TextMap, key: []u8) -> ?u32 {
         if !slot.used {
             return none
         }
-        if same_bytes(slot.key, key) {
+        if same_bytes(m.keys[usize.(slot.at)..usize.(slot.at + slot.len)], key) {
             return some.(value: slot.value)
         }
         at = (at + 1) & mask
@@ -205,11 +215,13 @@ pub fn put_text(m: inout TextMap, key: []u8, value: u32) -> ! OutOfMemory {
     for {
         let slot: TextSlot = m.slots[usize.(at)]
         if !slot.used {
-            m.slots[usize.(at)] = TextSlot.(used: true, key: key, value: value)
+            let start: u32 = u32.(m.keys.len)
+            try append(inout m.keys, key)
+            m.slots[usize.(at)] = TextSlot.(used: true, at: start, len: u32.(key.len), value: value)
             m.count += 1
             return ok
         }
-        if same_bytes(slot.key, key) {
+        if same_bytes(m.keys[usize.(slot.at)..usize.(slot.at + slot.len)], key) {
             m.slots[usize.(at)].value = value
             return ok
         }
@@ -222,17 +234,23 @@ fn grow_texts(m: inout TextMap) -> ! OutOfMemory {
     if size < 16 {
         size = 16
     }
-    let old: [..]TextSlot = m.slots
+    var old: [..]TextSlot = take(inout m.slots)
     m.slots = make(m.alloc)
-    let empty: TextSlot = TextSlot.(used: false, key: "", value: 0)
+    let empty: TextSlot = TextSlot.(used: false, at: 0, len: 0, value: 0)
     for let _: usize in 0..size {
         try push(inout m.slots, empty)
     }
-    m.count = 0
+    // The keys stay where they are; only the slots move.
+    let mask: u64 = u64.(m.slots.len) - 1
     for let slot: TextSlot in old {
         if slot.used {
-            try put_text(inout m, slot.key, slot.value)
+            var at: u64 = hash_bytes(m.keys[usize.(slot.at)..usize.(slot.at + slot.len)]) & mask
+            for m.slots[usize.(at)].used {
+                at = (at + 1) & mask
+            }
+            m.slots[usize.(at)] = slot
         }
     }
+    free(inout old)
     return ok
 }

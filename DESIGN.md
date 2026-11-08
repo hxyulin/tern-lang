@@ -1187,9 +1187,9 @@ each local to a function or a signature:
 2. **References do not escape, and a function can return a view
    derived from its parameters.** See
    [Second-class references](#second-class-references-and-parameter-modes).
-3. **Records store indices, not views.** A view is a local, a
-   parameter or a result, never a field or a `[..]T` element. See
-   [Views](#views).
+3. **Stored data holds indices, not views.** A view, and any value
+   whose type holds one, is a local, a parameter or a result, never a
+   `[..]T` element or a `var` global. See [Views](#views).
 4. **The compiler infers which globals each function writes.** Nothing
    can alias an `inout` argument. See
    [Exclusivity](#exclusivity) and [Mutable globals](#mutable-globals).
@@ -1204,12 +1204,12 @@ values. A verifier can model a `[..]T` as a sequence, with no heap.
 The earlier design, from 2026-11-08, checked bounds and null only, as
 Zig and Odin do. The one before it checked views with `in` clauses and
 `uses` lists, and the user rejected it because a type holding a view
-needed a new kind of type. Rule 3 avoids that: views never go in types,
-so no type inherits anything.
+needed a new kind of type. Rule 3 avoids that: whether a type holds a
+view is inferred, like whether it owns a buffer, and nothing is written
+for it.
 
 **Status.** Decided and being built in this order, in stage 1 and ternc
-together: rule 1, rule 4, then rules 3 and 2, which need std and ternc
-to store spans and owned text instead of views. Until a rule is built,
+together: rule 1, rule 4, rule 3, then rule 2. Until a rule is built,
 the program it would reject still compiles.
 
 - **Rule 1: built (2026-11-09)** in both checkers, with `take` on
@@ -1228,6 +1228,9 @@ the program it would reject still compiles.
   a global can be a value; `ternc` printing write sets; `noalias` on
   `inout` parameters and dropping the copy of a `let` argument rooted
   at a global; and the `shared` checks that need read sets.
+- **Rule 3: built (2026-11-09)** in both checkers: a `[..]T` element, a
+  `var` or `shared` global and a C global cannot hold a view. Rule 2
+  is not built yet, so a local view can still dangle.
 
 ### Bounds checks, no null, no pointer arithmetic
 
@@ -1441,11 +1444,22 @@ global needed.
 view is a pointer and a length into memory owned by something else.
 
 **Decided (2026-11-09): a view is a local, a parameter or a result**
-(rule 3). It cannot be a field of a declared type, an enum payload, a
-`[..]T` element or a `var` global. A named tuple can hold views, and is
-then bound by the same rule, so a function can still return
-`(head: []u8, tail: []u8)`. A `let` global can be a view of static
-data, such as a string literal, since that memory never goes away.
+(rule 3). A type that holds a view, a named tuple or a declared type,
+is bound by the same rule, so a function can still return
+`(head: []u8, tail: []u8)` and an iterator can still be
+`type Lines (rest: []u8)`. No such value can be a `[..]T` element or a
+`var` global, which outlive every frame, so every view lives in a
+frame where rule 2 follows what it borrows. A `let` global can be a
+view of static data, such as a string literal, since that memory never
+goes away. Whether a type holds a view is inferred, as whether it owns
+a buffer is.
+
+Building it changed the first wording, "never a field of a declared
+type", which the user had agreed to. That wording rejected the iterator
+design (an iterator is a struct holding a view), `fmt.Part`, whose
+`text` payload is a view, and `fmt.Chunks`. Since rule 2 follows a
+local of a view-holding record as it follows a local view, only storage
+that outlives a frame needs the ban.
 
 ```
 fn trim(s: []u8) -> []u8 { ... }
@@ -1467,10 +1481,23 @@ pub type Line enum {
 }
 ```
 
-The cost: the ini parser's `pair(key: []u8, value: []u8)` becomes a
-pair of spans into the line, or owned copies. The user accepted it on
-2026-11-09. The `Format` rule, which keeps a `Format` out of everything
-but parameters, is the same kind of check.
+The ini parser's `pair(key: []u8, value: []u8)` stays: `parse_line`
+returns it, and nothing stores it. The `Format` rule, which keeps a
+`Format` out of everything but parameters, is the same kind of check,
+stricter because a `Format` points at temporaries in its caller's
+frame.
+
+What changed when it was built (2026-11-09):
+
+- `std.rt` keeps the raw arguments and builds the view of them inside
+  `unsafe`, instead of a `var` global of views.
+- `std.fs.Entry.name` is owned text, `[..]u8`.
+- ternc stores names as spans into a file or as numbers interned in a
+  table that owns the bytes, messages as owned text, built-in names as
+  indexes into a static table, and hash map keys in a byte buffer the
+  map owns. A parse problem names what it expected by an enum.
+- An interpolation can take owned text, `[..]u8`, as well as `[]u8`,
+  since stored text is now owned.
 
 Rejected:
 
@@ -1779,7 +1806,8 @@ let s: [..]u8 = try format(alloc, "x={x}")   // owned text, explicitly
 ```
 
 - A literal without interpolation is still a `[]u8`.
-- `{}` accepts integers, `bool`, `[]u8` and other `Format` values.
+- `{}` accepts integers, `bool`, `[]u8`, `[..]u8` and other `Format`
+  values.
 - A function takes `f: Format` and writes each part where it wants: a
   file, a buffer, or a UART register on a board with no heap. The UART
   example prints this way.
@@ -1807,7 +1835,7 @@ let s: [..]u8 = try format(alloc, "x={x}")   // owned text, explicitly
   }
   ```
 
-- `{}` accepts integers, `bool`, `[]u8`, a `Format` parameter passed on,
+- `{}` accepts integers, `bool`, `[]u8`, `[..]u8`, a `Format` parameter passed on,
   and a small closed set of built-in formatters such as `hex(n, digits)`.
 - User types are not interpolated. Code interpolates their fields, or
   writes a function such as `show(p: Point, out: inout [..]u8)`.

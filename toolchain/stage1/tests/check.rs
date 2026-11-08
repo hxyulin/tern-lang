@@ -307,7 +307,7 @@ fn f(p: Point, n: u32) {
         one("strings", source),
         [
             "expected `[]u8`, found `Format`",
-            "`Point` cannot be interpolated; `{}` takes integers, `bool`, `[]u8`, a `Format` and `fmt.Part`",
+            "`Point` cannot be interpolated; `{}` takes integers, `bool`, `[]u8`, `[..]u8`, a `Format` and `fmt.Part`",
         ]
     );
 }
@@ -575,6 +575,51 @@ fn f(alloc: Allocator, b: inout Bag, s: Shape, opt: inout ?[..]u8) -> ! OutOfMem
 }
 
 #[test]
+fn views_are_not_stored() {
+    let source = "type Name (text: []u8)
+
+type Token enum {
+    word(text: []u8)
+    number(value: u32)
+}
+
+// A type that holds a view is bound by the view rule itself.
+type Lines (rest: []u8)
+
+let greeting: []u8 = \"hello\"
+
+var last: []u8 = \"\"
+
+var names: ?Name = none
+
+fn lines(text: []u8) -> Lines {
+    return Lines.(rest: text)
+}
+
+fn f(alloc: Allocator, text: []u8) -> ! OutOfMemory {
+    var words: [..][]u8 = make(alloc)
+    var tokens: [..]Token = make(alloc)
+    var owned: [..][..]u8 = make(alloc)
+    let parts: [2][]u8 = [text, greeting]
+    let it: Lines = lines(text)
+    try push(inout words, text)
+    try push(inout tokens, Token.number.(value: 1))
+    let _: usize = words.len + tokens.len + owned.len + parts.len + it.rest.len
+    return ok
+}
+";
+    assert_eq!(
+        one("views", source),
+        [
+            "a `var` global cannot be a view: it can outlive what `[]u8` points into, so store owned values or indexes",
+            "a `var` global cannot hold a view, and `?Name` holds one: it can outlive what the view points into, so store owned values or indexes",
+            "a `[..]T` element cannot be a view: it can outlive what `[]u8` points into, so store owned values or indexes",
+            "a `[..]T` element cannot hold a view, and `Token` holds one: it can outlive what the view points into, so store owned values or indexes",
+        ]
+    );
+}
+
+#[test]
 fn calls_do_not_alias_the_globals_they_write() {
     let main = "import counter
 
@@ -741,7 +786,7 @@ fn f(alloc: Allocator) {
 
 #[test]
 fn values_copy_and_free_empties() {
-    let source = "type Names (list: [..][]u8, count: u32)
+    let source = "type Names (list: [..]u32, count: u32)
 
 fn read(_: []u8) {
 }
@@ -752,7 +797,7 @@ fn f(alloc: Allocator, given: [..]u8, edit: inout [..]u8) -> [..]u8 {
     read(a)
     read(b)
     let names: Names = Names.(list: make(alloc), count: 0)
-    let list: [..][]u8 = names.list
+    let list: [..]u32 = names.list
     let _: u32 = names.count
     var c: [..]u8 = take(inout a)
     free(inout c)
@@ -762,7 +807,7 @@ fn f(alloc: Allocator, given: [..]u8, edit: inout [..]u8) -> [..]u8 {
     free(inout given)
     let n: u32 = 1
     let _: [..]u8 = take(inout n)
-    let _: [..][]u8 = list
+    let _: [..]u32 = list
     return a
 }
 ";

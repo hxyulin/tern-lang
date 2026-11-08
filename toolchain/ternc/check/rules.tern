@@ -33,9 +33,9 @@ fn spine(alloc: Allocator, input: Input, fx: Fx, e: syntax.ExprId) -> []syntax.E
     }
 }
 
-fn require_unsafe(c: inout Checker, fx: Fx, start: u32, what: []u8) -> ! OutOfMemory {
+fn require_unsafe(c: inout Checker, fx: Fx, start: u32, what: Format) -> ! OutOfMemory {
     if !fx.in_unsafe {
-        try report(inout c, fx.file, start, try program.format_text(c.alloc, "{what} needs `unsafe`"))
+        try report(inout c, fx.file, start, "{what} needs `unsafe`")
     }
     return ok
 }
@@ -62,7 +62,7 @@ fn unsafe_callee(input: Input, c: inout Checker, fx: Fx, callee: syntax.ExprId) 
                     if what.len > 0 {
                         let span: syntax.Span = expr_span(input, fx, callee)
                         let text: []u8 = file_text(input, fx.file, span)
-                        try require_unsafe(inout c, fx, span.start, try program.format_text(c.alloc, "calling {what} `{text}`"))
+                        try require_unsafe(inout c, fx, span.start, "calling {what} `{text}`")
                     }
                 }
                 _ {
@@ -83,12 +83,12 @@ fn use_decl(input: Input, c: inout Checker, fx: Fx, e: syntax.ExprId, decl: maps
     match decl_of(input, decl).kind {
         global(is_shared: bool, local: _) {
             if is_shared && !is_locked(fx, decl) {
-                try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "`{shown}` is `shared`: use it inside `lock {shown} \{ ... }`"))
+                try report(inout c, fx.file, span.start, "`{shown}` is `shared`: use it inside `lock {shown} \{ ... }`")
             }
         }
         extern_var(mutable: _, name: _, ty: _) {
             if !marked(fx.addressed, u32.(e)) {
-                try require_unsafe(inout c, fx, span.start, try program.format_text(c.alloc, "using the C global `{shown}`"))
+                try require_unsafe(inout c, fx, span.start, "using the C global `{shown}`")
             }
         }
         _ {
@@ -119,7 +119,8 @@ type Root enum {
 
 // One step from a root to an argument's storage.
 type Step enum {
-    field(name: []u8)
+    // The field's name in the file being checked.
+    field(name: syntax.Span)
     // An index, when it is a constant.
     index(at: ?Wide)
     deref
@@ -150,11 +151,11 @@ fn exclusive(input: Input, c: inout Checker, fx: Fx, args: []ArgMode) -> ! OutOf
                         none {
                         }
                         some(value as path_b: AccessPath) {
-                            if overlaps(path_a, path_b) {
+                            if overlaps(input, fx.file, path_a, path_b) {
                                 let span: syntax.Span = expr_span(input, fx, args[j].e)
                                 let b_text: []u8 = file_text(input, fx.file, span)
                                 let a_text: []u8 = file_text(input, fx.file, expr_span(input, fx, args[i].e))
-                                try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "`{b_text}` overlaps `{a_text}`, which is passed `inout`; an `inout` argument must not overlap another argument"))
+                                try report(inout c, fx.file, span.start, "`{b_text}` overlaps `{a_text}`, which is passed `inout`; an `inout` argument must not overlap another argument")
                             }
                         }
                     }
@@ -220,7 +221,7 @@ fn access_path(input: Input, c: Checker, fx: Fx, e: syntax.ExprId) -> ?AccessPat
             }
             match try access_path(input, c, fx, value) {
                 some(value as var path: AccessPath) {
-                    try push(inout path.steps, Step.field.(name: file_text(input, fx.file, name)))
+                    try push(inout path.steps, Step.field.(name: name))
                     return ok.(value: some.(value: path))
                 }
                 none {
@@ -295,7 +296,7 @@ fn same_root(a: Root, b: Root) -> bool {
 // Whether two access paths can name the same storage: the same root, and
 // no step where they go to different fields or different constant
 // indexes.
-fn overlaps(a: AccessPath, b: AccessPath) -> bool {
+fn overlaps(input: Input, file: u32, a: AccessPath, b: AccessPath) -> bool {
     if !same_root(a.root, b.root) {
         return false
     }
@@ -305,10 +306,10 @@ fn overlaps(a: AccessPath, b: AccessPath) -> bool {
     }
     for let i: usize in 0..n {
         match a.steps[i] {
-            field(name as m: []u8) {
+            field(name as m: syntax.Span) {
                 match b.steps[i] {
-                    field(name as k: []u8) {
-                        if !program.bytes_equal(m, k) {
+                    field(name as k: syntax.Span) {
+                        if !program.bytes_equal(file_text(input, file, m), file_text(input, file, k)) {
                             return false
                         }
                     }
@@ -430,6 +431,125 @@ fn owning(c: inout Checker, ty: TyId) -> bool ! OutOfMemory {
     return ok.(value: result)
 }
 
+// Views are not stored (rule 3).
+
+// A written `[..]T`: where its type starts, and its element type.
+type GrowableUse (file: u32, start: u32, elem: TyId)
+
+// Whether a value of ty holds a view. Such a value is a local, a
+// parameter or a result, where rule 2 follows what it borrows. A pointer
+// and a function value hold none that the checker follows.
+fn holds_view(c: inout Checker, ty: TyId) -> bool ! OutOfMemory {
+    match maps.get_int(c.views, u32.(ty)) {
+        some(value as known: u32) {
+            return ok.(value: known == 1)
+        }
+        none {
+        }
+    }
+    // A type that holds itself does so through a `[..]T` or a pointer,
+    // which never hold a view.
+    try maps.put_int(inout c.views, u32.(ty), 0)
+    if is_builtin_named(c, ty, BuiltinNamed.format) || is_builtin_named(c, ty, BuiltinNamed.panic_info) {
+        try maps.put_int(inout c.views, u32.(ty), 1)
+        return ok.(value: true)
+    }
+    var parts: [..]TyId = make(c.alloc)
+    match get(c.types, ty) {
+        view(elem: _) {
+            try maps.put_int(inout c.views, u32.(ty), 1)
+            return ok.(value: true)
+        }
+        tuple(fields: Range) {
+            for let f: TupleField in tuple_fields(c.types, fields) {
+                try push(inout parts, f.ty)
+            }
+        }
+        array(len: _, elem: TyId) {
+            try push(inout parts, elem)
+        }
+        optional(elem: TyId) {
+            try push(inout parts, elem)
+        }
+        result(value: ?TyId, error: TyId) {
+            match value {
+                some(value as v: TyId) {
+                    try push(inout parts, v)
+                }
+                none {
+                }
+            }
+            try push(inout parts, error)
+        }
+        named(id: _) {
+            match info_of(c, ty) {
+                some(value as info: NamedInfo) {
+                    match info.def {
+                        plain(underlying: TyId, pub_fields: _) {
+                            try push(inout parts, underlying)
+                        }
+                        enum_def(info as e: EnumInfo) {
+                            for let v: Variant in enum_variants(c.types, e) {
+                                match v.payload {
+                                    some(value as p: TyId) {
+                                        try push(inout parts, p)
+                                    }
+                                    none {
+                                    }
+                                }
+                            }
+                        }
+                        union_def(fields: Range) {
+                            for let f: TupleField in tuple_fields(c.types, fields) {
+                                try push(inout parts, f.ty)
+                            }
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        _ {
+        }
+    }
+    var result: bool = false
+    for let t: TyId in parts {
+        if try holds_view(inout c, t) {
+            result = true
+            break
+        }
+    }
+    try maps.put_int(inout c.views, u32.(ty), if result { 1 } else { 0 })
+    return ok.(value: result)
+}
+
+// ty is the type of what, which outlives every frame: a `[..]T` element
+// or a `var` global. A `Format` is reported by the `Format` rule instead.
+fn no_view(input: Input, c: inout Checker, file: u32, start: u32, ty: TyId, what: []u8) -> ! OutOfMemory {
+    if is_error(c.types, ty) || holds_format(input, c, ty) || !(try holds_view(inout c, ty)) {
+        return ok
+    }
+    let shown: []u8 = try show(inout c, ty)
+    return match get(c.types, ty) {
+        view(elem: _) {
+            report(inout c, file, start, "{what} cannot be a view: it can outlive what `{shown}` points into, so store owned values or indexes")
+        }
+        _ {
+            report(inout c, file, start, "{what} cannot hold a view, and `{shown}` holds one: it can outlive what the view points into, so store owned values or indexes")
+        }
+    }
+}
+
+// Every written `[..]T`, once every type is known.
+fn no_views_in_growables(input: Input, c: inout Checker) -> ! OutOfMemory {
+    for let k: usize in 0..c.growables.len {
+        let u: GrowableUse = c.growables[k]
+        try no_view(input, inout c, u.file, u.start, u.elem, "a `[..]T` element")
+    }
+    return ok
+}
+
 // Whether `take` can leave a value of ty empty: each owning part is a
 // `[..]T` or an optional, which becomes `none`, or a record or tuple
 // whose owning parts are.
@@ -532,14 +652,14 @@ fn fresh(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, target:
                                                 for let m: u32 in d {
                                                     if m == id {
                                                         let root: []u8 = file_text(input, fx.file, try root_name(input, c, fx, e))
-                                                        try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "a `defer` uses `{root}` after this `return`; hand the value over with `take(inout {text})`"))
+                                                        try report(inout c, fx.file, span.start, "a `defer` uses `{root}` after this `return`; hand the value over with `take(inout {text})`")
                                                         return ok
                                                     }
                                                 }
                                             }
                                             for let t: AccessPath in fx.taken {
-                                                if overlaps(t, path) {
-                                                    try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "this `return` already takes `{text}` or part of it; a buffer can go to only one place"))
+                                                if overlaps(input, fx.file, t, path) {
+                                                    try report(inout c, fx.file, span.start, "this `return` already takes `{text}` or part of it; a buffer can go to only one place")
                                                     return ok
                                                 }
                                             }
@@ -555,7 +675,7 @@ fn fresh(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, target:
                             }
                         }
                     }
-                    try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "this would copy `{text}`, and its buffer would have two owners; hand it over with `take(inout {text})` or make a second one with `try copy(alloc, {text})`"))
+                    try report(inout c, fx.file, span.start, "this would copy `{text}`, and its buffer would have two owners; hand it over with `take(inout {text})` or make a second one with `try copy(alloc, {text})`")
                 }
                 none {
                 }
@@ -578,7 +698,7 @@ fn root_name(input: Input, c: Checker, fx: Fx, e: syntax.ExprId) -> syntax.Span 
 fn no_owning_copy(c: inout Checker, file: u32, start: u32, name: []u8, elem: TyId) -> ! OutOfMemory {
     if try owning(inout c, elem) {
         let shown: []u8 = try show(inout c, elem)
-        try report(inout c, file, start, try program.format_text(c.alloc, "`{name}` copies each element, and a `{shown}` cannot be copied: its buffer would have two owners"))
+        try report(inout c, file, start, "`{name}` copies each element, and a `{shown}` cannot be copied: its buffer would have two owners")
     }
     return ok
 }
@@ -664,7 +784,7 @@ fn no_format(input: Input, c: inout Checker, file: u32, start: u32, ty: TyId) ->
         return report(inout c, file, start, "a `Format` can only be a parameter: it points into the frame of the call that made it")
     }
     let shown: []u8 = try show(inout c, ty)
-    return report(inout c, file, start, try program.format_text(c.alloc, "`{shown}` holds a `Format`, which can only be a parameter: it points into the frame of the call that made it"))
+    return report(inout c, file, start, "`{shown}` holds a `Format`, which can only be a parameter: it points into the frame of the call that made it")
 }
 
 // A parameter's type may be `Format` itself, but not hold one.
@@ -968,7 +1088,8 @@ fn is_type_expr(input: Input, file: u32, e: syntax.ExprId) -> bool {
     match expr_res(input, file, e) {
         some(value as res: resolve.Res) {
             match res {
-                builtin(name: []u8) {
+                builtin(id as builtin_index: u32) {
+                    let name: []u8 = resolve.builtin_name(builtin_index)
                     return resolve.is_builtin_type(name)
                 }
                 decl(decl as d: maps.DeclRef) {

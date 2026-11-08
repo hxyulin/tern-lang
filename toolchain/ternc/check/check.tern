@@ -42,13 +42,14 @@ pub type Item enum {
     // A call that returns nothing.
     nothing
     type_item(ty: TyId)
-    builtin(name: []u8)
+    builtin(id: u32)
     // A variant with a payload, before `.(...)`.
     variant(ty: TyId, index: u32)
 }
 
 // A problem, before sorting by file and position.
-type Found (file: u32, start: u32, message: []u8)
+// A problem: message is its index in the checker's messages.
+type Found (file: u32, start: u32, message: u32)
 
 // What checking reads: the program and its names.
 type Input (program: program.Program, names: resolve.Resolution)
@@ -60,9 +61,15 @@ type Checker (
     // Each function's type, by declaration number.
     fn_tys: [..]?TyId,
     found: [..]Found,
+    // The text of each problem, by its index in found.
+    messages: [..][..]u8,
     files: [..]FileTypes,
     // Which types hold a `[..]T`, as 1 or 0; see owning.
     owning: maps.IntMap,
+    // Which types hold a view, as 1 or 0; see holds_view.
+    views: maps.IntMap,
+    // Each written `[..]T`, checked once every type is known.
+    growables: [..]GrowableUse,
     // What each function writes and calls directly, and the functions used
     // as values; see effects.tern.
     direct_writes: [..]DirectWrite,
@@ -109,7 +116,8 @@ type Fx (
 )
 
 // Which arms a `match` has covered.
-type Coverage (variants: [..][]u8, wildcard: bool)
+// The variants matched so far, as name numbers.
+type Coverage (variants: [..]u32, wildcard: bool)
 
 // Checks p, whose names are resolved in names. It borrows both for the
 // duration and gives them back unchanged.
@@ -120,8 +128,11 @@ pub fn check(alloc: Allocator, p: inout program.Program, names: inout resolve.Re
         types: try new_types(alloc, input.program),
         fn_tys: make(alloc),
         found: make(alloc),
+        messages: make(alloc),
         files: make(alloc),
         owning: maps.new_ints(alloc),
+        views: maps.new_ints(alloc),
+        growables: make(alloc),
         direct_writes: make(alloc),
         call_sites: make(alloc),
         call_args: make(alloc),
@@ -147,13 +158,13 @@ pub fn check(alloc: Allocator, p: inout program.Program, names: inout resolve.Re
             try check_decl(input, inout c, d, decls[index].kind)
         }
     }
+    try no_views_in_growables(input, inout c)
     try check_effects(input, inout c)
     // Stable: problems at one place keep the order they were found.
-    let sorted: []Found = try sort_found(alloc, c.found)
+    let sorted: [..]Found = try sort_found(alloc, c.found)
     var diagnostics: [..]program.Diagnostic = make(alloc)
     for let d: Found in sorted {
-        let message: program.Message = program.Message.text.(start: d.start, message: d.message)
-        try push(inout diagnostics, program.Diagnostic.(file: d.file, message: message))
+        try push(inout diagnostics, program.Diagnostic.(file: d.file, message: program.Message.text.(start: d.start, message: take(inout c.messages[usize.(d.message)]))))
     }
     p = take(inout input.program)
     names = take(inout input.names)
@@ -168,7 +179,7 @@ fn found_before(a: Found, b: Found) -> bool {
 }
 
 // A stable merge sort by file and position.
-fn sort_found(alloc: Allocator, items: []Found) -> []Found ! OutOfMemory {
+fn sort_found(alloc: Allocator, items: []Found) -> [..]Found ! OutOfMemory {
     var a: [..]Found = make(alloc)
     try append(inout a, items)
     var b: [..]Found = make(alloc)
@@ -208,8 +219,9 @@ fn sort_found(alloc: Allocator, items: []Found) -> []Found ! OutOfMemory {
     return ok.(value: a)
 }
 
-fn report(c: inout Checker, file: u32, start: u32, message: []u8) -> ! OutOfMemory {
-    try push(inout c.found, Found.(file: file, start: start, message: message))
+fn report(c: inout Checker, file: u32, start: u32, message: Format) -> ! OutOfMemory {
+    try push(inout c.found, Found.(file: file, start: start, message: u32.(c.messages.len)))
+    try push(inout c.messages, try program.format_text(c.alloc, message))
     return ok
 }
 
@@ -245,8 +257,22 @@ fn decl_of(input: Input, decl: maps.DeclRef) -> syntax.Decl {
 // Types.
 
 fn lower(input: Input, c: inout Checker, file: u32, id: syntax.TypeId) -> TyId ! OutOfMemory {
+    let first: bool = match c.files[usize.(file)].types[usize.(id)] {
+        some(value: _) { false }
+        none { true }
+    }
     let ty: TyId = try lower_type(input, inout c, file, id)
     c.files[usize.(file)].types[usize.(id)] = some.(value: ty)
+    if first {
+        match get(c.types, ty) {
+            growable(elem: TyId) {
+                let start: u32 = input.program.files[usize.(file)].ast.types[usize.(id)].span.start
+                try push(inout c.growables, GrowableUse.(file: file, start: start, elem: elem))
+            }
+            _ {
+            }
+        }
+    }
     return ok.(value: ty)
 }
 
@@ -268,7 +294,8 @@ fn lower_type(input: Input, c: inout Checker, file: u32, id: syntax.TypeId) -> T
             match input.names.files[usize.(file)].types[usize.(id)] {
                 some(value as res: resolve.Res) {
                     match res {
-                        builtin(name as b: []u8) {
+                        builtin(id as builtin_index: u32) {
+                            let b: []u8 = resolve.builtin_name(builtin_index)
                             return builtin_type(input, inout c, b)
                         }
                         decl(decl as d: maps.DeclRef) {
@@ -288,7 +315,7 @@ fn lower_type(input: Input, c: inout Checker, file: u32, id: syntax.TypeId) -> T
             for let i: u32 in syntax.items(ast.extra, fields) {
                 let f: syntax.Field = ast.fields[usize.(i)]
                 let ty: TyId = try lower(input, inout c, file, f.ty)
-                try push(inout lowered, TupleField.(name: file_text(input, file, f.name), ty: ty))
+                try push(inout lowered, TupleField.(name: try name_number(inout c.types, file_text(input, file, f.name)), ty: ty))
             }
             return tuple_ty(inout c.types, lowered)
         }
@@ -379,7 +406,7 @@ fn named_type(input: Input, c: inout Checker, id: NamedId) -> TyId ! OutOfMemory
     // A placeholder, so a type that refers to itself through a view or
     // pointer does not recurse forever.
     let placeholder: NamedInfo = NamedInfo.(
-        display: "",
+        display: try name_number(inout c.types, ""),
         package: none,
         def: NamedDef.union_def.(fields: Range.(start: 0, len: 0)),
     )
@@ -416,9 +443,9 @@ fn named_decl(input: Input, c: inout Checker, decl: maps.DeclRef) -> NamedInfo !
     }
     let tail: []u8 = path[last..]
     let short: []u8 = file_text(input, decl.file, name)
-    var display: []u8 = short
+    var display: u32 = try name_number(inout c.types, short)
     if tail.len > 0 {
-        display = try program.format_text(c.alloc, "{tail}.{short}")
+        display = try name_number(inout c.types, try program.format_text(c.alloc, "{tail}.{short}"))
     }
     var out: NamedDef = NamedDef.union_def.(fields: Range.(start: 0, len: 0))
     match def {
@@ -471,7 +498,7 @@ fn named_decl(input: Input, c: inout Checker, decl: maps.DeclRef) -> NamedInfo !
                             none {
                             }
                         }
-                        try push(inout found, Variant.(name: file_text(input, decl.file, n), payload: p, value: v))
+                        try push(inout found, Variant.(name: try name_number(inout c.types, file_text(input, decl.file, n)), payload: p, value: v))
                     }
                     open(span: _) {
                         open = true
@@ -488,7 +515,7 @@ fn named_decl(input: Input, c: inout Checker, decl: maps.DeclRef) -> NamedInfo !
             for let i: u32 in syntax.items(f.ast.extra, fields) {
                 let field: syntax.Field = f.ast.fields[usize.(i)]
                 let ty: TyId = try lower(input, inout c, decl.file, field.ty)
-                try push(inout members, TupleField.(name: file_text(input, decl.file, field.name), ty: ty))
+                try push(inout members, TupleField.(name: try name_number(inout c.types, file_text(input, decl.file, field.name)), ty: ty))
             }
             let start: u32 = u32.(c.types.fields.len)
             try append(inout c.types.fields, members)
@@ -516,7 +543,7 @@ fn enum_value(input: Input, c: inout Checker, file: u32, e: syntax.ExprId, int: 
                         var buf: [48]u8 = fill[48](0)
                         let shown: []u8 = wide_text(inout buf, n)
                         let name: []u8 = int_name(k)
-                        try report(inout c, file, start, try program.format_text(c.alloc, "`{shown}` does not fit in `{name}`"))
+                        try report(inout c, file, start, "`{shown}` does not fit in `{name}`")
                     }
                     return ok.(value: some.(value: n))
                 }
@@ -532,7 +559,7 @@ fn plain_record(c: inout Checker, display: []u8, fields: []TupleField) -> NamedI
         try push(inout c.types.pub_fields, true)
     }
     let def: NamedDef = NamedDef.plain.(underlying: underlying, pub_fields: Range.(start: start, len: u32.(fields.len)))
-    return ok.(value: NamedInfo.(display: display, package: none, def: def))
+    return ok.(value: NamedInfo.(display: try name_number(inout c.types, display), package: none, def: def))
 }
 
 fn let_params(alloc: Allocator, tys: []TyId) -> []FnParam ! OutOfMemory {
@@ -557,10 +584,10 @@ fn named_builtin(input: Input, c: inout Checker, which: BuiltinNamed) -> NamedIn
             let free_params: [4]TyId = [context, ptr, size, size]
             let free_fn: TyId = try fn_ty(inout c.types, try let_params(c.alloc, free_params), none)
             let fields: [4]TupleField = [
-                TupleField.(name: "context", ty: context),
-                TupleField.(name: "alloc", ty: alloc_fn),
-                TupleField.(name: "resize", ty: resize_fn),
-                TupleField.(name: "free", ty: free_fn),
+                TupleField.(name: try name_number(inout c.types, "context"), ty: context),
+                TupleField.(name: try name_number(inout c.types, "alloc"), ty: alloc_fn),
+                TupleField.(name: try name_number(inout c.types, "resize"), ty: resize_fn),
+                TupleField.(name: try name_number(inout c.types, "free"), ty: free_fn),
             ]
             return plain_record(inout c, "Allocator", fields)
         }
@@ -570,7 +597,7 @@ fn named_builtin(input: Input, c: inout Checker, which: BuiltinNamed) -> NamedIn
                 some(value as p: maps.DeclRef) {
                     let part: TyId = try named_type(input, inout c, NamedId.decl.(decl: p))
                     let parts: TyId = try intern(inout c.types, Ty.view.(elem: part))
-                    let fields: [1]TupleField = [TupleField.(name: "parts", ty: parts)]
+                    let fields: [1]TupleField = [TupleField.(name: try name_number(inout c.types, "parts"), ty: parts)]
                     return plain_record(inout c, "Format", fields)
                 }
                 none {
@@ -584,19 +611,19 @@ fn named_builtin(input: Input, c: inout Checker, which: BuiltinNamed) -> NamedIn
             let bytes: TyId = try bytes_ty(inout c.types)
             let word_ty: TyId = try int_ty(inout c.types, IntTy.u32)
             let fields: [5]TupleField = [
-                TupleField.(name: "message", ty: format),
-                TupleField.(name: "file", ty: bytes),
-                TupleField.(name: "line", ty: word_ty),
-                TupleField.(name: "column", ty: word_ty),
-                TupleField.(name: "function", ty: bytes),
+                TupleField.(name: try name_number(inout c.types, "message"), ty: format),
+                TupleField.(name: try name_number(inout c.types, "file"), ty: bytes),
+                TupleField.(name: try name_number(inout c.types, "line"), ty: word_ty),
+                TupleField.(name: try name_number(inout c.types, "column"), ty: word_ty),
+                TupleField.(name: try name_number(inout c.types, "function"), ty: bytes),
             ]
             return plain_record(inout c, "PanicInfo", fields)
         }
         out_of_memory {
             let start: u32 = u32.(c.types.variants.len)
-            try push(inout c.types.variants, Variant.(name: "out_of_memory", payload: none, value: none))
+            try push(inout c.types.variants, Variant.(name: try name_number(inout c.types, "out_of_memory"), payload: none, value: none))
             let info: EnumInfo = EnumInfo.(variants: Range.(start: start, len: 1), int: none, open: false)
-            return ok.(value: NamedInfo.(display: "OutOfMemory", package: none, def: NamedDef.enum_def.(info: info)))
+            return ok.(value: NamedInfo.(display: try name_number(inout c.types, "OutOfMemory"), package: none, def: NamedDef.enum_def.(info: info)))
         }
     }
 }
@@ -678,7 +705,7 @@ fn is_float(c: Checker, ty: TyId) -> bool {
 }
 
 // A field of a record, and whether it is visible from a file.
-type RecordField (name: []u8, ty: TyId, visible: bool)
+type RecordField (name: u32, ty: TyId, visible: bool)
 
 // The fields of a record, or none if ty is not one.
 fn record_fields(input: Input, c: Checker, ty: TyId, file: u32) -> ?[]RecordField ! OutOfMemory {
@@ -743,7 +770,7 @@ fn record_fields(input: Input, c: Checker, ty: TyId, file: u32) -> ?[]RecordFiel
 }
 
 // A variant of an enum, optional or result: its name and payload.
-type VariantSig (name: []u8, payload: ?TyId)
+type VariantSig (name: u32, payload: ?TyId)
 
 // The variants of an enum, optional or result, and whether it is open.
 type Variants (list: []VariantSig, open: bool)
@@ -753,8 +780,8 @@ fn variants_of(c: inout Checker, ty: TyId) -> ?Variants ! OutOfMemory {
     match get(c.types, ty) {
         optional(elem: TyId) {
             let payload: TyId = try single_field(inout c.types, "value", elem)
-            try push(inout list, VariantSig.(name: "some", payload: some.(value: payload)))
-            try push(inout list, VariantSig.(name: "none", payload: none))
+            try push(inout list, VariantSig.(name: try name_number(inout c.types, "some"), payload: some.(value: payload)))
+            try push(inout list, VariantSig.(name: try name_number(inout c.types, "none"), payload: none))
             return ok.(value: some.(value: Variants.(list: list, open: false)))
         }
         result(value: ?TyId, error: TyId) {
@@ -767,8 +794,8 @@ fn variants_of(c: inout Checker, ty: TyId) -> ?Variants ! OutOfMemory {
                 }
             }
             let err_payload: TyId = try single_field(inout c.types, "error", error)
-            try push(inout list, VariantSig.(name: "ok", payload: ok_payload))
-            try push(inout list, VariantSig.(name: "err", payload: some.(value: err_payload)))
+            try push(inout list, VariantSig.(name: try name_number(inout c.types, "ok"), payload: ok_payload))
+            try push(inout list, VariantSig.(name: try name_number(inout c.types, "err"), payload: some.(value: err_payload)))
             return ok.(value: some.(value: Variants.(list: list, open: false)))
         }
         named(id: _) {
@@ -875,7 +902,7 @@ fn expect_ty(c: inout Checker, file: u32, start: u32, actual: TyId, expected: Ty
     if !coerces(c, actual, expected) {
         let want: []u8 = try show(inout c, expected)
         let got: []u8 = try show(inout c, actual)
-        try report(inout c, file, start, try program.format_text(c.alloc, "expected `{want}`, found `{got}`"))
+        try report(inout c, file, start, "expected `{want}`, found `{got}`")
     }
     return ok
 }
@@ -1135,7 +1162,7 @@ fn check_decl(input: Input, c: inout Checker, decl: maps.DeclRef, kind: syntax.D
                             let shown: []u8 = try show(inout c, r)
                             message = try program.format_text(c.alloc, "this function can reach its end without returning a `{shown}`")
                         }
-                        try report(inout c, file, name.start, message)
+                        try report(inout c, file, name.start, "{message}")
                     }
                 }
                 none {
@@ -1175,16 +1202,20 @@ fn check_decl(input: Input, c: inout Checker, decl: maps.DeclRef, kind: syntax.D
         extern_var(mutable: _, name: _, ty as t: syntax.TypeId) {
             let ty: TyId = try lower(input, inout c, file, t)
             try no_format(input, inout c, file, ast.types[usize.(t)].span.start, ty)
+            try no_view(input, inout c, file, ast.types[usize.(t)].span.start, ty, "a C global")
         }
         type_decl(name: _, def: syntax.TypeDef) {
             let ty: TyId = try named_type(input, inout c, NamedId.decl.(decl: decl))
             try no_format_in_type(input, inout c, file, def, ty)
         }
-        global(is_shared: _, local: syntax.Local) {
+        global(is_shared: bool, local: syntax.Local) {
             match local.binding {
                 single(name: _, ty as t: syntax.TypeId) {
                     let ty: TyId = try lower(input, inout c, file, t)
                     try no_format(input, inout c, file, ast.types[usize.(t)].span.start, ty)
+                    if local.mutable || is_shared {
+                        try no_view(input, inout c, file, ast.types[usize.(t)].span.start, ty, "a `var` global")
+                    }
                     let _: TyId = try check_expect(input, inout c, inout fx, local.value, ty)
                 }
                 destructure(fields: syntax.List) {
@@ -1229,9 +1260,9 @@ fn local_info(fx: Fx, id: u32) -> ?LocalInfo {
     }
 }
 
-fn find_field(fields: []RecordField, name: []u8) -> ?RecordField {
+fn find_field(t: Types, fields: []RecordField, name: []u8) -> ?RecordField {
     for let f: RecordField in fields {
-        if program.bytes_equal(f.name, name) {
+        if program.bytes_equal(name_of(t, f.name), name) {
             return some.(value: f)
         }
     }
@@ -1255,22 +1286,22 @@ fn destructure_fields(input: Input, c: inout Checker, fx: inout Fx, fields: synt
         }
         none {
             let shown: []u8 = try show(inout c, value)
-            try report(inout c, fx.file, start, try program.format_text(c.alloc, "only a record can be destructured, not `{shown}`"))
+            try report(inout c, fx.file, start, "only a record can be destructured, not `{shown}`")
             return ok
         }
     }
     for let i: u32 in syntax.items(ast.extra, fields) {
         let field: syntax.DestructField = ast.destructs[usize.(i)]
         let name: []u8 = file_text(input, fx.file, field.field)
-        match find_field(record, name) {
+        match find_field(c.types, record, name) {
             none {
                 let shown: []u8 = try show(inout c, value)
-                try report(inout c, fx.file, field.field.start, try program.format_text(c.alloc, "`{shown}` has no field `{name}`"))
+                try report(inout c, fx.file, field.field.start, "`{shown}` has no field `{name}`")
             }
             some(value as rf: RecordField) {
                 if !rf.visible {
                     let shown: []u8 = try show(inout c, value)
-                    try report(inout c, fx.file, field.field.start, try program.format_text(c.alloc, "field `{name}` of `{shown}` is private to its package"))
+                    try report(inout c, fx.file, field.field.start, "field `{name}` of `{shown}` is private to its package")
                 }
                 match field.ty {
                     some(value as t: syntax.TypeId) {
@@ -1280,7 +1311,7 @@ fn destructure_fields(input: Input, c: inout Checker, fx: inout Fx, fields: synt
                         if !is_error(c.types, declared) && !same_ty(declared, rf.ty) {
                             let have: []u8 = try show(inout c, rf.ty)
                             let want: []u8 = try show(inout c, declared)
-                            try report(inout c, fx.file, tstart, try program.format_text(c.alloc, "field `{name}` is `{have}`, not `{want}`"))
+                            try report(inout c, fx.file, tstart, "field `{name}` is `{have}`, not `{want}`")
                         }
                         var bound: syntax.Span = field.field
                         match field.rename {
@@ -1293,7 +1324,7 @@ fn destructure_fields(input: Input, c: inout Checker, fx: inout Fx, fields: synt
                         let field_mutable: bool = mutable || field.mutable
                         if borrowed && field_mutable && (try owning(inout c, rf.ty)) {
                             let bound_text: []u8 = file_text(input, fx.file, bound)
-                            try report(inout c, fx.file, bound.start, try program.format_text(c.alloc, "`{bound_text}` would be a second owner of a buffer in a place that keeps it; bind it without `var`, or take the value first, as in `match take(inout x)`"))
+                            try report(inout c, fx.file, bound.start, "`{bound_text}` would be a second owner of a buffer in a place that keeps it; bind it without `var`, or take the value first, as in `match take(inout x)`")
                         }
                         try bind_local(input, inout c, inout fx, bound, rf.ty, field_mutable, !borrowed)
                     }
@@ -1459,7 +1490,7 @@ fn check_stmt(input: Input, c: inout Checker, fx: inout Fx, id: syntax.StmtId) -
                 value(ty: TyId) {
                     if !is_error(c.types, ty) {
                         let shown: []u8 = try show(inout c, ty)
-                        try report(inout c, fx.file, start, try program.format_text(c.alloc, "`defer` takes a call that returns nothing; this one returns `{shown}`"))
+                        try report(inout c, fx.file, start, "`defer` takes a call that returns nothing; this one returns `{shown}`")
                     }
                 }
                 _ {
@@ -1491,7 +1522,7 @@ fn check_stmt(input: Input, c: inout Checker, fx: inout Fx, id: syntax.StmtId) -
                         }
                         if taken {
                             let text: []u8 = file_text(input, fx.file, g.name)
-                            try report(inout c, fx.file, g.name.start, try program.format_text(c.alloc, "`{text}` is already taken by this `lock`"))
+                            try report(inout c, fx.file, g.name.start, "`{text}` is already taken by this `lock`")
                         }
                         try push(inout fx.locked, d)
                     }
@@ -1521,7 +1552,7 @@ fn check_stmt(input: Input, c: inout Checker, fx: inout Fx, id: syntax.StmtId) -
                         }
                         _ {
                             let shown: []u8 = try show(inout c, ty)
-                            try report(inout c, fx.file, start, try program.format_text(c.alloc, "the `{shown}` this returns is ignored; write `let _: {shown} = ...` to discard it"))
+                            try report(inout c, fx.file, start, "the `{shown}` this returns is ignored; write `let _: {shown} = ...` to discard it")
                             return ok.(value: false)
                         }
                     }
@@ -1575,7 +1606,7 @@ fn return_stmt(input: Input, c: inout Checker, fx: inout Fx, value: ?syntax.Expr
                         let shown: []u8 = try show(inout c, result)
                         message = try program.format_text(c.alloc, "this function returns a `{shown}`")
                     }
-                    try report(inout c, fx.file, start, message)
+                    try report(inout c, fx.file, start, "{message}")
                 }
                 some(value as e: syntax.ExprId) {
                     fx.returning = true
@@ -1644,7 +1675,7 @@ fn assign_stmt(input: Input, c: inout Checker, fx: inout Fx, left: syntax.ExprId
     }
     if !fine {
         let shown: []u8 = try show(inout c, ty)
-        try report(inout c, fx.file, expr_span(input, fx, left).start, try program.format_text(c.alloc, "this operator does not apply to `{shown}`"))
+        try report(inout c, fx.file, expr_span(input, fx, left).start, "this operator does not apply to `{shown}`")
     }
     if op == syntax.AssignOp.shl || op == syntax.AssignOp.shr {
         try shift_amount(input, inout c, inout fx, right, ty)
@@ -1670,7 +1701,7 @@ fn for_in(input: Input, c: inout Checker, fx: inout Fx, mutable: bool, binding: 
                     }
                     if !is_int && !is_error(c.types, ty) {
                         let shown: []u8 = try show(inout c, ty)
-                        try report(inout c, fx.file, expr_span(input, fx, first).start, try program.format_text(c.alloc, "a range yields integers, not `{shown}`"))
+                        try report(inout c, fx.file, expr_span(input, fx, first).start, "a range yields integers, not `{shown}`")
                     }
                     let _: TyId = try check_expect(input, inout c, inout fx, first, ty)
                     let _: TyId = try check_expect(input, inout c, inout fx, end, ty)
@@ -1696,7 +1727,7 @@ fn for_in(input: Input, c: inout Checker, fx: inout Fx, mutable: bool, binding: 
                     if !coerces(c, elem, declared) {
                         let yields: []u8 = try show(inout c, elem)
                         let shown: []u8 = try show(inout c, declared)
-                        try report(inout c, fx.file, tstart, try program.format_text(c.alloc, "the loop yields `{yields}`, not `{shown}`"))
+                        try report(inout c, fx.file, tstart, "the loop yields `{yields}`, not `{shown}`")
                     }
                     if mutable && (try owning(inout c, declared)) {
                         try report(inout c, fx.file, tstart, "`for var` would copy each element, and its buffer would have two owners; use `for let`")
@@ -1781,7 +1812,7 @@ fn element_of_iterable(input: Input, c: inout Checker, fx: Fx, ty: TyId, start: 
         }
     }
     let shown: []u8 = try show(inout c, ty)
-    try report(inout c, fx.file, start, try program.format_text(c.alloc, "`{shown}` cannot be iterated: its package has no `fn next(it: inout {shown}) -> ?T`"))
+    try report(inout c, fx.file, start, "`{shown}` cannot be iterated: its package has no `fn next(it: inout {shown}) -> ?T`")
     return error_ty(inout c.types)
 }
 
@@ -1797,9 +1828,9 @@ fn check_patterns(input: Input, c: inout Checker, fx: inout Fx, pats: syntax.Lis
     return ok
 }
 
-fn covered(coverage: Coverage, name: []u8) -> bool {
-    for let v: []u8 in coverage.variants {
-        if program.bytes_equal(v, name) {
+fn covered(coverage: Coverage, name: u32) -> bool {
+    for let v: u32 in coverage.variants {
+        if v == name {
             return true
         }
     }
@@ -1825,7 +1856,7 @@ fn check_pattern(input: Input, c: inout Checker, fx: inout Fx, pat: syntax.PatId
             match try variants_of(inout c, scrutinee) {
                 none {
                     let shown: []u8 = try show(inout c, scrutinee)
-                    try report(inout c, fx.file, name.start, try program.format_text(c.alloc, "`{shown}` has no variants; match it with literals and `_`"))
+                    try report(inout c, fx.file, name.start, "`{shown}` has no variants; match it with literals and `_`")
                     return ok
                 }
                 some(value as vs: Variants) {
@@ -1835,20 +1866,21 @@ fn check_pattern(input: Input, c: inout Checker, fx: inout Fx, pat: syntax.PatId
             var found: bool = false
             var payload_of: ?TyId = none
             for let v: VariantSig in list {
-                if !found && program.bytes_equal(v.name, text) {
+                if !found && program.bytes_equal(name_of(c.types, v.name), text) {
                     found = true
                     payload_of = v.payload
                 }
             }
             if !found {
                 let shown: []u8 = try show(inout c, scrutinee)
-                try report(inout c, fx.file, name.start, try program.format_text(c.alloc, "`{text}` is not a variant of `{shown}`"))
+                try report(inout c, fx.file, name.start, "`{text}` is not a variant of `{shown}`")
                 return ok
             }
-            if covered(coverage, text) {
-                try report(inout c, fx.file, name.start, try program.format_text(c.alloc, "`{text}` is already matched"))
+            let number: u32 = try name_number(inout c.types, text)
+            if covered(coverage, number) {
+                try report(inout c, fx.file, name.start, "`{text}` is already matched")
             } else {
-                try push(inout coverage.variants, text)
+                try push(inout coverage.variants, number)
             }
             match payload {
                 some(value as fields: syntax.List) {
@@ -1857,7 +1889,7 @@ fn check_pattern(input: Input, c: inout Checker, fx: inout Fx, pat: syntax.PatId
                             try destructure_fields(input, inout c, inout fx, fields, vp, start, false, borrowed)
                         }
                         none {
-                            try report(inout c, fx.file, start, try program.format_text(c.alloc, "`{text}` carries no payload"))
+                            try report(inout c, fx.file, start, "`{text}` carries no payload")
                         }
                     }
                 }
@@ -1869,7 +1901,7 @@ fn check_pattern(input: Input, c: inout Checker, fx: inout Fx, pat: syntax.PatId
             match try variants_of(inout c, scrutinee) {
                 some(value: _) {
                     let shown: []u8 = try show(inout c, scrutinee)
-                    try report(inout c, fx.file, start, try program.format_text(c.alloc, "`{shown}` is matched by its variants, not by literals"))
+                    try report(inout c, fx.file, start, "`{shown}` is matched by its variants, not by literals")
                     return ok
                 }
                 none {
@@ -1900,7 +1932,7 @@ fn exhaustive(c: inout Checker, fx: Fx, start: u32, scrutinee: TyId, coverage: C
         some(value as vs: Variants) {
             if vs.open {
                 let shown: []u8 = try show(inout c, scrutinee)
-                try report(inout c, fx.file, start, try program.format_text(c.alloc, "a match on the open enum `{shown}` needs a `_` arm"))
+                try report(inout c, fx.file, start, "a match on the open enum `{shown}` needs a `_` arm")
                 return ok
             }
             var missing: [..]u8 = make(c.alloc)
@@ -1910,18 +1942,18 @@ fn exhaustive(c: inout Checker, fx: Fx, start: u32, scrutinee: TyId, coverage: C
                         try append(inout missing, ", ")
                     }
                     try push(inout missing, '`')
-                    try append(inout missing, v.name)
+                    try append(inout missing, name_of(c.types, v.name))
                     try push(inout missing, '`')
                 }
             }
             if missing.len > 0 {
                 let list: []u8 = missing
-                try report(inout c, fx.file, start, try program.format_text(c.alloc, "this match does not cover {list}"))
+                try report(inout c, fx.file, start, "this match does not cover {list}")
             }
         }
         none {
             let shown: []u8 = try show(inout c, scrutinee)
-            try report(inout c, fx.file, start, try program.format_text(c.alloc, "a match on `{shown}` needs a `_` arm"))
+            try report(inout c, fx.file, start, "a match on `{shown}` needs a `_` arm")
         }
     }
     return ok
@@ -2021,11 +2053,11 @@ fn require_mutable(input: Input, c: inout Checker, fx: Fx, e: syntax.ExprId, act
         some(value as mutable: bool) {
             if !mutable {
                 let text: []u8 = file_text(input, fx.file, span)
-                try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "cannot {action} `{text}`: it is not a `var` or an `inout` parameter"))
+                try report(inout c, fx.file, span.start, "cannot {action} `{text}`: it is not a `var` or an `inout` parameter")
             }
         }
         none {
-            try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "cannot {action} this: it is not a variable, field or element"))
+            try report(inout c, fx.file, span.start, "cannot {action} this: it is not a variable, field or element")
         }
     }
     return ok

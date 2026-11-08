@@ -14,7 +14,7 @@
 // gathered in the middle of it.
 
 pub type ParseProblem enum {
-    expected(what: []u8, found: Found)
+    expected(what: Expected, found: Found)
     imports_first
     variadic_first
     empty_tuple_type
@@ -27,6 +27,76 @@ pub type ParseProblem enum {
     comparison_chain
     shift_chain
     operator_mix(first: BinaryOp, next: BinaryOp)
+}
+
+// What an `expected` problem expected. A diagnostic is stored, so it
+// names the text instead of holding a view of it; see describe_expected.
+pub type Expected enum {
+    name
+    close_brace
+    end_of_statement
+    comma_or_close_paren
+    fn_after_unsafe
+    colon
+    after_extern
+    var_after_shared
+    declaration
+    literal
+    open_paren
+    variadic_end
+    colon_and_type
+    open_brace
+    growable_end
+    close_bracket
+    type_name
+    initializer
+    binding_type
+    statement
+    in_keyword
+    negative_pattern
+    pattern
+    comma_or_close_bracket
+    else_branch
+    branch_end
+    after_dot
+    expression
+    interpolation_end
+    close_paren
+}
+
+pub fn describe_expected(e: Expected) -> []u8 {
+    return match e {
+        name { "a name" }
+        close_brace { "`}`" }
+        end_of_statement { "the end of the line or `;`" }
+        comma_or_close_paren { "`,` or `)`" }
+        fn_after_unsafe { "`fn` after `unsafe`" }
+        colon { "`:`" }
+        after_extern { "`fn`, `let` or `var` after `extern`" }
+        var_after_shared { "`var` after `shared`" }
+        declaration { "a declaration" }
+        literal { "an integer or string literal" }
+        open_paren { "`(`" }
+        variadic_end { "`)` after `...`" }
+        colon_and_type { "`:` and a type" }
+        open_brace { "`\{`" }
+        growable_end { "`]` after `[..`" }
+        close_bracket { "`]`" }
+        type_name { "a type" }
+        initializer { "`=` and a value; every binding is initialized" }
+        binding_type { "`:` and a type; every binding states its type" }
+        statement { "a statement" }
+        in_keyword { "`in`" }
+        negative_pattern { "an integer after `-` in a pattern" }
+        pattern { "a pattern" }
+        comma_or_close_bracket { "`,` or `]`" }
+        else_branch { "`else`; an `if` expression needs both branches" }
+        branch_end { "`}`; a branch holds one expression" }
+        after_dot { "a field name or `(` after `.`" }
+        expression { "an expression" }
+        interpolation_end { "`}` to close the interpolation" }
+        close_paren { "`)`" }
+    }
 }
 
 // The token an `expected` problem found, which its span covers.
@@ -186,7 +256,7 @@ fn fail_here(p: inout Parser, problem: ParseProblem) -> Stop {
     return fail_at(inout p, span, problem)
 }
 
-fn expected(p: inout Parser, what: []u8) -> Stop {
+fn expected(p: inout Parser, what: Expected) -> Stop {
     let t: Token = current(p)
     var found: Found = Found.token
     if t.kind == TokenKind.eof {
@@ -197,7 +267,7 @@ fn expected(p: inout Parser, what: []u8) -> Stop {
     return fail_here(inout p, ParseProblem.expected.(what: what, found: found))
 }
 
-fn expect(p: inout Parser, k: TokenKind, what: []u8) -> ! Stop {
+fn expect(p: inout Parser, k: TokenKind, what: Expected) -> ! Stop {
     if eat(inout p, k) {
         return ok
     }
@@ -206,7 +276,7 @@ fn expect(p: inout Parser, k: TokenKind, what: []u8) -> ! Stop {
 
 fn name(p: inout Parser) -> Span ! Stop {
     if next_kind(p) != TokenKind.ident {
-        return err.(error: expected(inout p, "a name"))
+        return err.(error: expected(inout p, Expected.name))
     }
     let span: Span = current_span(p)
     advance(inout p)
@@ -279,7 +349,7 @@ fn lines(p: inout Parser, item: Item) -> List ! Stop {
             return finish(inout p, mark)
         }
         if next_kind(p) == TokenKind.eof {
-            return err.(error: expected(inout p, "`}`"))
+            return err.(error: expected(inout p, Expected.close_brace))
         }
         let before: usize = p.scratch.len
         match item(inout p) {
@@ -292,7 +362,7 @@ fn lines(p: inout Parser, item: Item) -> List ! Stop {
                     r_brace {
                     }
                     _ {
-                        let stop: Stop = expected(inout p, "the end of the line or `;`")
+                        let stop: Stop = expected(inout p, Expected.end_of_statement)
                         if stop == Stop.out_of_memory {
                             return err.(error: stop)
                         }
@@ -326,7 +396,7 @@ fn comma_list(p: inout Parser, item: Item) -> List ! Stop {
             return err.(error: fail_here(inout p, ParseProblem.list_spans_lines))
         }
         if !eat(inout p, TokenKind.comma) {
-            try expect(inout p, TokenKind.r_paren, "`,` or `)`")
+            try expect(inout p, TokenKind.r_paren, Expected.comma_or_close_paren)
             return finish(inout p, mark)
         }
     }
@@ -393,7 +463,7 @@ fn recovered(p: inout Parser, stop: Stop) -> ! Stop {
 
 fn end_top_level_item(p: inout Parser) -> ! Stop {
     if !eat(inout p, TokenKind.semicolon) && next_kind(p) != TokenKind.eof {
-        let stop: Stop = expected(inout p, "the end of the line or `;`")
+        let stop: Stop = expected(inout p, Expected.end_of_statement)
         try recovered(inout p, stop)
         recover_top_level(inout p)
     }
@@ -452,7 +522,7 @@ fn declaration_kind(p: inout Parser) -> DeclKind ! Stop {
         kw_unsafe {
             advance(inout p)
             if next_kind(p) != TokenKind.kw_fn {
-                return err.(error: expected(inout p, "`fn` after `unsafe`"))
+                return err.(error: expected(inout p, Expected.fn_after_unsafe))
             }
             return function(inout p, true)
         }
@@ -466,12 +536,12 @@ fn declaration_kind(p: inout Parser) -> DeclKind ! Stop {
                     let mutable: bool = next_kind(p) == TokenKind.kw_var
                     advance(inout p)
                     let n: Span = try name(inout p)
-                    try expect(inout p, TokenKind.colon, "`:`")
+                    try expect(inout p, TokenKind.colon, Expected.colon)
                     let ty: TypeId = try type_expr(inout p)
                     return ok.(value: DeclKind.extern_var.(mutable: mutable, name: n, ty: ty))
                 }
                 _ {
-                    return err.(error: expected(inout p, "`fn`, `let` or `var` after `extern`"))
+                    return err.(error: expected(inout p, Expected.after_extern))
                 }
             }
         }
@@ -485,13 +555,13 @@ fn declaration_kind(p: inout Parser) -> DeclKind ! Stop {
         kw_shared {
             advance(inout p)
             if next_kind(p) != TokenKind.kw_var {
-                return err.(error: expected(inout p, "`var` after `shared`"))
+                return err.(error: expected(inout p, Expected.var_after_shared))
             }
             let l: Local = try local(inout p)
             return ok.(value: DeclKind.global.(is_shared: true, local: l))
         }
         _ {
-            return err.(error: expected(inout p, "a declaration"))
+            return err.(error: expected(inout p, Expected.declaration))
         }
     }
 }
@@ -515,7 +585,7 @@ fn attribute_arg(p: inout Parser) -> u32 ! Stop {
             return ok.(value: u32.(try primary(inout p)))
         }
         _ {
-            return err.(error: expected(inout p, "an integer or string literal"))
+            return err.(error: expected(inout p, Expected.literal))
         }
     }
 }
@@ -523,7 +593,7 @@ fn attribute_arg(p: inout Parser) -> u32 ! Stop {
 fn function(p: inout Parser, is_unsafe: bool) -> DeclKind ! Stop {
     advance(inout p)
     let n: Span = try name(inout p)
-    try expect(inout p, TokenKind.l_paren, "`(`")
+    try expect(inout p, TokenKind.l_paren, Expected.open_paren)
     let params: List = try comma_list(inout p, parameter)
     let result: ?TypeId = try result_type(inout p)
     let body: Block = try block(inout p)
@@ -546,7 +616,7 @@ fn result_type(p: inout Parser) -> ?TypeId ! Stop {
 fn extern_function(p: inout Parser) -> DeclKind ! Stop {
     advance(inout p)
     let n: Span = try name(inout p)
-    try expect(inout p, TokenKind.l_paren, "`(`")
+    try expect(inout p, TokenKind.l_paren, Expected.open_paren)
     let mark: usize = p.scratch.len
     var variadic: bool = false
     for {
@@ -560,13 +630,13 @@ fn extern_function(p: inout Parser) -> DeclKind ! Stop {
             advance(inout p)
             variadic = true
             let _: bool = eat(inout p, TokenKind.comma)
-            try expect(inout p, TokenKind.r_paren, "`)` after `...`")
+            try expect(inout p, TokenKind.r_paren, Expected.variadic_end)
             break
         }
         let index: u32 = try parameter(inout p)
         try gather(inout p, index)
         if !eat(inout p, TokenKind.comma) {
-            try expect(inout p, TokenKind.r_paren, "`,` or `)`")
+            try expect(inout p, TokenKind.r_paren, Expected.comma_or_close_paren)
             break
         }
     }
@@ -587,7 +657,7 @@ fn parameter(p: inout Parser) -> u32 ! Stop {
     if !eat(inout p, TokenKind.underscore) {
         n = some.(value: try name(inout p))
     }
-    try expect(inout p, TokenKind.colon, "`:` and a type")
+    try expect(inout p, TokenKind.colon, Expected.colon_and_type)
     let m: Mode = mode(inout p)
     let ty: TypeId = try type_expr(inout p)
     try memory(push(inout p.ast.params, Param.(name: n, mode: m, ty: ty)))
@@ -608,7 +678,7 @@ fn type_def(p: inout Parser) -> TypeDef ! Stop {
         }
         kw_union {
             advance(inout p)
-            try expect(inout p, TokenKind.l_paren, "`(`")
+            try expect(inout p, TokenKind.l_paren, Expected.open_paren)
             let fs: List = try fields(inout p)
             return ok.(value: TypeDef.union_type.(fields: fs))
         }
@@ -625,7 +695,7 @@ fn enum_type(p: inout Parser) -> TypeDef ! Stop {
     if next_kind(p) == TokenKind.ident {
         int_type = some.(value: try type_name(inout p))
     }
-    try expect(inout p, TokenKind.l_brace, "`\{`")
+    try expect(inout p, TokenKind.l_brace, Expected.open_brace)
     let variants: List = try lines(inout p, variant)
     return ok.(value: TypeDef.enum_type.(int_type: int_type, variants: variants))
 }
@@ -663,7 +733,7 @@ fn fields(p: inout Parser) -> List ! Stop {
 fn field(p: inout Parser) -> u32 ! Stop {
     let public: bool = eat(inout p, TokenKind.kw_pub)
     let n: Span = try name(inout p)
-    try expect(inout p, TokenKind.colon, "`:` and a type")
+    try expect(inout p, TokenKind.colon, Expected.colon_and_type)
     let ty: TypeId = try type_expr(inout p)
     try memory(push(inout p.ast.fields, Field.(public: public, name: n, ty: ty)))
     return ok.(value: u32.(p.ast.fields.len - 1))
@@ -677,7 +747,7 @@ fn type_expr(p: inout Parser) -> TypeId ! Stop {
     match next_kind(p) {
         kw_fn {
             advance(inout p)
-            try expect(inout p, TokenKind.l_paren, "`(`")
+            try expect(inout p, TokenKind.l_paren, Expected.open_paren)
             let params: List = try comma_list(inout p, function_type_param)
             let result: ?TypeId = try result_type(inout p)
             return add_type(inout p, TypeKind.function.(params: params, result: result), from)
@@ -744,17 +814,17 @@ fn simple_type(p: inout Parser) -> TypeId ! Stop {
                 return add_type(inout p, TypeKind.view.(elem: elem), from)
             }
             if eat(inout p, TokenKind.dot_dot) {
-                try expect(inout p, TokenKind.r_bracket, "`]` after `[..`")
+                try expect(inout p, TokenKind.r_bracket, Expected.growable_end)
                 let elem: TypeId = try simple_type(inout p)
                 return add_type(inout p, TypeKind.growable.(elem: elem), from)
             }
             let len: ExprId = try expression(inout p)
-            try expect(inout p, TokenKind.r_bracket, "`]`")
+            try expect(inout p, TokenKind.r_bracket, Expected.close_bracket)
             let elem: TypeId = try simple_type(inout p)
             return add_type(inout p, TypeKind.array.(len: len, elem: elem), from)
         }
         _ {
-            return err.(error: expected(inout p, "a type"))
+            return err.(error: expected(inout p, Expected.type_name))
         }
     }
 }
@@ -767,7 +837,7 @@ fn local(p: inout Parser) -> Local ! Stop {
     advance(inout p)
     let b: Binding = try binding(inout p)
     if !eat(inout p, TokenKind.eq) {
-        return err.(error: expected(inout p, "`=` and a value; every binding is initialized"))
+        return err.(error: expected(inout p, Expected.initializer))
     }
     let value: ExprId = try expression(inout p)
     return ok.(value: Local.(mutable: mutable, binding: b, value: value))
@@ -782,7 +852,7 @@ fn binding(p: inout Parser) -> Binding ! Stop {
         n = some.(value: try name(inout p))
     }
     if !eat(inout p, TokenKind.colon) {
-        return err.(error: expected(inout p, "`:` and a type; every binding states its type"))
+        return err.(error: expected(inout p, Expected.binding_type))
     }
     let ty: TypeId = try type_expr(inout p)
     return ok.(value: Binding.single.(name: n, ty: ty))
@@ -809,7 +879,7 @@ fn destruct_field(p: inout Parser) -> u32 ! Stop {
         mutable = eat(inout p, TokenKind.kw_var)
         rename = some.(value: try name(inout p))
     }
-    try expect(inout p, TokenKind.colon, "`:` and a type")
+    try expect(inout p, TokenKind.colon, Expected.colon_and_type)
     var ty: ?TypeId = none
     if !eat(inout p, TokenKind.underscore) {
         ty = some.(value: try type_expr(inout p))
@@ -823,7 +893,7 @@ fn destruct_field(p: inout Parser) -> u32 ! Stop {
 
 fn block(p: inout Parser) -> Block ! Stop {
     let from: u32 = token_start(p)
-    try expect(inout p, TokenKind.l_brace, "`\{`")
+    try expect(inout p, TokenKind.l_brace, Expected.open_brace)
     let stmts: List = try lines(inout p, statement_item)
     return ok.(value: Block.(stmts: stmts, span: span_from(p, from)))
 }
@@ -868,7 +938,7 @@ fn statement_kind(p: inout Parser) -> StmtKind ! Stop {
         kw_match {
             advance(inout p)
             let value: ExprId = try expression(inout p)
-            try expect(inout p, TokenKind.l_brace, "`\{`")
+            try expect(inout p, TokenKind.l_brace, Expected.open_brace)
             let arms: List = try lines(inout p, statement_arm)
             return ok.(value: StmtKind.match_stmt.(value: value, arms: arms))
         }
@@ -927,7 +997,7 @@ fn statement_kind(p: inout Parser) -> StmtKind ! Stop {
             }
         }
         _ {
-            return err.(error: expected(inout p, "a statement"))
+            return err.(error: expected(inout p, Expected.statement))
         }
     }
 }
@@ -997,7 +1067,7 @@ fn for_kind(p: inout Parser) -> ForKind ! Stop {
             let mutable: bool = next_kind(p) == TokenKind.kw_var
             advance(inout p)
             let b: Binding = try binding(inout p)
-            try expect(inout p, TokenKind.kw_in, "`in`")
+            try expect(inout p, TokenKind.kw_in, Expected.in_keyword)
             let first: ExprId = try expression(inout p)
             var iterable: Iterable = Iterable.value.(value: first)
             if eat(inout p, TokenKind.dot_dot) {
@@ -1093,7 +1163,7 @@ fn pattern_kind(p: inout Parser) -> PatternKind ! Stop {
         minus {
             advance(inout p)
             if next_kind(p) != TokenKind.int {
-                return err.(error: expected(inout p, "an integer after `-` in a pattern"))
+                return err.(error: expected(inout p, Expected.negative_pattern))
             }
             let value: ExprId = try primary(inout p)
             return ok.(value: PatternKind.negative.(value: value))
@@ -1103,7 +1173,7 @@ fn pattern_kind(p: inout Parser) -> PatternKind ! Stop {
             return ok.(value: PatternKind.discard)
         }
         _ {
-            return err.(error: expected(inout p, "a pattern"))
+            return err.(error: expected(inout p, Expected.pattern))
         }
     }
 }
@@ -1127,7 +1197,7 @@ fn expression(p: inout Parser) -> ExprId ! Stop {
         kw_match {
             advance(inout p)
             let value: ExprId = try expression(inout p)
-            try expect(inout p, TokenKind.l_brace, "`\{`")
+            try expect(inout p, TokenKind.l_brace, Expected.open_brace)
             let arms: List = try lines(inout p, expression_arm)
             return add_expr(inout p, ExprKind.match_expr.(value: value, arms: arms), from)
         }
@@ -1165,7 +1235,7 @@ fn array_literal(p: inout Parser, first: ExprId, from: u32) -> ExprId ! Stop {
         let elem: ExprId = try expression(inout p)
         try gather(inout p, u32.(elem))
     }
-    try expect(inout p, TokenKind.r_bracket, "`,` or `]`")
+    try expect(inout p, TokenKind.r_bracket, Expected.comma_or_close_bracket)
     let elems: List = try finish(inout p, mark)
     return add_expr(inout p, ExprKind.array.(elems: elems), from)
 }
@@ -1176,7 +1246,7 @@ fn if_expression(p: inout Parser) -> ExprId ! Stop {
     let cond: ExprId = try expression(inout p)
     let then: ExprId = try branch(inout p)
     if !eat(inout p, TokenKind.kw_else) {
-        return err.(error: expected(inout p, "`else`; an `if` expression needs both branches"))
+        return err.(error: expected(inout p, Expected.else_branch))
     }
     var otherwise: IfElse = IfElse.branch.(value: then)
     if next_kind(p) == TokenKind.kw_if {
@@ -1192,10 +1262,10 @@ fn if_expression(p: inout Parser) -> ExprId ! Stop {
 
 // `{ expr }`: one expression in braces.
 fn branch(p: inout Parser) -> ExprId ! Stop {
-    try expect(inout p, TokenKind.l_brace, "`\{`")
+    try expect(inout p, TokenKind.l_brace, Expected.open_brace)
     let value: ExprId = try expression(inout p)
     let _: bool = eat(inout p, TokenKind.semicolon)
-    try expect(inout p, TokenKind.r_brace, "`}`; a branch holds one expression")
+    try expect(inout p, TokenKind.r_brace, Expected.branch_end)
     return ok.(value: value)
 }
 
@@ -1407,7 +1477,7 @@ fn postfix(p: inout Parser) -> ExprId ! Stop {
                         e = try add_expr(inout p, ExprKind.construct.(ty: e, value: value), from)
                     }
                     _ {
-                        return err.(error: expected(inout p, "a field name or `(` after `.`"))
+                        return err.(error: expected(inout p, Expected.after_dot))
                     }
                 }
             }
@@ -1418,7 +1488,7 @@ fn postfix(p: inout Parser) -> ExprId ! Stop {
             l_bracket {
                 advance(inout p)
                 let i: Index = try subscript(inout p)
-                try expect(inout p, TokenKind.r_bracket, "`]`")
+                try expect(inout p, TokenKind.r_bracket, Expected.close_bracket)
                 e = try add_expr(inout p, ExprKind.index.(value: e, index: i), from)
             }
             _ {
@@ -1512,7 +1582,7 @@ fn primary(p: inout Parser) -> ExprId ! Stop {
             return paren_or_tuple(inout p)
         }
         _ {
-            return err.(error: expected(inout p, "an expression"))
+            return err.(error: expected(inout p, Expected.expression))
         }
     }
 }
@@ -1532,7 +1602,7 @@ fn string(p: inout Parser) -> List ! Stop {
         try add_part(inout p, StrPart.interpolation.(value: value))
         let k: TokenKind = next_kind(p)
         if k != TokenKind.str_mid && k != TokenKind.str_end {
-            return err.(error: expected(inout p, "`}` to close the interpolation"))
+            return err.(error: expected(inout p, Expected.interpolation_end))
         }
     }
 }
@@ -1566,13 +1636,13 @@ fn paren_or_tuple(p: inout Parser) -> ExprId ! Stop {
         return add_expr(inout p, ExprKind.tuple.(items: list), from)
     }
     let inner: ExprId = try expression(inout p)
-    try expect(inout p, TokenKind.r_paren, "`)`")
+    try expect(inout p, TokenKind.r_paren, Expected.close_paren)
     return add_expr(inout p, ExprKind.paren.(inner: inner), from)
 }
 
 fn tuple_item(p: inout Parser) -> u32 ! Stop {
     let n: Span = try name(inout p)
-    try expect(inout p, TokenKind.colon, "`:`")
+    try expect(inout p, TokenKind.colon, Expected.colon)
     let value: ExprId = try expression(inout p)
     try memory(push(inout p.ast.tuple_items, TupleItem.(name: n, value: value)))
     return ok.(value: u32.(p.ast.tuple_items.len - 1))

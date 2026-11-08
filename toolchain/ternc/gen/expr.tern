@@ -15,7 +15,7 @@ type ElemAddr (addr: keel.Value, elem: check.TyId)
 
 // A piece of a `Format` being built.
 type FormatPiece enum {
-    text(bytes: []u8)
+    text(bytes: [..]u8)
     value(v: V, ty: check.TyId)
 }
 
@@ -367,7 +367,7 @@ fn addr_of(input: Input, g: inout Gen, fx: inout Fx, e: syntax.ExprId) -> keel.V
                                 match try fields_of(input, inout g, core) {
                                     some(value as fields: []FieldInfo) {
                                         for let f: FieldInfo in fields {
-                                            if same_text(f.name, name_text) {
+                                            if same_text(check.name_of(g.types, f.name), name_text) {
                                                 let base: keel.Value = try addr_of(input, inout g, inout fx, value)
                                                 return ok.(value: offset_by(fx, base, f.offset))
                                             }
@@ -564,7 +564,7 @@ fn borrowable(input: Input, g: inout Gen, fx: Fx, e: syntax.ExprId) -> bool ! Ou
 }
 
 fn decl_addr(input: Input, g: inout Gen, fx: Fx, decl: maps.DeclRef) -> keel.Value ! OutOfMemory {
-    let name: []u8 = try symbol(input, inout g, decl)
+    let name: [..]u8 = try symbol(input, inout g, decl)
     let s: keel.Symbol = try data_symbol(inout g, name)
     return ok.(value: data_addr(fx, s))
 }
@@ -593,11 +593,7 @@ fn elem_addr(input: Input, g: inout Gen, fx: inout Fx, value: syntax.ExprId, i: 
     let index_v: V = try value_as(input, inout g, inout fx, i, usize_ty)
     let index: keel.Value = scalar_v(fx, index_v)
     let inside: keel.Value = compare_ints(fx, keel.IntCC.ult, index, pl.len)
-    var pieces: [..]Piece = make(g.alloc)
-    try push(inout pieces, Piece.text.(text: "index "))
-    try push(inout pieces, Piece.unsigned.(value: index))
-    try push(inout pieces, Piece.text.(text: " out of bounds for length "))
-    try push(inout pieces, Piece.unsigned.(value: pl.len))
+    let pieces: [4]Piece = [Piece.text.(text: "index "), Piece.unsigned.(value: index), Piece.text.(text: " out of bounds for length "), Piece.unsigned.(value: pl.len)]
     try check_or_panic(input, inout g, inout fx, inside, pieces, span)
     let l: TyLayout = try ty_layout(input, inout g, elem)
     let size: keel.Value = usize_const(fx, l.size)
@@ -616,7 +612,8 @@ fn name_value(input: Input, g: inout Gen, fx: inout Fx, e: syntax.ExprId, ty: ch
                 decl(decl: maps.DeclRef) {
                     return decl_value(input, inout g, inout fx, decl, ty)
                 }
-                builtin(name: []u8) {
+                builtin(id as builtin_index: u32) {
+                    let name: []u8 = resolve.builtin_name(builtin_index)
                     return builtin_value(input, inout g, inout fx, name, ty)
                 }
                 package(id: _) {
@@ -646,7 +643,7 @@ fn decl_value(input: Input, g: inout Gen, fx: inout Fx, decl: maps.DeclRef, ty: 
         return load_v(input, inout g, fx, addr, ty)
     }
     let abi: FnAbi = try decl_abi(input, inout g, decl)
-    let name: []u8 = try symbol(input, inout g, decl)
+    let name: [..]u8 = try symbol(input, inout g, decl)
     var byval: bool = false
     for let i: usize in 0..usize.(abi.pass_count) {
         let p: Pass = abi_pass(g, abi, i)
@@ -659,7 +656,7 @@ fn decl_value(input: Input, g: inout Gen, fx: inout Fx, decl: maps.DeclRef, ty: 
         }
     }
     if byval && is_extern_fn(input, decl) {
-        try unsupported(inout g, try program.format_text(g.alloc, "`{name}` takes a record by value, as C does, so it cannot be a function value, whose records are passed by pointer"))
+        try unsupported(inout g, "`{name}` takes a record by value, as C does, so it cannot be a function value, whose records are passed by pointer")
     }
     let s: keel.Symbol = try function_symbol(inout g, name, abi.sig)
     return ok.(value: V.scalar.(value: keel.symbol_addr(fx.m, fx.block, s)))
@@ -808,7 +805,8 @@ fn construct(input: Input, g: inout Gen, fx: inout Fx, target: syntax.ExprId, va
     match res_of(input, fx, target) {
         some(value as r: resolve.Res) {
             match r {
-                builtin(name: []u8) {
+                builtin(id as builtin_index: u32) {
+                    let name: []u8 = resolve.builtin_name(builtin_index)
                     match name {
                         "some", "ok", "err" {
                             return enum_value(input, inout g, inout fx, ty, name, some.(value: value))
@@ -829,14 +827,15 @@ fn construct(input: Input, g: inout Gen, fx: inout Fx, target: syntax.ExprId, va
             var name: []u8 = ""
             match try shape_of(input, inout g, enum_ty) {
                 some(value as shape: EnumShape) {
-                    name = shape_variant(g, shape, usize.(index)).name
+                    name = check.name_of(g.types, shape_variant(g, shape, usize.(index)).name)
                 }
                 none {
                 }
             }
             return enum_value(input, inout g, inout fx, enum_ty, name, some.(value: value))
         }
-        builtin(name: []u8) {
+        builtin(id as builtin_index: u32) {
+            let name: []u8 = resolve.builtin_name(builtin_index)
             return enum_value(input, inout g, inout fx, ty, name, some.(value: value))
         }
         type_item(ty as target_ty: check.TyId) {
@@ -914,8 +913,7 @@ fn convert(input: Input, g: inout Gen, fx: inout Fx, v: V, from: check.TyId, to:
                                         }
                                         let name: []u8 = try shown(g, to)
                                         let message: []u8 = try program.format_text(g.alloc, "no variant of `{name}` has this value")
-                                        var pieces: [..]Piece = make(g.alloc)
-                                        try push(inout pieces, Piece.text.(text: message))
+                                        let pieces: [1]Piece = [Piece.text.(text: message)]
                                         try check_or_panic(input, inout g, inout fx, valid, pieces, span)
                                     }
                                 }
@@ -1070,13 +1068,11 @@ fn convert_int(input: Input, g: inout Gen, fx: inout Fx, x: keel.Value, from: ch
             let name: []u8 = try shown(g, to_ty)
             let message: []u8 = try program.format_text(g.alloc, " does not fit in `{name}`")
             let wide: keel.Value = widen(fx, x, from)
-            var pieces: [..]Piece = make(g.alloc)
+            var first: Piece = Piece.unsigned.(value: wide)
             if from_signed {
-                try push(inout pieces, Piece.signed.(value: wide))
-            } else {
-                try push(inout pieces, Piece.unsigned.(value: wide))
+                first = Piece.signed.(value: wide)
             }
-            try push(inout pieces, Piece.text.(text: message))
+            let pieces: [2]Piece = [first, Piece.text.(text: message)]
             try check_or_panic(input, inout g, inout fx, all, pieces, span)
         }
         none {
@@ -1155,13 +1151,7 @@ fn slice(input: Input, g: inout Gen, fx: inout Fx, value: syntax.ExprId, start: 
     let ordered: keel.Value = compare_ints(fx, keel.IntCC.ule, start_x, end_x)
     let inside: keel.Value = compare_ints(fx, keel.IntCC.ule, end_x, pl.len)
     let fine: keel.Value = binop(fx, keel.BinaryOp.and, ordered, inside)
-    var pieces: [..]Piece = make(g.alloc)
-    try push(inout pieces, Piece.text.(text: "range "))
-    try push(inout pieces, Piece.unsigned.(value: start_x))
-    try push(inout pieces, Piece.text.(text: ".."))
-    try push(inout pieces, Piece.unsigned.(value: end_x))
-    try push(inout pieces, Piece.text.(text: " out of bounds for length "))
-    try push(inout pieces, Piece.unsigned.(value: pl.len))
+    let pieces: [6]Piece = [Piece.text.(text: "range "), Piece.unsigned.(value: start_x), Piece.text.(text: ".."), Piece.unsigned.(value: end_x), Piece.text.(text: " out of bounds for length "), Piece.unsigned.(value: pl.len)]
     try check_or_panic(input, inout g, inout fx, fine, pieces, span)
     let l: TyLayout = try ty_layout(input, inout g, elem)
     let size: keel.Value = usize_const(fx, l.size)
@@ -1310,7 +1300,7 @@ fn try_value(input: Input, g: inout Gen, fx: inout Fx, operand: syntax.ExprId, _
     var payload: ?check.TyId = none
     for let i: usize in 0..usize.(shape.count) {
         let variant: VariantShape = shape_variant(g, shape, i)
-        if same_text(variant.name, success) {
+        if same_text(check.name_of(g.types, variant.name), success) {
             payload = variant.payload
         }
     }
@@ -1434,8 +1424,7 @@ fn compare(input: Input, g: inout Gen, fx: Fx, op: syntax.BinaryOp, l: keel.Valu
 
 // A check that panics with message unless fine, with one text piece.
 fn check_text(input: Input, g: inout Gen, fx: inout Fx, fine: keel.Value, message: []u8, span: syntax.Span) -> ! OutOfMemory {
-    var pieces: [..]Piece = make(g.alloc)
-    try push(inout pieces, Piece.text.(text: message))
+    let pieces: [1]Piece = [Piece.text.(text: message)]
     return check_or_panic(input, inout g, inout fx, fine, pieces, span)
 }
 
@@ -1562,7 +1551,7 @@ fn string_lit(input: Input, g: inout Gen, fx: inout Fx, parts: syntax.List, ty: 
                 var bytes: [..]u8 = make(g.alloc)
                 try unescape(span_text(fx, span), inout bytes)
                 if bytes.len > 0 {
-                    try push(inout pieces, FormatPiece.text.(bytes: bytes))
+                    try push(inout pieces, FormatPiece.text.(bytes: take(inout bytes)))
                 }
             }
             interpolation(value as e: syntax.ExprId) {
@@ -1631,7 +1620,7 @@ fn format(input: Input, g: inout Gen, fx: inout Fx, pieces: []FormatPiece, forma
         var value: V = V.unit
         var vty: check.TyId = bytes_ty
         match pieces[i] {
-            text(bytes: []u8) {
+            text(bytes: [..]u8) {
                 value = try string_view(input, inout g, fx, bytes, bytes_ty)
                 name = "text"
             }
@@ -1657,6 +1646,10 @@ fn format(input: Input, g: inout Gen, fx: inout Fx, pieces: []FormatPiece, forma
                     view(elem: _) {
                         name = "text"
                         value = v
+                    }
+                    growable(elem: _) {
+                        name = "text"
+                        value = try coerce(input, inout g, inout fx, v, ety, vty)
                     }
                     _ {
                         if is_format(g, core) {

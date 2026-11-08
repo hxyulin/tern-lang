@@ -110,9 +110,9 @@ type BuildOptions (
     assembly_only: bool,
     ir_only: bool,
     // Static archives and object files linked with the program.
-    link: [..][]u8,
+    link: [..][..]u8,
     // System libraries, as in `-l NAME`.
-    libraries: [..][]u8,
+    libraries: [..][..]u8,
 )
 
 fn ends_with(text: []u8, suffix: []u8) -> bool {
@@ -155,7 +155,7 @@ fn build_command(args: [][]u8) -> u8 {
                         has_std = true
                     }
                     _ {
-                        if !pushed(inout o.libraries, value) {
+                        if !pushed(alloc, inout o.libraries, value) {
                             return out_of_memory()
                         }
                     }
@@ -178,11 +178,11 @@ fn build_command(args: [][]u8) -> u8 {
             }
         }
         if arg.len > 2 && arg[0] == '-' && arg[1] == 'l' {
-            if !pushed(inout o.libraries, arg[2..]) {
+            if !pushed(alloc, inout o.libraries, arg[2..]) {
                 return out_of_memory()
             }
         } else if is_link_input(arg) {
-            if !pushed(inout o.link, arg) {
+            if !pushed(alloc, inout o.link, arg) {
                 return out_of_memory()
             }
         } else if !has_root {
@@ -207,9 +207,15 @@ fn build_command(args: [][]u8) -> u8 {
     }
 }
 
-fn pushed(list: inout [..][]u8, item: []u8) -> bool {
-    return match push(inout list, item) {
-        ok { true }
+// Pushes a copy of item.
+fn pushed(alloc: Allocator, list: inout [..][..]u8, item: []u8) -> bool {
+    return match program.own(alloc, item) {
+        ok(value as var copied: [..]u8) {
+            match push(inout list, take(inout copied)) {
+                ok { true }
+                err(error: _) { false }
+            }
+        }
         err(error: _) { false }
     }
 }
@@ -246,40 +252,43 @@ fn build_program(alloc: Allocator, o: BuildOptions) -> u8 ! OutOfMemory {
     }
     // The root directory's name prefixes the root package's symbols and
     // names the executable.
-    var root_name: ?[]u8 = none
+    var real: ?[..]u8 = none
     match fs.real_path(alloc, o.root) {
-        ok(value as found: ?[..]u8) {
-            match found {
-                some(value as path: [..]u8) {
-                    root_name = some.(value: base_name(path))
-                }
-                none {
-                }
-            }
+        ok(value as var found: ?[..]u8) {
+            real = take(inout found)
         }
         err(error: _) {
+        }
+    }
+    var root_name: ?[]u8 = none
+    match real {
+        some(value as path: [..]u8) {
+            root_name = some.(value: base_name(path))
+        }
+        none {
         }
     }
     let symbol_prefix: []u8 = match root_name {
         some(value as n: []u8) { n }
         none { "main" }
     }
-    var out: []u8 = match root_name {
+    var out: [..]u8 = try program.own(alloc, match root_name {
         some(value as n: []u8) { n }
         none { "a.out" }
-    }
+    })
     if o.assembly_only {
-        out = try program.format_text(alloc, "{out}.s")
+        let base: []u8 = out
+        out = try program.format_text(alloc, "{base}.s")
     }
     match o.out {
         some(value as given: []u8) {
-            out = given
+            out = try program.own(alloc, given)
         }
         none {
         }
     }
     match try gen.generate(alloc, inout p, inout names, inout checked, symbol_prefix) {
-        unsupported(message: []u8) {
+        unsupported(message: [..]u8) {
             io.eprint("{message}\n")
             return ok.(value: 1)
         }
@@ -372,26 +381,34 @@ fn link(alloc: Allocator, object: []u8, o: BuildOptions, out: []u8) -> u8 ! OutO
             return ok.(value: 1)
         }
     }
-    var inputs: [..]keel.LinkInput = make(alloc)
-    try push(inout inputs, keel.LinkInput.(name: "tern.o", bytes: object))
-    for let path: []u8 in o.link {
+    // Each input's name, and its bytes.
+    var input_names: [..][..]u8 = make(alloc)
+    var input_bytes: [..][..]u8 = make(alloc)
+    try push(inout input_names, try program.own(alloc, "tern.o"))
+    try push(inout input_bytes, try program.own(alloc, object))
+    for let path: [..]u8 in o.link {
+        let shown: []u8 = path
         match read_all(alloc, path) {
-            ok(value as bytes: [..]u8) {
-                try push(inout inputs, keel.LinkInput.(name: path, bytes: bytes))
+            ok(value as var bytes: [..]u8) {
+                try push(inout input_names, try program.own(alloc, path))
+                try push(inout input_bytes, take(inout bytes))
             }
             err(error: io.Error) {
-                io.eprint("cannot read {path}: {io.describe(error)}\n")
+                io.eprint("cannot read {shown}: {io.describe(error)}\n")
                 return ok.(value: 1)
             }
         }
     }
     // libc, libm and others are links to libSystem; load each stub once.
-    var names: [..][]u8 = make(alloc)
-    try push(inout names, "System")
-    try append(inout names, o.libraries)
-    var stubs: [..][]u8 = make(alloc)
-    for let name: []u8 in names {
-        let path: []u8 = try program.format_text(alloc, "{sdk}/usr/lib/lib{name}.tbd")
+    var names: [..][..]u8 = make(alloc)
+    try push(inout names, try program.own(alloc, "System"))
+    for let library: [..]u8 in o.libraries {
+        try push(inout names, try program.own(alloc, library))
+    }
+    var stubs: [..][..]u8 = make(alloc)
+    for let owned_name: [..]u8 in names {
+        let name: []u8 = owned_name
+        let path: [..]u8 = try program.format_text(alloc, "{sdk}/usr/lib/lib{name}.tbd")
         var real: ?[..]u8 = none
         match fs.real_path(alloc, path) {
             ok(value as var found: ?[..]u8) {
@@ -400,16 +417,16 @@ fn link(alloc: Allocator, object: []u8, o: BuildOptions, out: []u8) -> u8 ! OutO
             err(error: _) {
             }
         }
-        match real {
-            some(value as stub: [..]u8) {
+        match take(inout real) {
+            some(value as var stub: [..]u8) {
                 var seen: bool = false
-                for let s: []u8 in stubs {
+                for let s: [..]u8 in stubs {
                     if program.bytes_equal(s, stub) {
                         seen = true
                     }
                 }
                 if !seen {
-                    try push(inout stubs, stub)
+                    try push(inout stubs, take(inout stub))
                 }
             }
             none {
@@ -418,7 +435,7 @@ fn link(alloc: Allocator, object: []u8, o: BuildOptions, out: []u8) -> u8 ! OutO
             }
         }
     }
-    match try keel.link_signed(alloc, inputs, stubs, sdk, out) {
+    match try keel.link_signed(alloc, input_names, input_bytes, stubs, sdk, out) {
         failed(message: [..]u8) {
             let text: []u8 = message
             io.eprint("cannot link {out}: {text}\n")
@@ -446,7 +463,8 @@ fn link(alloc: Allocator, object: []u8, o: BuildOptions, out: []u8) -> u8 ! OutO
 
 // Every error, rendered with its source line where it has one.
 fn render_program(p: program.Program) {
-    for let e: []u8 in p.errors {
+    for let owned: [..]u8 in p.errors {
+        let e: []u8 = owned
         io.eprint("error: {e}\n")
     }
     render_diagnostics(p, p.diagnostics)
@@ -464,7 +482,8 @@ fn render_diagnostics(p: program.Program, diagnostics: []program.Diagnostic) {
                 print_parse_problem(f.text, d)
                 render_tail(f.text, f.starts, d.start)
             }
-            text(start: u32, message: []u8) {
+            text(start: u32, message as owned: [..]u8) {
+                let message: []u8 = owned
                 render_head(f.path, f.starts, start)
                 io.eprint("{message}")
                 render_tail(f.text, f.starts, start)
@@ -704,7 +723,8 @@ fn code_point(buf: inout [8]u8, code: u32) -> []u8 {
 
 fn print_parse_problem(text: []u8, d: syntax.ParseDiagnostic) {
     match d.problem {
-        expected(what: []u8, found: syntax.Found) {
+        expected(what as expected: syntax.Expected, found: syntax.Found) {
+            let what: []u8 = syntax.describe_expected(expected)
             match found {
                 end_of_file {
                     io.eprint("expected {what}, found the end of the file")

@@ -186,7 +186,7 @@ fn panic_helper(input: Input, g: inout Gen, fx: Fx, message: ?[]Piece) -> keel.S
             for let part: Piece in parts {
                 match part {
                     text(text as t: []u8) {
-                        try push(inout pieces, FormatPiece.text.(bytes: t))
+                        try push(inout pieces, FormatPiece.text.(bytes: try program.own(g.alloc, t)))
                     }
                     unsigned(value: _) {
                         let u64_ty: check.TyId = try check.int_ty(inout g.types, check.IntTy.u64)
@@ -213,7 +213,7 @@ fn panic_helper(input: Input, g: inout Gen, fx: Fx, message: ?[]Piece) -> keel.S
     match g.handler {
         some(value as handler: maps.DeclRef) {
             let abi: FnAbi = try decl_abi(input, inout g, handler)
-            let handler_name: []u8 = try symbol(input, inout g, handler)
+            let handler_name: [..]u8 = try symbol(input, inout g, handler)
             var args: [..]CallArg = make(g.alloc)
             try push(inout args, CallArg.addr.(value: info))
             let _: V = try direct_call(input, inout g, inout inner, handler_name, abi, args)
@@ -237,7 +237,8 @@ fn call_expr(input: Input, g: inout Gen, fx: inout Fx, callee: syntax.ExprId, ar
             match res_of(input, fx, value) {
                 some(value as r: resolve.Res) {
                     match r {
-                        builtin(name: []u8) {
+                        builtin(id as builtin_index: u32) {
+                            let name: []u8 = resolve.builtin_name(builtin_index)
                             builtin = some.(value: name)
                         }
                         _ {
@@ -252,7 +253,8 @@ fn call_expr(input: Input, g: inout Gen, fx: inout Fx, callee: syntax.ExprId, ar
             match res_of(input, fx, callee) {
                 some(value as r: resolve.Res) {
                     match r {
-                        builtin(name: []u8) {
+                        builtin(id as builtin_index: u32) {
+                            let name: []u8 = resolve.builtin_name(builtin_index)
                             builtin = some.(value: name)
                         }
                         _ {
@@ -287,7 +289,7 @@ fn call_expr(input: Input, g: inout Gen, fx: inout Fx, callee: syntax.ExprId, ar
             if is_fn {
                 let abi: FnAbi = try decl_abi(input, inout g, decl)
                 let call_args: [..]CallArg = try lower_call_args(input, inout g, inout fx, args, abi)
-                let name: []u8 = try symbol(input, inout g, decl)
+                let name: [..]u8 = try symbol(input, inout g, decl)
                 return direct_call(input, inout g, inout fx, name, abi, call_args)
             }
         }

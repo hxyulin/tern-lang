@@ -2083,6 +2083,10 @@ impl<'a> FnGen<'_, 'a> {
                         }
                         Ty::Bool => ("boolean", Some((*v, *ety))),
                         Ty::View(_) => ("text", Some((*v, bytes_ty))),
+                        Ty::Growable(_) => {
+                            let view = self.coerce(*v, *ety, bytes_ty);
+                            ("text", Some((view, bytes_ty)))
+                        }
                         Ty::Named(NamedId::Builtin(BuiltinNamed::Format)) => {
                             // nested(parts): the inner format's parts.
                             let addr = self.spill(*v, *ety);

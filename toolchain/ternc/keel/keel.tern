@@ -135,8 +135,10 @@ type DataItem (
     addend: u32,
 )
 
+// A data object's items. Bytes are at..at + len of the data the object
+// is added with.
 pub type Item enum {
-    bytes(bytes: []u8)
+    bytes(at: usize, len: usize)
     zero(size: u32)
     integer(ty: Type, value: i64)
     pointer(symbol: Symbol)
@@ -151,7 +153,10 @@ pub type CodegenOptions (
     pub flags: u32,
 )
 
-pub type LinkInput (pub name: []u8, pub bytes: []u8)
+// keel's KeelString and KeelLinkInput. They hold raw pointers, not views,
+// so link_signed can keep them in a [..]T for the C call.
+type RawBytes (ptr: ?*u8, len: c.size_t)
+type RawInput (name: RawBytes, bytes: RawBytes)
 
 type LinkOptions (sdk_root: []u8, output_path: []u8, flags: u32)
 
@@ -203,7 +208,7 @@ extern fn keel_module_emit_object_with_options(m: *u8, target: u32, options: Cod
 extern fn keel_buffer_data(b: *u8) -> *u8
 extern fn keel_buffer_size(b: *u8) -> c.size_t
 extern fn keel_buffer_destroy(b: *u8)
-extern fn keel_link_signed(inputs: ?*LinkInput, count: c.size_t, tbd_paths: ?*[]u8, tbd_count: c.size_t, options: *LinkOptions, warnings: *?*u8, error: *?*u8) -> u32
+extern fn keel_link_signed(inputs: ?*RawInput, count: c.size_t, tbd_paths: ?*RawBytes, tbd_count: c.size_t, options: *LinkOptions, warnings: *?*u8, error: *?*u8) -> u32
 
 let ok_status: u32 = 0
 
@@ -526,14 +531,14 @@ pub fn declare_global(m: Module, name: []u8) -> Symbol {
     return out
 }
 
-pub fn add_global(alloc: Allocator, m: Module, name: []u8, items: []Item, align: u32, flags: u32) -> Symbol ! OutOfMemory {
+pub fn add_global(alloc: Allocator, m: Module, name: []u8, items: []Item, data: []u8, align: u32, flags: u32) -> Symbol ! OutOfMemory {
     var raw: [..]DataItem = make(alloc)
     defer free(inout raw)
     let none_symbol: Symbol = Symbol.(owner: 0, index: 0)
     for let item: Item in items {
         let d: DataItem = match item {
-            bytes(bytes as b: []u8) {
-                DataItem.(kind: 0, ty: Type.int8, value: 0, bytes: some.(value: &b[0]), length: b.len, symbol: none_symbol, addend: 0)
+            bytes(at: usize, len: usize) {
+                DataItem.(kind: 0, ty: Type.int8, value: 0, bytes: some.(value: &data[at]), length: len, symbol: none_symbol, addend: 0)
             }
             zero(size: u32) {
                 DataItem.(kind: 1, ty: Type.int8, value: 0, bytes: none, length: usize.(size), symbol: none_symbol, addend: 0)
@@ -611,21 +616,37 @@ pub type Linked enum {
     failed(message: [..]u8)
 }
 
-// Links Mach-O objects and archives with the libraries whose TBD stubs
-// are listed, into the signed executable at path.
-pub fn link_signed(alloc: Allocator, inputs: []LinkInput, tbd_paths: [][]u8, sdk_root: []u8, path: []u8) -> Linked ! OutOfMemory {
-    var i: ?*LinkInput = none
+fn raw_bytes(s: []u8) -> RawBytes {
+    if s.len == 0 {
+        return RawBytes.(ptr: none, len: c.size_t.(0))
+    }
+    return RawBytes.(ptr: some.(value: &s[0]), len: c.size_t.(s.len))
+}
+
+// Links Mach-O objects and archives, each a name and its bytes, with the
+// libraries whose TBD stubs are listed, into the signed executable at
+// path.
+pub fn link_signed(alloc: Allocator, names: [][..]u8, bytes: [][..]u8, tbd_paths: [][..]u8, sdk_root: []u8, path: []u8) -> Linked ! OutOfMemory {
+    var inputs: [..]RawInput = make(alloc)
+    for let k: usize in 0..names.len {
+        try push(inout inputs, RawInput.(name: raw_bytes(names[k]), bytes: raw_bytes(bytes[k])))
+    }
+    var stubs: [..]RawBytes = make(alloc)
+    for let stub: [..]u8 in tbd_paths {
+        try push(inout stubs, raw_bytes(stub))
+    }
+    var i: ?*RawInput = none
     if inputs.len > 0 {
         i = some.(value: &inputs[0])
     }
-    var t: ?*[]u8 = none
-    if tbd_paths.len > 0 {
-        t = some.(value: &tbd_paths[0])
+    var t: ?*RawBytes = none
+    if stubs.len > 0 {
+        t = some.(value: &stubs[0])
     }
     let options: LinkOptions = LinkOptions.(sdk_root: sdk_root, output_path: path, flags: 0)
     var warnings: ?*u8 = none
     var problem: ?*u8 = none
-    let status: u32 = unsafe { keel_link_signed(i, c.size_t.(inputs.len), t, c.size_t.(tbd_paths.len), &options, &warnings, &problem) }
+    let status: u32 = unsafe { keel_link_signed(i, c.size_t.(inputs.len), t, c.size_t.(stubs.len), &options, &warnings, &problem) }
     match problem {
         some(value as b: *u8) {
             return ok.(value: Linked.failed.(message: try take_buffer(alloc, b)))

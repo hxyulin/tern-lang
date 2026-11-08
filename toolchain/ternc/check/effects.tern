@@ -227,7 +227,7 @@ fn check_effects(input: Input, c: inout Checker) -> ! OutOfMemory {
                 let f: []u8 = file_text(input, call.caller.file, call.callee_span)
                 let g: []u8 = file_text(input, call.caller.file, a.named)
                 let arg: []u8 = file_text(input, call.caller.file, a.span)
-                try report(inout c, call.caller.file, a.span.start, try program.format_text(c.alloc, "`{f}` writes `{g}`, so `{arg}` cannot also be its argument: an argument must not alias a global the function writes"))
+                try report(inout c, call.caller.file, a.span.start, "`{f}` writes `{g}`, so `{arg}` cannot also be its argument: an argument must not alias a global the function writes")
             }
         }
     }
@@ -235,8 +235,8 @@ fn check_effects(input: Input, c: inout Checker) -> ! OutOfMemory {
         let set: []maps.DeclRef = sets[usize.(decl_number(c.types, v.decl))]
         if set.len > 0 {
             let f: []u8 = file_text(input, v.file, v.span)
-            let g: []u8 = try global_shown(input, c, set[0], v.file)
-            try report(inout c, v.file, v.span.start, try program.format_text(c.alloc, "`{f}` writes {g}, so it cannot be a function value: a function type writes no globals"))
+            let g: [..]u8 = try global_shown(input, c, set[0], v.file)
+            try report(inout c, v.file, v.span.start, "`{f}` writes {g}, so it cannot be a function value: a function type writes no globals")
         }
     }
     return ok
@@ -245,7 +245,7 @@ fn check_effects(input: Input, c: inout Checker) -> ! OutOfMemory {
 // A global as a message names it from file: by name in its own package,
 // by its package and name if it is `pub`, and otherwise as its package's
 // state, which keeps private globals private.
-fn global_shown(input: Input, c: Checker, global: maps.DeclRef, file: u32) -> []u8 ! OutOfMemory {
+fn global_shown(input: Input, c: Checker, global: maps.DeclRef, file: u32) -> [..]u8 ! OutOfMemory {
     let decl: syntax.Decl = decl_of(input, global)
     let ast: syntax.Ast = input.program.files[usize.(global.file)].ast
     var span: syntax.Span = decl.span

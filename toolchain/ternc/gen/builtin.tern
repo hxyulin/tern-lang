@@ -3,7 +3,6 @@
 
 import check
 import keel
-import program
 import syntax
 
 fn arg_value(input: Input, fx: Fx, args: syntax.List, i: usize) -> syntax.ExprId {
@@ -209,7 +208,7 @@ fn builtin_call(input: Input, g: inout Gen, fx: inout Fx, name: []u8, args: synt
             return saturating(input, inout g, inout fx, name, args, ty)
         }
         _ {
-            try unsupported(inout g, try program.format_text(g.alloc, "code generation does not support `{name}` yet"))
+            try unsupported(inout g, "code generation does not support `{name}` yet")
             return dummy(input, inout g, fx, ty)
         }
     }

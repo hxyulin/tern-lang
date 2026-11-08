@@ -131,7 +131,8 @@ pub type NamedId enum {
 
 pub type Range (pub start: u32, pub len: u32)
 
-pub type TupleField (pub name: []u8, pub ty: TyId)
+// name is a name number; see name_of.
+pub type TupleField (pub name: u32, pub ty: TyId)
 
 pub type FnParam (pub mode: syntax.Mode, pub ty: TyId)
 
@@ -157,7 +158,7 @@ pub type Ty enum {
     error
 }
 
-pub type Variant (pub name: []u8, pub payload: ?TyId, pub value: ?Wide)
+pub type Variant (pub name: u32, pub payload: ?TyId, pub value: ?Wide)
 
 pub type EnumInfo (
     // In Types.variants.
@@ -176,8 +177,9 @@ pub type NamedDef enum {
 }
 
 pub type NamedInfo (
-    // For messages: `File`, or `io.File` outside the root package.
-    pub display: []u8,
+    // For messages: `File`, or `io.File` outside the root package, as a
+    // name number.
+    pub display: u32,
     // None for built-in types.
     pub package: ?u32,
     pub def: NamedDef,
@@ -195,8 +197,10 @@ pub type Types (
     keys: [..]Range,
     // Open addressing over keys: a type's id plus one, or zero.
     slots: [..]u32,
-    // Field names, numbered for the words.
-    names: [..][]u8,
+    // Field, variant and type names, numbered for the words: name n is
+    // name_text at name_ranges[n].
+    name_text: [..]u8,
+    name_ranges: [..]Range,
     name_slots: [..]u32,
     // The named types' definitions: one per built-in, and one per type
     // declaration, indexed by the declaration's number.
@@ -217,7 +221,8 @@ pub fn new_types(alloc: Allocator, p: program.Program) -> Types ! OutOfMemory {
         words: make(alloc),
         keys: make(alloc),
         slots: make(alloc),
-        names: make(alloc),
+        name_text: make(alloc),
+        name_ranges: make(alloc),
         name_slots: make(alloc),
         builtin_infos: [none, none, none, none],
         decl_infos: make(alloc),
@@ -304,9 +309,15 @@ fn key_words(t: Types, i: u32) -> []u32 {
     return t.words[usize.(r.start)..usize.(r.start + r.len)]
 }
 
-// The number of a field name, interning it.
-fn name_number(t: inout Types, name: []u8) -> u32 ! OutOfMemory {
-    if (t.names.len + 1) * 2 > t.name_slots.len {
+// The name with number n.
+pub fn name_of(t: Types, n: u32) -> []u8 {
+    let r: Range = t.name_ranges[usize.(n)]
+    return t.name_text[usize.(r.start)..usize.(r.start + r.len)]
+}
+
+// The number of a name, interning it.
+pub fn name_number(t: inout Types, name: []u8) -> u32 ! OutOfMemory {
+    if (t.name_ranges.len + 1) * 2 > t.name_slots.len {
         var size: usize = t.name_slots.len * 2
         if size < 64 {
             size = 64
@@ -315,7 +326,7 @@ fn name_number(t: inout Types, name: []u8) -> u32 ! OutOfMemory {
         for let _: usize in 0..size {
             try push(inout t.name_slots, 0)
         }
-        for let i: usize in 0..t.names.len {
+        for let i: usize in 0..t.name_ranges.len {
             place_name(inout t, u32.(i))
         }
     }
@@ -324,12 +335,13 @@ fn name_number(t: inout Types, name: []u8) -> u32 ! OutOfMemory {
     for {
         let slot: u32 = t.name_slots[usize.(at)]
         if slot == 0 {
-            let n: u32 = u32.(t.names.len)
-            try push(inout t.names, name)
+            let n: u32 = u32.(t.name_ranges.len)
+            try push(inout t.name_ranges, Range.(start: u32.(t.name_text.len), len: u32.(name.len)))
+            try append(inout t.name_text, name)
             t.name_slots[usize.(at)] = n + 1
             return ok.(value: n)
         }
-        if program.bytes_equal(t.names[usize.(slot - 1)], name) {
+        if program.bytes_equal(name_of(t, slot - 1), name) {
             return ok.(value: slot - 1)
         }
         at = (at + 1) & mask
@@ -346,7 +358,7 @@ fn name_hash(name: []u8) -> u64 {
 
 fn place_name(t: inout Types, n: u32) {
     let mask: u64 = u64.(t.name_slots.len) - 1
-    var at: u64 = name_hash(t.names[usize.(n)]) & mask
+    var at: u64 = name_hash(name_of(t, n)) & mask
     for t.name_slots[usize.(at)] != 0 {
         at = (at + 1) & mask
     }
@@ -401,7 +413,7 @@ fn encode(t: inout Types, ty: Ty, out: inout [..]u32) -> ! OutOfMemory {
             try push(inout out, fields.len)
             for let i: u32 in 0..fields.len {
                 let f: TupleField = t.fields[usize.(fields.start + i)]
-                try push(inout out, try name_number(inout t, f.name))
+                try push(inout out, f.name)
                 try push(inout out, u32.(f.ty))
             }
         }
@@ -568,7 +580,7 @@ pub fn tuple_ty(t: inout Types, fields: []TupleField) -> TyId ! OutOfMemory {
 
 // A one-field tuple, such as `(value: T)`.
 pub fn single_field(t: inout Types, name: []u8, ty: TyId) -> TyId ! OutOfMemory {
-    let one: [1]TupleField = [TupleField.(name: name, ty: ty)]
+    let one: [1]TupleField = [TupleField.(name: try name_number(inout t, name), ty: ty)]
     return tuple_ty(inout t, one)
 }
 
@@ -621,7 +633,7 @@ pub fn show_into(t: Types, id: TyId, out: inout [..]u8) -> ! OutOfMemory {
         named(id as n: NamedId) {
             match named_info(t, n) {
                 some(value as info: NamedInfo) {
-                    try append(inout out, info.display)
+                    try append(inout out, name_of(t, info.display))
                 }
                 none {
                     try append(inout out, "\{unknown}")
@@ -635,7 +647,7 @@ pub fn show_into(t: Types, id: TyId, out: inout [..]u8) -> ! OutOfMemory {
                     try append(inout out, ", ")
                 }
                 let f: TupleField = t.fields[usize.(fields.start + i)]
-                try append(inout out, f.name)
+                try append(inout out, name_of(t, f.name))
                 try append(inout out, ": ")
                 try show_into(t, f.ty, inout out)
             }

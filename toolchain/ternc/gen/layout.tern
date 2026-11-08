@@ -22,9 +22,9 @@ pub type Repr enum {
 pub type TyLayout (size: u64, align: u64, repr: Repr)
 
 // A field of a record with its offset. A union's members all sit at 0.
-type FieldInfo (name: []u8, ty: check.TyId, offset: u64)
+type FieldInfo (name: u32, ty: check.TyId, offset: u64)
 
-type VariantShape (name: []u8, payload: ?check.TyId, tag: i64)
+type VariantShape (name: u32, payload: ?check.TyId, tag: i64)
 
 type EnumKind enum {
     // No payloads: the value is the tag.
@@ -396,18 +396,18 @@ fn compute_fields(input: Input, g: inout Gen, ty: check.TyId) -> FieldsSlot ! Ou
         view(elem: check.TyId) {
             let p: check.TyId = try check.intern(inout g.types, check.Ty.pointer.(elem: elem))
             let n: check.TyId = try check.usize_ty(inout g.types)
-            try push(inout fields, check.TupleField.(name: "ptr", ty: p))
-            try push(inout fields, check.TupleField.(name: "len", ty: n))
+            try push(inout fields, check.TupleField.(name: try check.name_number(inout g.types, "ptr"), ty: p))
+            try push(inout fields, check.TupleField.(name: try check.name_number(inout g.types, "len"), ty: n))
         }
         growable(elem: check.TyId) {
             let p: check.TyId = try check.intern(inout g.types, check.Ty.pointer.(elem: elem))
             let q: check.TyId = try check.intern(inout g.types, check.Ty.optional.(elem: p))
             let n: check.TyId = try check.usize_ty(inout g.types)
             let a: check.TyId = try check.named_ty(inout g.types, check.NamedId.builtin.(which: check.BuiltinNamed.allocator))
-            try push(inout fields, check.TupleField.(name: "ptr", ty: q))
-            try push(inout fields, check.TupleField.(name: "len", ty: n))
-            try push(inout fields, check.TupleField.(name: "cap", ty: n))
-            try push(inout fields, check.TupleField.(name: "alloc", ty: a))
+            try push(inout fields, check.TupleField.(name: try check.name_number(inout g.types, "ptr"), ty: q))
+            try push(inout fields, check.TupleField.(name: try check.name_number(inout g.types, "len"), ty: n))
+            try push(inout fields, check.TupleField.(name: try check.name_number(inout g.types, "cap"), ty: n))
+            try push(inout fields, check.TupleField.(name: try check.name_number(inout g.types, "alloc"), ty: a))
         }
         named(id: check.NamedId) {
             match check.named_info(g.types, id) {
@@ -461,7 +461,7 @@ fn field_of(input: Input, g: inout Gen, ty: check.TyId, name: []u8) -> FieldInfo
     match try fields_of(input, inout g, ty) {
         some(value as fields: []FieldInfo) {
             for let f: FieldInfo in fields {
-                if same_text(f.name, name) {
+                if same_text(check.name_of(g.types, f.name), name) {
                     return ok.(value: f)
                 }
             }
@@ -485,7 +485,7 @@ fn same_text(a: []u8, b: []u8) -> bool {
 }
 
 // A named variant with its declared value, before tags are given.
-type NamedVariant (name: []u8, payload: ?check.TyId, value: ?check.Wide)
+type NamedVariant (name: u32, payload: ?check.TyId, value: ?check.Wide)
 
 pub fn shape_of(input: Input, g: inout Gen, ty: check.TyId) -> ?EnumShape ! OutOfMemory {
     let index: usize = usize.(ty)
@@ -528,12 +528,12 @@ fn compute_shape(input: Input, g: inout Gen, ty: check.TyId) -> ShapeSlot ! OutO
             let payload: check.TyId = try check.single_field(inout g.types, "value", elem)
             if is_pointer_like(g, elem) {
                 let first: u32 = u32.(g.variant_shapes.len)
-                try push(inout g.variant_shapes, VariantShape.(name: "none", payload: none, tag: 0))
-                try push(inout g.variant_shapes, VariantShape.(name: "some", payload: some.(value: payload), tag: 1))
+                try push(inout g.variant_shapes, VariantShape.(name: try check.name_number(inout g.types, "none"), payload: none, tag: 0))
+                try push(inout g.variant_shapes, VariantShape.(name: try check.name_number(inout g.types, "some"), payload: some.(value: payload), tag: 1))
                 return ok.(value: ShapeSlot.found.(shape: EnumShape.(first: first, count: 2, kind: EnumKind.nullable_pointer)))
             }
-            try push(inout named, NamedVariant.(name: "none", payload: none, value: none))
-            try push(inout named, NamedVariant.(name: "some", payload: some.(value: payload), value: none))
+            try push(inout named, NamedVariant.(name: try check.name_number(inout g.types, "none"), payload: none, value: none))
+            try push(inout named, NamedVariant.(name: try check.name_number(inout g.types, "some"), payload: some.(value: payload), value: none))
         }
         result(value: ?check.TyId, error: check.TyId) {
             var ok_payload: ?check.TyId = none
@@ -545,8 +545,8 @@ fn compute_shape(input: Input, g: inout Gen, ty: check.TyId) -> ShapeSlot ! OutO
                 }
             }
             let err_payload: check.TyId = try check.single_field(inout g.types, "error", error)
-            try push(inout named, NamedVariant.(name: "ok", payload: ok_payload, value: none))
-            try push(inout named, NamedVariant.(name: "err", payload: some.(value: err_payload), value: none))
+            try push(inout named, NamedVariant.(name: try check.name_number(inout g.types, "ok"), payload: ok_payload, value: none))
+            try push(inout named, NamedVariant.(name: try check.name_number(inout g.types, "err"), payload: some.(value: err_payload), value: none))
         }
         named(id: check.NamedId) {
             match check.named_info(g.types, id) {
@@ -642,7 +642,7 @@ fn variant_of(input: Input, g: inout Gen, ty: check.TyId, name: []u8) -> Variant
         some(value as shape: EnumShape) {
             for let i: usize in 0..usize.(shape.count) {
                 let v: VariantShape = shape_variant(g, shape, i)
-                if same_text(v.name, name) {
+                if same_text(check.name_of(g.types, v.name), name) {
                     return ok.(value: VariantOf.(variant: v, kind: shape.kind))
                 }
             }
@@ -661,7 +661,7 @@ fn shape_variant(g: Gen, shape: EnumShape, i: usize) -> VariantShape {
 
 fn variant_index(g: Gen, shape: EnumShape, name: []u8) -> usize {
     for let i: usize in 0..usize.(shape.count) {
-        if same_text(shape_variant(g, shape, i).name, name) {
+        if same_text(check.name_of(g.types, shape_variant(g, shape, i).name), name) {
             return i
         }
     }
