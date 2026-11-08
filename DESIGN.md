@@ -1335,3 +1335,37 @@ Not in the first version. `[T]` is reserved for type arguments.
 - `static str`, and how long-lived structs refer to input.
 - Iterators and nested functions (see Deferred).
 - The language's name.
+
+Raised by the programs in `examples/` on 2026-11-08. They parse, but a
+checker would have to settle these:
+
+- **Views in enum payloads.** The natural parser result is
+  `type Line enum { section(name: str); pair(key: str, value: str) }`,
+  borrowing from the input line. View rule 1 forbids views in struct
+  fields; whether enum payloads and returned named tuples count is not
+  decided. This is the view-struct question from Iterators again.
+- **Payload bindings cannot be renamed.** `some(value: u8)` binds
+  `value`, so a match nested inside another arm shadows the outer
+  `value`.
+- **Converting an error needs a statement `match`.** A `match`
+  expression arm cannot `return`, and there is no `From`, so passing an
+  `io.Error` up as `AppError` takes a whole `match` with a `return` in
+  each arm.
+- **A fallible call in `defer`.** `defer io.close(inout f)` ignores a
+  result, which is otherwise an error.
+- **Private globals in another package's `uses`.** `main` calls
+  `board.read_byte()`, so it must list `uses inout board.rx`, which
+  `board` keeps private.
+- **Interrupt handlers and `fn` values.** A handler has a `uses` list, so
+  it cannot be a `fn()` value in a vector table. The example exports it
+  by symbol name instead.
+- **Constant initializers.** Whether `from_address[*Regs](0x4000_C000)`
+  counts as constant in a global, and whether it needs `unsafe`, since
+  creating a pointer is safe.
+- **`str` and `[]u8`.** The examples write `str.(line[..n])`. Whether
+  the two are the same type is not decided.
+- **A global `str` constant.** A `let` global cannot hold a view, so
+  `let prompt: str = "> "` waits on `static str`.
+- **Length.** The examples use a built-in `len(s)`.
+- **Import roots.** The examples import packages from their own project
+  as `import board`. How a path resolves to a directory is not decided.

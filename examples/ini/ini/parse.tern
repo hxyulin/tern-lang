@@ -1,0 +1,86 @@
+// Parses one line of an INI file. Every view in a Line points into the
+// line that was passed in.
+//
+//   [section]
+//   key = value
+//   ; comment, or # comment
+
+pub type Line enum {
+    blank
+    section(name: str)
+    pair(key: str, value: str)
+}
+
+pub type ParseError enum {
+    missing_equals
+    empty_key
+    unclosed_section
+}
+
+pub fn parse_line(line: str) -> Line ! ParseError {
+    let t: str = trim(strip_comment(line))
+    if len(t) == 0 {
+        return ok.(value: Line.blank)
+    }
+    if t[0] == '[' {
+        if t[len(t) - 1] != ']' {
+            return err.(error: ParseError.unclosed_section)
+        }
+        let name: str = trim(t[1..len(t) - 1])
+        return ok.(value: Line.section.(name: name))
+    }
+    match index_of(t, '=') {
+        none {
+            return err.(error: ParseError.missing_equals)
+        }
+        some(value: usize) {
+            let key: str = trim(t[..value])
+            if len(key) == 0 {
+                return err.(error: ParseError.empty_key)
+            }
+            let rest: str = trim(t[value + 1..])
+            return ok.(value: Line.pair.(key: key, value: rest))
+        }
+    }
+}
+
+fn strip_comment(s: str) -> str {
+    for let i: usize in 0..len(s) {
+        match s[i] {
+            ';' {
+                return s[..i]
+            }
+            '#' {
+                return s[..i]
+            }
+            _ {
+            }
+        }
+    }
+    return s
+}
+
+fn trim(s: str) -> str {
+    var a: usize = 0
+    var b: usize = len(s)
+    for a < b && is_space(s[a]) {
+        a += 1
+    }
+    for b > a && is_space(s[b - 1]) {
+        b -= 1
+    }
+    return s[a..b]
+}
+
+fn is_space(c: u8) -> bool {
+    return c == ' ' || c == '\t' || c == '\r'
+}
+
+fn index_of(s: str, c: u8) -> ?usize {
+    for let i: usize in 0..len(s) {
+        if s[i] == c {
+            return some.(value: i)
+        }
+    }
+    return none
+}

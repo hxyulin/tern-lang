@@ -1,0 +1,106 @@
+// A command shell on the serial port. It echoes what is typed and runs a
+// command at each carriage return:
+//
+//   led on, led off   switch the board LED
+//   status            print how many received bytes were dropped
+
+import board
+
+type Command enum {
+    led_on
+    led_off
+    status
+    unknown
+}
+
+let gpio_out: *u32 = from_address[*u32](0x4002_0014)
+let led_pin: u32 = 1 << 5
+let line_max: usize = 80
+
+// 115200 baud from a 48 MHz clock.
+let baud_divisor: u32 = 26
+
+@export("main")
+fn main() uses inout board.rx, inout board.overruns {
+    board.init(baud_divisor)
+    var line: [line_max]u8 = fill[line_max](0)
+    var n: usize = 0
+    board.write_str("> ")
+    for {
+        match board.read_byte() {
+            none {
+                board.wait()
+            }
+            some(value: u8) {
+                if value == '\r' {
+                    board.write_str("\r\n")
+                    run(str.(line[..n]))
+                    n = 0
+                    board.write_str("> ")
+                } else if n < line_max {
+                    line[n] = value
+                    n += 1
+                    board.write_byte(value)
+                }
+            }
+        }
+    }
+}
+
+fn run(line: str) uses inout board.overruns {
+    match parse_command(line) {
+        led_on {
+            set_led(true)
+        }
+        led_off {
+            set_led(false)
+        }
+        status {
+            board.write_str("overruns: ")
+            write_decimal(board.take_overruns())
+            board.write_str("\r\n")
+        }
+        unknown {
+            board.write_str("unknown command\r\n")
+        }
+    }
+}
+
+fn parse_command(line: str) -> Command {
+    return match line {
+        "led on" { Command.led_on }
+        "led off" { Command.led_off }
+        "status" { Command.status }
+        _ { Command.unknown }
+    }
+}
+
+fn set_led(on: bool) {
+    // SAFETY: gpio_out is the GPIO output register in the chip's memory map.
+    unsafe {
+        let v: u32 = volatile_load(gpio_out)
+        if on {
+            volatile_store(gpio_out, v | led_pin)
+        } else {
+            volatile_store(gpio_out, v & ~led_pin)
+        }
+    }
+}
+
+// Writes n in base 10 without a heap.
+fn write_decimal(n: u32) {
+    var digits: [10]u8 = fill[10](0)
+    var i: usize = 10
+    var rest: u32 = n
+    for {
+        i -= 1
+        digits[i] = '0' + truncate[u8](rest % 10)
+        rest /= 10
+        if rest == 0 {
+            break
+        }
+    }
+    for let d: u8 in digits[i..] {
+        board.write_byte(d)
+    }
+}

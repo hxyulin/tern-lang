@@ -1,0 +1,108 @@
+// inicheck FILE: prints each section and key of an INI file, or the first
+// line that does not parse. Exits with 0 on success and 1 on any error.
+
+import std.io
+import std.os
+import ini
+
+type AppError enum {
+    usage
+    read_failed(error: io.Error)
+    bad_line(line: u32, error: ini.ParseError)
+}
+
+fn main() -> u8 {
+    match run() {
+        ok {
+            return 0
+        }
+        err(error: AppError) {
+            report(error)
+            return 1
+        }
+    }
+}
+
+fn run() -> ! AppError {
+    let args: []str = os.args()
+    if len(args) != 2 {
+        return err.(error: AppError.usage)
+    }
+    match read_all(args[1]) {
+        ok(value: String) {
+            return check(value)
+        }
+        err(error: io.Error) {
+            return err.(error: AppError.read_failed.(error: error))
+        }
+    }
+}
+
+fn read_all(path: str) -> String ! io.Error {
+    var f: io.File = try io.open(path)
+    defer io.close(inout f)
+    return io.read_to_end(inout f)
+}
+
+fn check(text: str) -> ! AppError {
+    var line_no: u32 = 0
+    var start: usize = 0
+    for start < len(text) {
+        let end: usize = line_end(text, start)
+        line_no += 1
+        match ini.parse_line(text[start..end]) {
+            ok(value: ini.Line) {
+                show(value)
+            }
+            err(error: ini.ParseError) {
+                return err.(error: AppError.bad_line.(line: line_no, error: error))
+            }
+        }
+        start = end + 1
+    }
+    return ok
+}
+
+fn show(line: ini.Line) {
+    match line {
+        blank {
+        }
+        section(name: str) {
+            io.print("[{name}]\n")
+        }
+        pair(key: str, value: str) {
+            io.print("  {key} = {value}\n")
+        }
+    }
+}
+
+// The index of the next '\n' at or after start, or the end of text.
+fn line_end(text: str, start: usize) -> usize {
+    var i: usize = start
+    for i < len(text) && text[i] != '\n' {
+        i += 1
+    }
+    return i
+}
+
+fn report(e: AppError) {
+    match e {
+        usage {
+            io.eprint("usage: inicheck FILE\n")
+        }
+        read_failed(error: io.Error) {
+            io.eprint("cannot read file: {io.describe(error)}\n")
+        }
+        bad_line(line: u32, error: ini.ParseError) {
+            io.eprint("line {line}: {describe(error)}\n")
+        }
+    }
+}
+
+fn describe(e: ini.ParseError) -> str {
+    return match e {
+        missing_equals { "expected key = value" }
+        empty_key { "empty key" }
+        unclosed_section { "missing ] after section name" }
+    }
+}

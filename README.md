@@ -15,6 +15,9 @@ declarations, so a clean `tree-sitter generate` shows the syntax has no
 LR(1) conflicts. The tests in `tree-sitter/test/corpus` include code the
 grammar must reject.
 
+[examples/](examples) holds small programs written in the designed syntax.
+`npm test` also parses them. Nothing type-checks them yet.
+
 The flake provides the tree-sitter CLI. Generating the parser also needs
 Node.js on the `PATH`.
 

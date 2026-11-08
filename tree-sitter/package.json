@@ -5,6 +5,7 @@
   "description": "Tree-sitter grammar for tern",
   "scripts": {
     "generate": "tree-sitter generate",
-    "test": "tree-sitter generate && tree-sitter test"
+    "test": "tree-sitter generate && tree-sitter test && npm run examples",
+    "examples": "tree-sitter parse --quiet --stat ../examples/*/*.tern ../examples/*/*/*.tern"
   }
 }

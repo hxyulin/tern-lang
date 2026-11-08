@@ -1,0 +1,102 @@
+// Driver for a memory-mapped UART. Received bytes arrive by interrupt and
+// wait in a ring until the main loop reads them. Sending polls.
+
+import ring
+
+type Regs (
+    data: u32,
+    status: u32,
+    ctrl: u32,
+    baud: u32,
+)
+
+let status_rx_ready: u32 = 0x01
+let status_tx_ready: u32 = 0x02
+let ctrl_enable: u32 = 0x01
+let ctrl_rx_irq: u32 = 0x10
+
+let regs: *Regs = from_address[*Regs](0x4000_C000)
+
+shared var rx: ring.Ring = ring.empty
+shared var overruns: u32 = 0
+
+// Defined in the startup assembly.
+extern fn cpu_wait_for_interrupt()
+
+pub fn init(baud_divisor: u32) {
+    // SAFETY: regs is the UART block in the chip's memory map.
+    unsafe {
+        volatile_store(&regs.*.baud, baud_divisor)
+        volatile_store(&regs.*.ctrl, ctrl_enable | ctrl_rx_irq)
+    }
+}
+
+// The vector table refers to this symbol by name. A function with a uses
+// list cannot be a fn() value, so the table cannot hold it directly.
+@interrupt
+@export("UART0_IRQHandler")
+pub fn isr() uses inout rx, inout overruns {
+    for rx_ready() {
+        let b: u8 = read_data()
+        lock rx, overruns {
+            if !ring.push(inout rx, b) {
+                overruns = wrapping_add(overruns, 1)
+            }
+        }
+    }
+}
+
+pub fn read_byte() -> ?u8 uses inout rx {
+    lock rx {
+        return ring.pop(inout rx)
+    }
+}
+
+// Returns the bytes dropped since the last call.
+pub fn take_overruns() -> u32 uses inout overruns {
+    lock overruns {
+        let n: u32 = overruns
+        overruns = 0
+        return n
+    }
+}
+
+pub fn wait() {
+    // SAFETY: wfi only pauses until the next interrupt.
+    unsafe {
+        cpu_wait_for_interrupt()
+    }
+}
+
+pub fn write_byte(b: u8) {
+    for !tx_ready() {
+    }
+    // SAFETY: as in init.
+    unsafe {
+        volatile_store(&regs.*.data, u32.(b))
+    }
+}
+
+pub fn write_str(s: str) {
+    for let c: u8 in s {
+        write_byte(c)
+    }
+}
+
+fn rx_ready() -> bool {
+    // SAFETY: as in init.
+    let status: u32 = unsafe { volatile_load(&regs.*.status) }
+    return status & status_rx_ready != 0
+}
+
+fn tx_ready() -> bool {
+    // SAFETY: as in init.
+    let status: u32 = unsafe { volatile_load(&regs.*.status) }
+    return status & status_tx_ready != 0
+}
+
+fn read_data() -> u8 {
+    // SAFETY: as in init. Reading data clears rx_ready.
+    let word: u32 = unsafe { volatile_load(&regs.*.data) }
+    return truncate[u8](word)
+}
