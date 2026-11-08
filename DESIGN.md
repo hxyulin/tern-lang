@@ -1767,9 +1767,9 @@ Decided the same day:
 - **Scope:** the whole language except concurrency and the details of C
   interop, aiming first to compile `examples/ini`.
 
-**Leaning (2026-11-08):** details the safety checks had to settle. The
-user asked to finish the checks; these follow the decided rules where
-they reach, and fill gaps where they do not.
+**Decided (2026-11-08):** details the safety checks had to settle. They
+follow the decided rules where those reach, and fill gaps where they do
+not. The user agreed to each.
 
 - **What moves.** A type moves instead of copying when it holds a
   `[..]T`, directly or through a record, tuple, array, enum payload,
@@ -1803,7 +1803,8 @@ they reach, and fill gaps where they do not.
 - **Exclusivity** compares access paths: the same local or global, then
   fields and constant indexes. Any other argument that overlaps an
   `inout` one is an error, so `add(inout p.x, p.x)` is rejected; write
-  `let n: u32 = p.x` first.
+  `let n: u32 = p.x` first. The user kept this strict form unless real
+  code runs into problems with it.
 - **Constants** also include function names, whose addresses are fixed,
   so an interrupt table or `heap.c_allocator` is a constant. Cycles
   between `let` globals are not checked yet.
@@ -1866,10 +1867,10 @@ Not in the first version. `[T]` is reserved for type arguments.
   allocator's `free`, can be called without `unsafe`. One option is
   `unsafe fn(...)` as a type. The same gap lets code call a C function
   through a function value without `unsafe`.
-- Moving types the compiler cannot recognize. `io.File` owns a
-  descriptor but holds only a `c.int`, so it copies, and nothing stops
-  `close` on both copies. An attribute or keyword that marks a type as
-  moving would close this.
+- How to mark a type as moving. `io.File` owns a descriptor but holds
+  only a `c.int`, so it copies, and nothing stops `close` on both
+  copies. The user agreed on 2026-11-08 that a marker is needed; its
+  form is open.
 
 Raised by the programs in `examples/` on 2026-11-08. They parse, but a
 checker would have to settle these. Dropping temporal safety settled
