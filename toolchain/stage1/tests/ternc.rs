@@ -32,10 +32,8 @@ fn compilers() -> &'static [(PathBuf, &'static str); 2] {
         [(false, "plain"), (true, "-O")].map(|(optimize, label)| {
             let out = tmp().join(if optimize { "ternc-O" } else { "ternc" });
             let options = Options {
-                std_dir: repo().join("toolchain/std"),
                 optimize,
-                assembly_only: false,
-                ir_only: false,
+                ..Options::new(repo().join("toolchain/std"))
             };
             build(&repo().join("toolchain/ternc"), &out, &options)
                 .unwrap_or_else(|e| panic!("cannot build ternc ({label}):\n{e}"));

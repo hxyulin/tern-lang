@@ -1,9 +1,12 @@
 //! End to end: each directory in `tests/run` is a program, built with
 //! keel without and with optimization, then run. Its `stdout` file holds
 //! the expected output, `exit` the exit status (0 if absent), and
-//! `stderr`, if present, text the error output must start with.
+//! `stderr`, if present, text the error output must start with. A
+//! directory with `.c` files is linked with a static archive of them, and
+//! with libm.
 //!
-//! On Linux, needs `clang` to assemble and link.
+//! Needs `cc` and `ar` for those archives; on Linux, also `clang` to
+//! assemble and link.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,8 +18,9 @@ fn std_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../std")
 }
 
-/// Builds `root`, runs it with `args`, and returns the failures.
-fn run(name: &str, root: &Path, args: &[&str], expected: &Path) -> Vec<String> {
+/// Builds `root` with `options` (optimization aside), runs it with `args`,
+/// and returns the failures.
+fn run(name: &str, root: &Path, options: &Options, args: &[&str], expected: &Path) -> Vec<String> {
     let mut failures = Vec::new();
     let read = |file: &str| fs::read_to_string(expected.join(file)).ok();
     let want_stdout = read("stdout").unwrap_or_default();
@@ -29,10 +33,10 @@ fn run(name: &str, root: &Path, args: &[&str], expected: &Path) -> Vec<String> {
             .join(format!("{name}{}", if optimize { "-O" } else { "" }));
         fs::create_dir_all(out.parent().expect("a parent")).expect("can create directory");
         let options = Options {
-            std_dir: std_dir(),
             optimize,
-            assembly_only: false,
-            ir_only: false,
+            link: options.link.clone(),
+            libraries: options.libraries.clone(),
+            ..Options::new(std_dir())
         };
         if let Err(e) = build(root, &out, &options) {
             failures.push(format!("{name} ({label}): build failed:\n{e}"));
@@ -67,6 +71,45 @@ fn run(name: &str, root: &Path, args: &[&str], expected: &Path) -> Vec<String> {
     failures
 }
 
+/// A static archive of the `.c` files in `root`, if it has any.
+fn c_archive(name: &str, root: &Path) -> Option<PathBuf> {
+    let mut sources: Vec<PathBuf> = fs::read_dir(root)
+        .expect("can read directory")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "c"))
+        .collect();
+    if sources.is_empty() {
+        return None;
+    }
+    sources.sort();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("c").join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("can create directory");
+    let mut objects = Vec::new();
+    for source in &sources {
+        let stem = source.file_stem().expect("a file name");
+        let object = dir.join(stem).with_extension("o");
+        let status = Command::new("cc")
+            .args(["-c", "-O2", "-o"])
+            .arg(&object)
+            .arg(source)
+            .status()
+            .expect("can run cc");
+        assert!(status.success(), "cc failed on {}", source.display());
+        objects.push(object);
+    }
+    let archive = dir.join(format!("lib{name}.a"));
+    let status = Command::new("ar")
+        .arg("rcs")
+        .arg(&archive)
+        .args(&objects)
+        .status()
+        .expect("can run ar");
+    assert!(status.success(), "ar failed for {name}");
+    Some(archive)
+}
+
 #[test]
 fn programs_run() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/run");
@@ -79,7 +122,12 @@ fn programs_run() {
     let mut failures = Vec::new();
     for name in &names {
         let root = dir.join(name);
-        failures.extend(run(name, &root, &[], &root));
+        let mut options = Options::new(std_dir());
+        if let Some(archive) = c_archive(name, &root) {
+            options.link.push(archive);
+            options.libraries.push("m".into());
+        }
+        failures.extend(run(name, &root, &options, &[], &root));
     }
     assert!(names.len() >= 8, "found only {names:?}");
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
@@ -117,8 +165,26 @@ fn ini_example_runs() {
     let mut failures = Vec::new();
     let good = good.to_string_lossy().into_owned();
     let bad = bad.to_string_lossy().into_owned();
-    failures.extend(run("ini-good", &root, &[&good], &good_dir));
-    failures.extend(run("ini-bad", &root, &[&bad], &bad_dir));
-    failures.extend(run("ini-usage", &root, &[], &usage_dir));
+    failures.extend(run(
+        "ini-good",
+        &root,
+        &Options::new(std_dir()),
+        &[&good],
+        &good_dir,
+    ));
+    failures.extend(run(
+        "ini-bad",
+        &root,
+        &Options::new(std_dir()),
+        &[&bad],
+        &bad_dir,
+    ));
+    failures.extend(run(
+        "ini-usage",
+        &root,
+        &Options::new(std_dir()),
+        &[],
+        &usage_dir,
+    ));
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

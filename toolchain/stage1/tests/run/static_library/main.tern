@@ -1,0 +1,14 @@
+// Calls C functions from a static archive the test builds from the .c
+// files here.
+
+import std.io
+
+extern fn lib_add(a: i64, b: i64) -> i64
+extern fn lib_root(x: i64) -> i64
+
+fn main() -> u8 {
+    let sum: i64 = unsafe { lib_add(40, 2) }
+    let root: i64 = unsafe { lib_root(1764) }
+    io.print("{sum} {root}\n")
+    return 0
+}

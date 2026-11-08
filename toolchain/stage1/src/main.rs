@@ -11,7 +11,8 @@ use stage1::{check, lexer, package, parser, resolve, sexp};
 const USAGE: &str = "usage: ternc lex FILE
        ternc parse FILE
        ternc check DIR [--std DIR]
-       ternc build DIR [-o OUT] [-O] [-S] [--ir] [--std DIR]";
+       ternc build DIR [FILE.a|FILE.o ...] [-l NAME] [-o OUT] [-O] [-S] [--ir]
+                   [--std DIR]";
 
 /// The standard library in this repository, for a compiler run from it.
 const DEFAULT_STD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../std");
@@ -51,12 +52,7 @@ fn main() -> ExitCode {
 fn build(args: &[String]) -> ExitCode {
     let mut root: Option<&str> = None;
     let mut out: Option<&str> = None;
-    let mut options = stage1::build::Options {
-        std_dir: DEFAULT_STD.into(),
-        optimize: false,
-        assembly_only: false,
-        ir_only: false,
-    };
+    let mut options = stage1::build::Options::new(DEFAULT_STD.into());
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -69,6 +65,17 @@ fn build(args: &[String]) -> ExitCode {
             "-O" => options.optimize = true,
             "-S" => options.assembly_only = true,
             "--ir" => options.ir_only = true,
+            "-l" => match rest.next() {
+                Some(name) => options.libraries.push(name.clone()),
+                None => return usage(),
+            },
+            _ if arg.starts_with("-l") && arg.len() > 2 => options.libraries.push(arg[2..].into()),
+            _ if Path::new(arg)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("a") || e.eq_ignore_ascii_case("o")) =>
+            {
+                options.link.push(arg.into());
+            }
             _ if root.is_none() => root = Some(arg),
             _ => return usage(),
         }

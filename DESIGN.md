@@ -1976,7 +1976,11 @@ not. The user agreed to each.
 - **`[..]T` grows through one helper,** `tern.grow`, which calls the
   array's allocator through its `alloc` or `resize` function value.
 - **`ternc build DIR`** writes an executable; `-O` runs keel's
-  optimizer, `-S` writes assembly and `--ir` keel's IR.
+  optimizer, `-S` writes assembly and `--ir` keel's IR. Extra `.a` and
+  `.o` arguments are linked with the program, and `-l NAME` links a
+  system library: on macOS keel's linker reads the archive and the SDK's
+  `libNAME.tbd`, elsewhere both go to clang. This stands in for the
+  build system until there is one.
 
 Not lowered yet: `copy`, destructured globals, and `lock`, which runs
 its block without taking anything until a target defines what a lock

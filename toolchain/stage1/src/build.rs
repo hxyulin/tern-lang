@@ -1,6 +1,7 @@
 //! Building a program: check it, lower it to keel, then assemble and link
-//! it with the C library. On macOS keel does both in memory; elsewhere
-//! `clang` assembles and links keel's assembly.
+//! it with the C library and any archives, objects and system libraries
+//! the command names. On macOS keel does both in memory; elsewhere `clang`
+//! assembles and links keel's assembly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,6 +18,25 @@ pub struct Options {
     pub assembly_only: bool,
     /// Write keel's IR instead, before optimization.
     pub ir_only: bool,
+    /// Static archives (`.a`) and object files (`.o`) linked with the
+    /// program.
+    pub link: Vec<PathBuf>,
+    /// System libraries, as in `-l NAME`.
+    pub libraries: Vec<String>,
+}
+
+impl Options {
+    /// A plain build: no optimization and nothing extra to link.
+    pub fn new(std_dir: PathBuf) -> Self {
+        Self {
+            std_dir,
+            optimize: false,
+            assembly_only: false,
+            ir_only: false,
+            link: Vec::new(),
+            libraries: Vec::new(),
+        }
+    }
 }
 
 /// The target this compiler runs on.
@@ -77,9 +97,9 @@ pub fn build(root: &Path, out: &Path, options: &Options) -> Result<(), String> {
     }
     if host() == Target::Aarch64AppleDarwin {
         let object = assemble(&module)?;
-        return link_darwin(&object, out);
+        return link_darwin(&object, out, options);
     }
-    link_with_clang(&module, out)
+    link_with_clang(&module, out, options)
 }
 
 /// Assembles `module` for Apple arm64 in memory: code generation hands each
@@ -109,17 +129,45 @@ fn assemble(module: &keel_ir::Module) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("internal error: assembly failed: {e}"))
 }
 
-/// Links one object with libSystem into the signed executable `out`.
-fn link_darwin(object: &[u8], out: &Path) -> Result<(), String> {
+/// Links the program's object, the extra archives and objects, libSystem
+/// and the `-l` libraries into the signed executable `out`.
+fn link_darwin(object: &[u8], out: &Path, options: &Options) -> Result<(), String> {
     let sdk = macos_sdk().ok_or("cannot find the macOS SDK; set SDKROOT")?;
-    let libsystem = keel_link::Dylib::from_tbd(&sdk.join("usr/lib/libSystem.tbd"), &sdk)
-        .map_err(|e| format!("cannot read libSystem from {}: {e}", sdk.display()))?;
-    let inputs = [keel_link::Input {
+    let mut files = Vec::new();
+    for path in &options.link {
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        files.push((path.display().to_string(), bytes));
+    }
+    let mut inputs = vec![keel_link::Input {
         name: "tern.o",
         bytes: object,
     }];
+    inputs.extend(
+        files
+            .iter()
+            .map(|(name, bytes)| keel_link::Input { name, bytes }),
+    );
+    // libc, libm and others are links to libSystem; load each stub once.
+    let mut stubs: Vec<PathBuf> = Vec::new();
+    for name in std::iter::once("System").chain(options.libraries.iter().map(String::as_str)) {
+        let path = sdk.join(format!("usr/lib/lib{name}.tbd"));
+        let path = path
+            .canonicalize()
+            .map_err(|_| format!("cannot find library `{name}` in {}", sdk.display()))?;
+        if !stubs.contains(&path) {
+            stubs.push(path);
+        }
+    }
+    let dylibs = stubs
+        .iter()
+        .map(|path| {
+            keel_link::Dylib::from_tbd(path, &sdk)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))
+        })
+        .collect::<Result<_, _>>()?;
     let link_options = keel_link::Options {
-        dylibs: vec![libsystem],
+        dylibs,
         ..keel_link::Options::default()
     };
     let warnings = keel_link::link_signed(&inputs, link_options, out)
@@ -153,8 +201,9 @@ fn macos_sdk() -> Option<PathBuf> {
     ))
 }
 
-/// Writes assembly next to `out` and has clang assemble and link it.
-fn link_with_clang(module: &keel_ir::Module, out: &Path) -> Result<(), String> {
+/// Writes assembly next to `out` and has clang assemble and link it with
+/// the extra archives, objects and `-l` libraries.
+fn link_with_clang(module: &keel_ir::Module, out: &Path, options: &Options) -> Result<(), String> {
     let assembly = keel_codegen::compile(module, host())
         .map_err(|e| format!("internal error: code generation failed: {e}"))?;
     let asm_path = out.with_extension("s");
@@ -164,6 +213,8 @@ fn link_with_clang(module: &keel_ir::Module, out: &Path) -> Result<(), String> {
         .arg("-o")
         .arg(out)
         .arg(&asm_path)
+        .args(&options.link)
+        .args(options.libraries.iter().map(|name| format!("-l{name}")))
         .status()
         .map_err(|e| format!("cannot run clang: {e}"))?;
     let _ = std::fs::remove_file(&asm_path);
