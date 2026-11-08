@@ -812,9 +812,13 @@ fn destructuring(p: inout Parser) -> List ! Stop {
 }
 
 fn destruct_field(p: inout Parser) -> u32 ! Stop {
+    // `var` comes right before the bound name: `var q: T`, or
+    // `q as var quotient: T`.
+    var mutable: bool = eat(inout p, TokenKind.kw_var)
     let f: Span = try name(inout p)
     var rename: ?Span = none
-    if eat(inout p, TokenKind.kw_as) {
+    if !mutable && eat(inout p, TokenKind.kw_as) {
+        mutable = eat(inout p, TokenKind.kw_var)
         rename = some.(value: try name(inout p))
     }
     try expect(inout p, TokenKind.colon, "`:` and a type")
@@ -822,7 +826,8 @@ fn destruct_field(p: inout Parser) -> u32 ! Stop {
     if !eat(inout p, TokenKind.underscore) {
         ty = some.(value: try type_expr(inout p))
     }
-    try memory(push(inout p.ast.destructs, DestructField.(field: f, rename: rename, ty: ty)))
+    let d: DestructField = DestructField.(field: f, rename: rename, mutable: mutable, ty: ty)
+    try memory(push(inout p.ast.destructs, d))
     return ok.(value: u32.(p.ast.destructs.len - 1))
 }
 

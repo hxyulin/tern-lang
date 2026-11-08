@@ -603,3 +603,36 @@ fn f(alloc: Allocator, given: [..]u8, edit: inout [..]u8) -> [..]u8 {
         ]
     );
 }
+
+#[test]
+fn var_in_patterns() {
+    let source = "type Pair (a: u32, b: u32)
+
+fn f(maybe: ?[..]u8, pair: Pair) {
+    match maybe {
+        some(value as var bytes: [..]u8) {
+            free(inout bytes)
+        }
+        none {
+        }
+    }
+    match maybe {
+        some(value: [..]u8) {
+            free(inout value)
+        }
+        none {
+        }
+    }
+    let (var a: u32, b: u32) = pair
+    a += 1
+    b += 1
+}
+";
+    assert_eq!(
+        one("var_patterns", source),
+        [
+            "cannot pass `inout` `value`: it is not a `var` or an `inout` parameter",
+            "cannot assign to `b`: it is not a `var` or an `inout` parameter",
+        ]
+    );
+}

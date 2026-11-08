@@ -248,3 +248,70 @@ fn f() {
             (call_expression
               (identifier)
               (argument_list))))))))
+
+================================================================================
+Mutable bindings in patterns
+================================================================================
+
+fn f() {
+    match read() {
+        ok(var value: Buf) {
+            free(inout value)
+        }
+        err(error as var e: E) {
+        }
+    }
+    let (a: u8, var b: u8) = pair
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (match_statement
+        value: (call_expression
+          function: (identifier)
+          arguments: (argument_list))
+        (match_arm
+          pattern: (variant_pattern
+            name: (identifier)
+            payload: (destructuring_pattern
+              (destructuring_field
+                mutable: (mutable)
+                name: (identifier)
+                type: (type_name
+                  name: (identifier)))))
+          body: (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (argument_list
+                  (argument
+                    mode: (parameter_mode)
+                    value: (identifier)))))))
+        (match_arm
+          pattern: (variant_pattern
+            name: (identifier)
+            payload: (destructuring_pattern
+              (destructuring_field
+                name: (identifier)
+                mutable: (mutable)
+                binding: (identifier)
+                type: (type_name
+                  name: (identifier)))))
+          body: (block)))
+      (let_declaration
+        pattern: (destructuring_pattern
+          (destructuring_field
+            name: (identifier)
+            type: (type_name
+              name: (identifier)))
+          (destructuring_field
+            mutable: (mutable)
+            name: (identifier)
+            type: (type_name
+              name: (identifier))))
+        value: (identifier)))))

@@ -677,15 +677,27 @@ impl Parser<'_> {
     /// `(q: u32, r as rest: _)`, after the `(`. At least one field.
     fn destructuring(&mut self) -> P<Vec<DestructField>> {
         let fields = self.comma_list(|p| {
+            // `var` comes right before the bound name: `var q: T`, or
+            // `q as var quotient: T`.
+            let mut mutable = p.eat(K::Var);
             let field = p.name()?;
-            let rename = if p.eat(K::As) { Some(p.name()?) } else { None };
+            let mut rename = None;
+            if !mutable && p.eat(K::As) {
+                mutable = p.eat(K::Var);
+                rename = Some(p.name()?);
+            }
             p.expect(K::Colon, "`:` and a type")?;
             let ty = if p.eat(K::Underscore) {
                 None
             } else {
                 Some(p.ty()?)
             };
-            Ok(DestructField { field, rename, ty })
+            Ok(DestructField {
+                field,
+                rename,
+                mutable,
+                ty,
+            })
         })?;
         if fields.is_empty() {
             self.error_at(

@@ -761,6 +761,25 @@ let (x: i32, y: i32) = p            // p: Point
 
   The examples raised the need. Renaming a skipped field
   (`r as x: _`) is a checker error.
+- **Decided (2026-11-08):** `var` right before the bound name makes
+  that one binding mutable: `some(var value: [..]u8)`, or
+  `some(value as var bytes: [..]u8)`. It is the same place `var` takes
+  in `var x: T`. Since [Values and buffers](#values-and-buffers),
+  `free` and `take` change their argument, and a `match` payload was
+  always immutable, so freeing one took a rebinding first:
+
+  ```
+  match read_all(alloc, path) {
+      ok(value as var text: [..]u8) {
+          defer free(inout text)
+          ...
+      }
+      ...
+  }
+  ```
+
+  Rejected: letting `free` take a `let` binding without emptying it,
+  which would make `free` behave two ways.
 
 Rejected: `let (q: quot, r: rem) = ...` for renaming, because it reuses
 `name: Type` with a different meaning.

@@ -308,13 +308,24 @@ module.exports = grammar({
     destructuring_pattern: ($) => seq('(', commaSep1($.destructuring_field), ')'),
 
     // q: u32, or q as quotient: u32 to bind field q under another name.
+    // var before the bound name makes the binding mutable: var q: u32, or
+    // q as var quotient: u32.
     destructuring_field: ($) =>
       seq(
-        field('name', $.identifier),
-        optional(seq('as', field('binding', $.identifier))),
+        choice(
+          seq(optional(field('mutable', $.mutable)), field('name', $.identifier)),
+          seq(
+            field('name', $.identifier),
+            'as',
+            optional(field('mutable', $.mutable)),
+            field('binding', $.identifier),
+          ),
+        ),
         ':',
         field('type', choice($._type, $.discard)),
       ),
+
+    mutable: (_) => 'var',
 
     discard: (_) => '_',
 

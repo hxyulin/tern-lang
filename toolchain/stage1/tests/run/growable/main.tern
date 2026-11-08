@@ -86,8 +86,7 @@ fn pops(alloc: Allocator) -> ! OutOfMemory {
     }
     for {
         match pop(inout words) {
-            some(value: [..]u8) {
-                var word: [..]u8 = value
+            some(value as var word: [..]u8) {
                 let view: []u8 = word
                 io.print("word {view} ")
                 free(inout word)

@@ -847,7 +847,8 @@ impl<'a> Checker<'a> {
                     );
                     self.error(fx.file, fx.ast.ty(ty).span, message);
                 }
-                self.bind(fx, field.rename.unwrap_or(field.field), *field_ty, mutable);
+                let name = field.rename.unwrap_or(field.field);
+                self.bind(fx, name, *field_ty, mutable || field.mutable);
             }
         }
     }

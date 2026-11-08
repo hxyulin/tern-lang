@@ -35,8 +35,7 @@ type Command enum {
 
 fn run_file(path: []u8, command: Command) -> u8 {
     match read_all(heap.c_allocator, path) {
-        ok(value: [..]u8) {
-            var text: [..]u8 = value
+        ok(value as var text: [..]u8) {
             defer free(inout text)
             match run_text(path, text, command) {
                 ok(value as code: u8) {

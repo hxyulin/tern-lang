@@ -231,6 +231,8 @@ pub struct DestructField {
     pub field: Name,
     /// The name after `as`, if the binding differs from the field.
     pub rename: Option<Name>,
+    /// `var` before the bound name: the binding is mutable.
+    pub mutable: bool,
     /// `None` for `_`: the field is not bound.
     pub ty: Option<TypeId>,
 }

@@ -291,8 +291,14 @@ impl Printer<'_> {
         self.open("destructuring_pattern");
         for field in fields {
             self.open("destructuring_field");
+            if field.mutable && field.rename.is_none() {
+                self.leaf("mutable");
+            }
             self.ident();
             if field.rename.is_some() {
+                if field.mutable {
+                    self.leaf("mutable");
+                }
                 self.ident();
             }
             match field.ty {

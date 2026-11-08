@@ -47,6 +47,7 @@ fn more() {
     let e: u8 = (x 1)
     let f: u8 = T.(a: 1, b 2)
     let g: u8 = T.(a: 1 2)
+    let (var a as b: u8) = c
 }
 fn () {}
 fn paren {}

@@ -155,7 +155,13 @@ pub type Binding enum {
 
 // The rename is the name after `as`. The type is none for `_`, which
 // leaves the field unbound.
-pub type DestructField (pub field: Span, pub rename: ?Span, pub ty: ?TypeId)
+pub type DestructField (
+    pub field: Span,
+    pub rename: ?Span,
+    // `var` before the bound name: the binding is mutable.
+    pub mutable: bool,
+    pub ty: ?TypeId,
+)
 
 pub type Block (pub stmts: List, pub span: Span)
 

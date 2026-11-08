@@ -323,12 +323,19 @@ fn destructuring(pr: inout Printer, ast: syntax.Ast, list: syntax.List) -> ! Out
     for let i: u32 in syntax.items(ast.extra, list) {
         let f: syntax.DestructField = ast.destructs[usize.(i)]
         try open(inout pr, "destructuring_field")
-        try ident(inout pr)
         match f.rename {
             some(value: _) {
                 try ident(inout pr)
+                if f.mutable {
+                    try leaf(inout pr, "mutable")
+                }
+                try ident(inout pr)
             }
             none {
+                if f.mutable {
+                    try leaf(inout pr, "mutable")
+                }
+                try ident(inout pr)
             }
         }
         match f.ty {
