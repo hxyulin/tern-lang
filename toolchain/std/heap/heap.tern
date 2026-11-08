@@ -22,7 +22,7 @@ fn c_alloc(_: ?*u8, size: usize, align: usize) -> ?*u8 {
     return unsafe { libc.malloc(c.size_t.(size)) }
 }
 
-fn c_resize(_: ?*u8, p: *u8, old_size: usize, new_size: usize, align: usize) -> ?*u8 {
+fn c_resize(_: ?*u8, p: *u8, _: usize, new_size: usize, align: usize) -> ?*u8 {
     if align > max_align {
         return none
     }
@@ -31,7 +31,7 @@ fn c_resize(_: ?*u8, p: *u8, old_size: usize, new_size: usize, align: usize) -> 
     return unsafe { libc.realloc(some.(value: p), c.size_t.(new_size)) }
 }
 
-fn c_free(_: ?*u8, p: *u8, size: usize, align: usize) {
+fn c_free(_: ?*u8, p: *u8, _: usize, _: usize) {
     // SAFETY: as in c_resize.
     unsafe {
         libc.free(some.(value: p))

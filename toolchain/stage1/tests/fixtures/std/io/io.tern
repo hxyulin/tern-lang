@@ -1,2 +1,2 @@
-pub fn print(s: []u8) {
+pub fn print(_: []u8) {
 }

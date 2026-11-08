@@ -765,6 +765,39 @@ discards the value: `let _: u32 = f()`, or an unused parameter
 Ignoring any function result without `let _` is a compile error, as in
 Zig. Every dropped error is visible in review.
 
+### Names and scopes
+
+**Decided (2026-11-08).** A name is looked up in the enclosing locals,
+innermost first, then the package's top-level declarations, the file's
+imports, and the built-in names.
+
+- **No shadowing.** A local never reuses a name already in scope: an
+  outer local, a parameter, a top-level declaration, an import or a
+  built-in. A reader never has to work out which `x` a line means; `as`
+  covers the nested `match` case. A top-level declaration may reuse a
+  built-in name, as in Go, so `std.libc` can declare C's `free`.
+- **Unused names are errors**, as in Go: imports, locals, parameters and
+  payload bindings. `_` discards on purpose: `fn f(_: u8)`,
+  `err(error: _)`. Parameters are included because the user-chosen
+  discard already covers them, and a function that must match a function
+  type, such as an allocator's `free`, names unused ones `_`.
+- **A top-level name is declared once per package**, across all its
+  files, and may not also be an import name in any of them.
+
+**Decided (2026-11-08): the built-in names.** One fixed list, all
+predeclared, none keywords.
+
+| Kind | Names |
+| --- | --- |
+| Types | `i8` `i16` `i32` `i64` `isize` `u8` `u16` `u32` `u64` `usize` `f32` `f64` `bool` `Allocator` `Format` `PanicInfo` `OutOfMemory` |
+| Values | `true` `false` `none` `some` `ok` `err` |
+| Control | `panic` |
+| Growable arrays | `make` `push` `append` `free` `copy` |
+| Arrays | `fill` |
+| Pointers | `from_address` `from_pointer` `offset` `cast` `volatile_load` `volatile_store` |
+| Conversions | `truncate` `c_string` |
+| Arithmetic | `wrapping_add` `wrapping_sub` `wrapping_mul` `saturating_add` `saturating_sub` `saturating_mul` `unchecked_add` `unchecked_sub` `unchecked_mul` |
+
 ### Multiple return values
 
 **Decided.** Through named tuples. Large results are written directly into
@@ -814,6 +847,39 @@ the declaration.
 - Integer enums have their integer type's layout. Enums with payloads have
   an unspecified layout and cannot cross the C boundary.
 - `?*T` is a nullable C pointer.
+
+### A specified layout for every type
+
+**Leaning (2026-11-08).** The user asked for layouts specified the way
+C++'s standard types are, so a compiled library has an ABI and does not
+depend on the compiler that built it, unlike Rust. Every type gets a
+layout written down here, expressed as C:
+
+- `[]T`: `(ptr: *T, len: usize)`. An empty view's pointer is not null.
+- `[..]T`: `(ptr: ?*T, len: usize, cap: usize, alloc: Allocator)`.
+- An enum with payloads: a tag, then a C union of the payload records.
+  Variants are numbered from 0 in declaration order, and the tag is the
+  smallest of `u8`, `u16` and `u32` that holds them. This is Rust's
+  `#[repr(C, u8)]` and the tagged union a C programmer writes by hand.
+- `?T`: the enum `{ none, some(value: T) }`, so a `u8` tag, then `T`. The
+  exceptions are `?*T` and an optional function value, which are a
+  pointer that may be null.
+- `T ! E`: the enum `{ ok(value: T), err(error: E) }`.
+- `Format`, `PanicInfo` and `Allocator` are records, with C layout like
+  every record.
+
+Symbols: a function's symbol is its package path and name,
+`std.io.open`. Without overloading or generics, no mangling is needed.
+The root package's path is its directory's name.
+
+With this, std can ship as `libstd.a` or a shared library plus the export
+data that importers read, and any compiler that follows these rules can
+link against it. The cost is that a layout is fixed once chosen:
+optimizations such as packing an optional into a type's unused bit
+patterns, which Rust does, are not available except where listed.
+Open: whether `Allocator` should be two words, a context and a pointer
+to a table of its three functions, as Zig's is, to keep `[..]T` at five
+words instead of seven.
 
 ### `extern` functions
 

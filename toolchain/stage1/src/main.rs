@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use stage1::diagnostic::Diagnostic;
 use stage1::source::SourceFile;
 use stage1::token::TokenKind;
-use stage1::{lexer, package, parser, sexp};
+use stage1::{lexer, package, parser, resolve, sexp};
 
 const USAGE: &str = "usage: ternc lex FILE
        ternc parse FILE
@@ -84,11 +84,18 @@ fn report(file: &SourceFile, diagnostics: &[Diagnostic]) -> ExitCode {
 }
 
 /// Loads the root package and everything it imports, and reports errors.
-/// For now that means parse errors and import errors.
+/// So far that means parse, import and name errors.
 fn check(root: &Path, std_dir: &Path) -> ExitCode {
     let program = package::load(root, std_dir);
     if program.has_errors() {
         eprint!("{}", program.render_errors());
+        return ExitCode::FAILURE;
+    }
+    let names = resolve::resolve(&program);
+    if !names.diagnostics.is_empty() {
+        for (file, d) in &names.diagnostics {
+            eprint!("{}", d.render(&program.file(*file).source));
+        }
         return ExitCode::FAILURE;
     }
     println!(

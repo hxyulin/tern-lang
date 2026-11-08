@@ -71,7 +71,7 @@ pub fn read_to_end(alloc: Allocator, f: inout File) -> [..]u8 ! Error {
         match append(inout out, buf[..usize.(count)]) {
             ok {
             }
-            err(error: OutOfMemory) {
+            err(error: _) {
                 free(sink out)
                 return err.(error: Error.out_of_memory)
             }

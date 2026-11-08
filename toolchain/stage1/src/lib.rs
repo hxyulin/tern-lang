@@ -5,6 +5,7 @@ pub mod diagnostic;
 pub mod lexer;
 pub mod package;
 pub mod parser;
+pub mod resolve;
 pub mod sexp;
 pub mod source;
 pub mod token;

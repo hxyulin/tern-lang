@@ -24,7 +24,7 @@ fn c_main(argc: c.int, argv: **u8) -> c.int {
         match push(inout all, arg) {
             ok {
             }
-            err(error: OutOfMemory) {
+            err(error: _) {
                 panic("out of memory reading the program's arguments")
             }
         }
