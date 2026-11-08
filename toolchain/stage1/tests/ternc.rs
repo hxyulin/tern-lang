@@ -7,9 +7,10 @@
 //! Among the tern files, `tests/lex/malformed.tern` and
 //! `tests/parse/malformed.tern` trigger every lexer and parser error.
 //!
-//! `check` runs on every package directory here and on the loader's
-//! fixtures. The resolver's and checker's tests compare it on each
-//! program they write.
+//! `check` runs on every package directory in `examples`, ternc, std and
+//! the run tests, on `tests/check/malformed`, which triggers every checker
+//! error the checker's tests do not, and on the loader's fixtures. The
+//! resolver's and checker's tests compare it on each program they write.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -124,7 +125,13 @@ fn package_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn checker_matches_stage1() {
     let std_dir = repo().join("toolchain/std");
     let mut failures = Vec::new();
-    for dir in ["examples", "toolchain/ternc"] {
+    for dir in [
+        "examples",
+        "toolchain/ternc",
+        "toolchain/std",
+        "toolchain/stage1/tests/run",
+        "toolchain/stage1/tests/check",
+    ] {
         let mut dirs = Vec::new();
         package_dirs(&repo().join(dir), &mut dirs);
         dirs.sort();

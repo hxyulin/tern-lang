@@ -1,0 +1,402 @@
+// Signed 128-bit integers, for constant expressions and literal values.
+// Stage 1 computes them in Rust's i128, and the messages print them, so
+// the checker needs the same range and the same overflow rules.
+//
+// A Wide is two's complement in two halves.
+
+pub type Wide (hi: u64, lo: u64)
+
+pub fn wide(v: u64) -> Wide {
+    return Wide.(hi: 0, lo: v)
+}
+
+pub fn wide_negative(a: Wide) -> bool {
+    return a.hi >> 63 == 1
+}
+
+fn wide_add_wrapping(a: Wide, b: Wide) -> Wide {
+    let lo: u64 = wrapping_add(a.lo, b.lo)
+    var hi: u64 = wrapping_add(a.hi, b.hi)
+    if lo < a.lo {
+        hi = wrapping_add(hi, 1)
+    }
+    return Wide.(hi: hi, lo: lo)
+}
+
+fn wide_not(a: Wide) -> Wide {
+    return Wide.(hi: ~a.hi, lo: ~a.lo)
+}
+
+// -a, wrapping at the minimum as Rust's release build does.
+pub fn wide_neg(a: Wide) -> Wide {
+    return wide_add_wrapping(wide_not(a), wide(1))
+}
+
+pub fn wide_equal(a: Wide, b: Wide) -> bool {
+    return a.hi == b.hi && a.lo == b.lo
+}
+
+pub fn wide_less(a: Wide, b: Wide) -> bool {
+    let an: bool = wide_negative(a)
+    let bn: bool = wide_negative(b)
+    if an != bn {
+        return an
+    }
+    if a.hi != b.hi {
+        return a.hi < b.hi
+    }
+    return a.lo < b.lo
+}
+
+pub fn wide_add(a: Wide, b: Wide) -> ?Wide {
+    let r: Wide = wide_add_wrapping(a, b)
+    if wide_negative(a) == wide_negative(b) && wide_negative(r) != wide_negative(a) {
+        return none
+    }
+    return some.(value: r)
+}
+
+pub fn wide_sub(a: Wide, b: Wide) -> ?Wide {
+    let r: Wide = wide_add_wrapping(a, wide_neg(b))
+    if wide_negative(a) != wide_negative(b) && wide_negative(r) != wide_negative(a) {
+        return none
+    }
+    return some.(value: r)
+}
+
+fn magnitude(a: Wide) -> Wide {
+    if wide_negative(a) {
+        return wide_neg(a)
+    }
+    return a
+}
+
+// x * y as two halves.
+fn mul64(x: u64, y: u64) -> Wide {
+    let mask: u64 = 0xffff_ffff
+    let x0: u64 = x & mask
+    let x1: u64 = x >> 32
+    let y0: u64 = y & mask
+    let y1: u64 = y >> 32
+    let p00: u64 = x0 * y0
+    let p01: u64 = x0 * y1
+    let p10: u64 = x1 * y0
+    let p11: u64 = x1 * y1
+    let middle: u64 = (p00 >> 32) + (p01 & mask) + (p10 & mask)
+    let lo: u64 = (p00 & mask) | (middle << 32)
+    let hi: u64 = p11 + (p01 >> 32) + (p10 >> 32) + (middle >> 32)
+    return Wide.(hi: hi, lo: lo)
+}
+
+// The unsigned product of two magnitudes, or none past 128 bits.
+fn umul(a: Wide, b: Wide) -> ?Wide {
+    if a.hi != 0 && b.hi != 0 {
+        return none
+    }
+    let low: Wide = mul64(a.lo, b.lo)
+    let cross: Wide = mul64(a.hi | b.hi, if a.hi != 0 { b.lo } else { a.lo })
+    if cross.hi != 0 {
+        return none
+    }
+    let hi: u64 = wrapping_add(low.hi, cross.lo)
+    if hi < low.hi {
+        return none
+    }
+    return some.(value: Wide.(hi: hi, lo: low.lo))
+}
+
+// The largest magnitude a result of this sign can have.
+fn fits_signed(m: Wide, negative: bool) -> bool {
+    if m.hi >> 63 == 0 {
+        return true
+    }
+    // Only -2^127 has the top bit set.
+    return negative && m.hi == 1 << 63 && m.lo == 0
+}
+
+pub fn wide_mul(a: Wide, b: Wide) -> ?Wide {
+    let negative: bool = wide_negative(a) != wide_negative(b)
+    match umul(magnitude(a), magnitude(b)) {
+        none {
+            return none
+        }
+        some(value as m: Wide) {
+            if !fits_signed(m, negative) {
+                return none
+            }
+            if negative {
+                return some.(value: wide_neg(m))
+            }
+            return some.(value: m)
+        }
+    }
+}
+
+fn shl1(a: Wide) -> Wide {
+    return Wide.(hi: (a.hi << 1) | (a.lo >> 63), lo: a.lo << 1)
+}
+
+fn uless(a: Wide, b: Wide) -> bool {
+    if a.hi != b.hi {
+        return a.hi < b.hi
+    }
+    return a.lo < b.lo
+}
+
+// Unsigned division by shifting and subtracting: the quotient and the
+// remainder. d is not zero.
+type DivMod (quotient: Wide, remainder: Wide)
+
+fn udivmod(n: Wide, d: Wide) -> DivMod {
+    var q: Wide = wide(0)
+    var r: Wide = wide(0)
+    var i: u32 = 128
+    for i > 0 {
+        i -= 1
+        r = shl1(r)
+        let bit: u64 = if i >= 64 { (n.hi >> u64.(i - 64)) & 1 } else { (n.lo >> u64.(i)) & 1 }
+        r.lo = r.lo | bit
+        q = shl1(q)
+        if !uless(r, d) {
+            r = wide_add_wrapping(r, wide_neg(d))
+            q.lo = q.lo | 1
+        }
+    }
+    return DivMod.(quotient: q, remainder: r)
+}
+
+fn wide_min() -> Wide {
+    return Wide.(hi: 1 << 63, lo: 0)
+}
+
+fn wide_zero(a: Wide) -> bool {
+    return a.hi == 0 && a.lo == 0
+}
+
+// Rust's checked_div: none for a zero divisor and for MIN / -1. The
+// quotient rounds toward zero.
+pub fn wide_div(a: Wide, b: Wide) -> ?Wide {
+    if wide_zero(b) || (wide_equal(a, wide_min()) && wide_equal(b, wide_neg(wide(1)))) {
+        return none
+    }
+    let q: Wide = udivmod(magnitude(a), magnitude(b)).quotient
+    if wide_negative(a) != wide_negative(b) {
+        return some.(value: wide_neg(q))
+    }
+    return some.(value: q)
+}
+
+// Rust's checked_rem: the remainder takes the sign of a.
+pub fn wide_rem(a: Wide, b: Wide) -> ?Wide {
+    if wide_zero(b) || (wide_equal(a, wide_min()) && wide_equal(b, wide_neg(wide(1)))) {
+        return none
+    }
+    let r: Wide = udivmod(magnitude(a), magnitude(b)).remainder
+    if wide_negative(a) {
+        return some.(value: wide_neg(r))
+    }
+    return some.(value: r)
+}
+
+// The shift amount as Rust's u32::try_from then checked_shl takes it:
+// none unless 0 <= b < 128.
+fn wide_shift_amount(b: Wide) -> ?u32 {
+    if b.hi != 0 || b.lo >= 128 {
+        return none
+    }
+    return some.(value: u32.(b.lo))
+}
+
+pub fn wide_shl(a: Wide, b: Wide) -> ?Wide {
+    match wide_shift_amount(b) {
+        none {
+            return none
+        }
+        some(value as n: u32) {
+            if n == 0 {
+                return some.(value: a)
+            }
+            if n >= 64 {
+                return some.(value: Wide.(hi: a.lo << u64.(n - 64), lo: 0))
+            }
+            let s: u64 = u64.(n)
+            return some.(value: Wide.(hi: (a.hi << s) | (a.lo >> (64 - s)), lo: a.lo << s))
+        }
+    }
+}
+
+// An arithmetic shift, as i128's checked_shr.
+pub fn wide_shr(a: Wide, b: Wide) -> ?Wide {
+    match wide_shift_amount(b) {
+        none {
+            return none
+        }
+        some(value as n: u32) {
+            if n == 0 {
+                return some.(value: a)
+            }
+            let fill: u64 = if wide_negative(a) { ~u64.(0) } else { 0 }
+            if n >= 64 {
+                let s: u64 = u64.(n - 64)
+                var lo: u64 = a.hi >> s
+                if s > 0 {
+                    lo = lo | (fill << (64 - s))
+                }
+                return some.(value: Wide.(hi: fill, lo: lo))
+            }
+            let s: u64 = u64.(n)
+            let hi: u64 = (a.hi >> s) | (fill << (64 - s))
+            let lo: u64 = (a.lo >> s) | (a.hi << (64 - s))
+            return some.(value: Wide.(hi: hi, lo: lo))
+        }
+    }
+}
+
+pub fn wide_and(a: Wide, b: Wide) -> Wide {
+    return Wide.(hi: a.hi & b.hi, lo: a.lo & b.lo)
+}
+
+pub fn wide_or(a: Wide, b: Wide) -> Wide {
+    return Wide.(hi: a.hi | b.hi, lo: a.lo | b.lo)
+}
+
+pub fn wide_xor(a: Wide, b: Wide) -> Wide {
+    return Wide.(hi: a.hi ^ b.hi, lo: a.lo ^ b.lo)
+}
+
+// The value as u64, if it is one.
+pub fn wide_u64(a: Wide) -> ?u64 {
+    if a.hi != 0 {
+        return none
+    }
+    return some.(value: a.lo)
+}
+
+// The decimal digits of a, with a sign, written into buf from the end.
+pub fn wide_text(buf: inout [48]u8, a: Wide) -> []u8 {
+    var i: usize = buf.len
+    var m: Wide = magnitude(a)
+    let ten: Wide = wide(10)
+    for {
+        let dm: DivMod = udivmod(m, ten)
+        i -= 1
+        buf[i] = '0' + u8.(dm.remainder.lo)
+        m = dm.quotient
+        if wide_zero(m) {
+            break
+        }
+    }
+    if wide_negative(a) {
+        i -= 1
+        buf[i] = '-'
+    }
+    return buf[i..]
+}
+
+// The value of a digit in base 2 to 16, or none.
+fn digit_value(c: u8, base: u64) -> ?u64 {
+    var v: u64 = 99
+    if c >= '0' && c <= '9' {
+        v = u64.(c - '0')
+    } else if c >= 'a' && c <= 'f' {
+        v = u64.(c - 'a') + 10
+    } else if c >= 'A' && c <= 'F' {
+        v = u64.(c - 'A') + 10
+    }
+    if v >= base {
+        return none
+    }
+    return some.(value: v)
+}
+
+// The value of an integer literal, or none if it does not fit in 128
+// bits. As Rust's i128::from_str_radix after removing `_`.
+pub fn parse_int(text: []u8) -> ?Wide {
+    var base: u64 = 10
+    var at: usize = 0
+    if text.len >= 2 && text[0] == '0' {
+        match text[1] {
+            'x' {
+                base = 16
+                at = 2
+            }
+            'b' {
+                base = 2
+                at = 2
+            }
+            'o' {
+                base = 8
+                at = 2
+            }
+            _ {
+            }
+        }
+    }
+    let w: Wide = wide(base)
+    var n: Wide = wide(0)
+    var digits: usize = 0
+    for let i: usize in at..text.len {
+        let c: u8 = text[i]
+        if c == '_' {
+            continue
+        }
+        // A sign is allowed first, as from_str_radix allows.
+        if digits == 0 && c == '+' && i == at {
+            continue
+        }
+        match digit_value(c, base) {
+            none {
+                return none
+            }
+            some(value as d: u64) {
+                n = try wide_mul(n, w)
+                n = try wide_add(n, wide(d))
+                digits += 1
+            }
+        }
+    }
+    if digits == 0 {
+        return none
+    }
+    return some.(value: n)
+}
+
+// The code of a character literal such as 'a' or '\n'.
+pub fn char_value(text: []u8) -> ?Wide {
+    if text.len < 3 || text[0] != '\'' || text[text.len - 1] != '\'' {
+        return none
+    }
+    let inner: []u8 = text[1..text.len - 1]
+    if inner.len == 1 {
+        return some.(value: wide(u64.(inner[0])))
+    }
+    if inner.len == 2 && inner[0] == '\\' {
+        return match inner[1] {
+            'n' { some.(value: wide(10)) }
+            't' { some.(value: wide(9)) }
+            'r' { some.(value: wide(13)) }
+            '0' { some.(value: wide(0)) }
+            _ { some.(value: wide(u64.(inner[1]))) }
+        }
+    }
+    if inner.len > 2 && inner[0] == '\\' && inner[1] == 'x' {
+        // u8::from_str_radix: one or two hex digits, at most 255.
+        let hex: []u8 = inner[2..]
+        var v: u64 = 0
+        for let c: u8 in hex {
+            match digit_value(c, 16) {
+                none {
+                    return none
+                }
+                some(value as d: u64) {
+                    v = v * 16 + d
+                    if v > 255 {
+                        return none
+                    }
+                }
+            }
+        }
+        return some.(value: wide(v))
+    }
+    return none
+}

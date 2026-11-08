@@ -8,6 +8,7 @@
 import std.heap
 import std.io
 import std.os
+import check
 import program
 import resolve
 import sexp
@@ -21,7 +22,7 @@ fn main() -> u8 {
             "check" {
                 match args[3] {
                     "--std" {
-                        return check(args[2], args[4])
+                        return check_command(args[2], args[4])
                     }
                     _ {
                     }
@@ -48,8 +49,8 @@ fn main() -> u8 {
 }
 
 // Loads the package in root and everything it imports, and reports
-// errors. So far that means parse, import and name errors.
-fn check(root: []u8, std_dir: []u8) -> u8 {
+// errors: parse, import, name and type errors.
+fn check_command(root: []u8, std_dir: []u8) -> u8 {
     var arena: heap.Arena = heap.new_arena(heap.c_allocator)
     defer heap.free_arena(inout arena)
     match check_program(heap.arena_allocator(&arena), root, std_dir) {
@@ -72,6 +73,11 @@ fn check_program(alloc: Allocator, root: []u8, std_dir: []u8) -> u8 ! OutOfMemor
     let names: resolve.Resolution = try resolve.resolve(alloc, p)
     if names.diagnostics.len > 0 {
         render_diagnostics(p, names.diagnostics)
+        return ok.(value: 1)
+    }
+    let checked: check.Checked = try check.check(alloc, p, names)
+    if checked.diagnostics.len > 0 {
+        render_diagnostics(p, checked.diagnostics)
         return ok.(value: 1)
     }
     io.print("{p.packages.len} packages, {p.files.len} files\n")

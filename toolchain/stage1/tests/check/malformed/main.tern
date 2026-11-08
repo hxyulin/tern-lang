@@ -1,0 +1,338 @@
+// Triggers every checker error the checker tests do not, so ternc's port
+// of each one is compared with stage 1's. Each function or declaration
+// holds one or two mistakes.
+
+type Point (x: i32, y: i32)
+
+type Shape enum {
+    circle(r: u32)
+    square
+}
+
+type Byte u8
+
+type Celsius f32
+
+type Bits union (word: u32, low: u8)
+
+type Code enum u8 {
+    a = 1
+}
+
+var counter: u8 = 0
+
+type NotInt enum Byte {
+    a
+}
+
+type NoValues enum {
+    a = 1
+}
+
+type NotConst enum u8 {
+    a = counter
+}
+
+fn bad_length(_: [-1]u8) {
+}
+
+fn destructure_scalar(n: u32) {
+    let (x: _) = n
+}
+
+fn missing_field(p: Point) {
+    let (z: _) = p
+}
+
+fn outside_loop() {
+    continue
+}
+
+fn returns_nothing() {
+    return 1
+}
+
+fn needs_ok() -> ! Byte {
+    return
+}
+
+fn needs_value() -> u32 {
+    return
+}
+
+fn bad_operator(p: Point) {
+    var q: Point = p
+    q += 1
+}
+
+fn destructure_range() {
+    for let (a: _) in 0..3 {
+    }
+}
+
+fn range_of_points() {
+    for let _: Point in 0..3 {
+    }
+}
+
+fn scalar_match(n: u32) {
+    match n {
+        circle {
+        }
+        _ {
+        }
+    }
+}
+
+fn no_payload(s: Shape) {
+    match s {
+        square(r: _) {
+        }
+        _ {
+        }
+    }
+}
+
+fn literal_on_enum(s: Shape) {
+    match s {
+        1 {
+        }
+        _ {
+        }
+    }
+}
+
+fn assign_to_call() {
+    returns_nothing() = 1
+}
+
+fn nothing_value() {
+    let _: u32 = destructure_range()
+}
+
+fn type_value() {
+    let _: u32 = Point
+}
+
+fn builtin_values() {
+    let _: ?u32 = some
+    let _: u32 ! Byte = err
+    let _: u32 = make
+}
+
+fn payload_value() {
+    let _: Shape = Shape.circle
+}
+
+fn char_into_point() {
+    let _: Point = 'a'
+}
+
+fn float_into_int() {
+    let _: u32 = 1.5
+}
+
+fn deref_int(n: u32) {
+    let _: u32 = unsafe { n.* }
+}
+
+fn none_without_optional() {
+    let _: u32 = none
+}
+
+fn ok_with_value() -> u32 ! Byte {
+    return ok
+}
+
+fn ok_without_result() {
+    let _: u32 = ok
+}
+
+fn negative_pattern(s: Point) {
+    match s {
+        -1 {
+        }
+        _ {
+        }
+    }
+}
+
+fn huge_literal() {
+    let _: u64 = 1_000_000_000_000_000_000_000_000_000_000_000_000_000
+}
+
+fn wrong_fields() {
+    let _: (x: i32, y: i32) = (x: 1, z: 2)
+}
+
+fn unknown_array() {
+    let _: bool = ([1, 2]) == ([1, 2])
+}
+
+fn len_of(xs: [2]u32) -> u32 {
+    return xs[0]
+}
+
+fn array_into_int() {
+    let _: u32 = [1, 2]
+}
+
+fn field_through_pointer(p: *Point) {
+    let _: i32 = p.x
+}
+
+fn no_variant() {
+    let _: Shape = Shape.triangle
+}
+
+fn not_an_enum() {
+    let _: Point = Point.origin
+}
+
+fn build_from_value(n: u32) {
+    let _: u32 = n.(1)
+}
+
+fn code_from_point(p: Point) {
+    let _: Code = Code.(p)
+}
+
+fn build_shape() {
+    let _: Shape = Shape.(1)
+}
+
+fn build_bool() {
+    let _: bool = bool.(1)
+}
+
+fn some_for_int() {
+    let _: u32 = some.(value: 1)
+}
+
+fn ok_without_place() {
+    let _: u32 = len_of(ok.(value: 1))
+}
+
+fn convert_point(p: Point) {
+    let _: u32 = u32.(p)
+}
+
+fn index_int(n: u32) {
+    let _: u32 = n[0]
+}
+
+fn type_index(xs: [2]u32) {
+    let _: u32 = xs[*u32]
+}
+
+fn negate_unsigned(n: u32) {
+    let _: u32 = -n
+}
+
+fn not_point(p: Point) {
+    let _: Point = ~p
+}
+
+fn address_of_call() {
+    let _: *u32 = &len_of(fill[2](0))
+}
+
+fn try_optional(x: ?u32) -> u32 {
+    return try x
+}
+
+fn try_int(n: u32) -> u32 {
+    return try n
+}
+
+fn shift_by_bool(n: u32, b: bool) {
+    let _: u32 = n << b
+}
+
+fn shift_float(f: f32) {
+    let _: f32 = f << 1
+}
+
+fn call_int(n: u32) {
+    let _: u32 = n(1)
+}
+
+fn call_type() {
+    let _: Point = Point(1)
+}
+
+fn takes_value(n: u32) -> u32 {
+    return n
+}
+
+fn extra_inout(n: u32) {
+    var m: u32 = n
+    let _: u32 = takes_value(inout m)
+}
+
+fn bad_type_arg(n: u32) {
+    let _: u8 = truncate[n](n)
+}
+
+fn fill_without_length() {
+    let _: [2]u8 = fill(0)
+}
+
+fn push_with_type_arg(alloc: Allocator) -> ! OutOfMemory {
+    var v: [..]u8 = make(alloc)
+    try push[u8](inout v, 1)
+    free(inout v)
+    return ok
+}
+
+fn push_without_inout(alloc: Allocator) -> ! OutOfMemory {
+    var v: [..]u8 = make(alloc)
+    try push(v, 1)
+    free(inout v)
+    return ok
+}
+
+fn make_without_place(alloc: Allocator) {
+    free(inout make(alloc))
+}
+
+fn free_int(n: u32) {
+    var m: u32 = n
+    free(inout m)
+}
+
+fn copy_int(alloc: Allocator, n: u32) {
+    let _: [..]u32 ! OutOfMemory = copy(alloc, n)
+}
+
+fn fill_variable(n: usize) {
+    let _: [2]u8 = fill[n](0)
+}
+
+fn address_of_int() {
+    let _: u32 = from_address[u32](0)
+}
+
+fn truncate_point(p: Point) {
+    let _: u8 = truncate[u8](p)
+}
+
+fn offset_int(n: u32) {
+    let _: u32 = offset(n, 1)
+}
+
+fn c_string_interpolated(n: u32) {
+    let _: *u8 = c_string("{n}")
+}
+
+fn wrapping_floats(a: f32, b: f32) {
+    let _: f32 = wrapping_add(a, b)
+}
+
+fn union_read(b: Bits) {
+    let _: u32 = b.word
+}
+
+fn celsius(t: Celsius) {
+    let _: Celsius = t
+}

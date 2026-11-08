@@ -1,10 +1,13 @@
 //! Type checking: each test writes a small program and checks the exact
-//! messages, after name resolution has passed.
+//! messages, after name resolution has passed. ternc's `check` must print
+//! what stage 1's prints for the same program.
 
 use std::fs;
 use std::path::Path;
 
 use stage1::{check, package, resolve};
+
+mod common;
 
 fn messages(test: &str, files: &[(&str, &str)]) -> Vec<String> {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -19,6 +22,8 @@ fn messages(test: &str, files: &[(&str, &str)]) -> Vec<String> {
     let std_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../std");
     let program = package::load(&root, &std_dir);
     assert!(!program.has_errors(), "{}", program.render_errors());
+    let failures = common::check_differences(&root, &std_dir);
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     let names = resolve::resolve(&program);
     let unresolved: Vec<String> = names
         .diagnostics

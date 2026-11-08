@@ -1,0 +1,756 @@
+// The local rules that need no flow: `unsafe`, `shared` globals,
+// exclusivity of `inout` arguments, the `Format` rule and constant global
+// initializers.
+
+import maps
+import program
+import resolve
+import syntax
+
+// The place expressions e is built from: e, then its base, through fields,
+// indexing and parentheses. Assigning to e or taking its address does not
+// read any of them.
+fn spine(alloc: Allocator, fx: Fx, e: syntax.ExprId) -> []syntax.ExprId ! OutOfMemory {
+    var out: [..]syntax.ExprId = make(alloc)
+    var current: syntax.ExprId = e
+    for {
+        try push(inout out, current)
+        match fx.ast.exprs[usize.(current)].kind {
+            paren(inner: syntax.ExprId) {
+                current = inner
+            }
+            field(value: syntax.ExprId, name: _) {
+                current = value
+            }
+            index(value: syntax.ExprId, index: _) {
+                current = value
+            }
+            _ {
+                return ok.(value: out)
+            }
+        }
+    }
+}
+
+fn require_unsafe(c: inout Checker, fx: Fx, start: u32, what: []u8) -> ! OutOfMemory {
+    if !fx.in_unsafe {
+        try report(inout c, fx.file, start, try program.format_text(c.alloc, "{what} needs `unsafe`"))
+    }
+    return ok
+}
+
+// A call to a C function or an `unsafe fn` needs `unsafe`.
+fn unsafe_callee(c: inout Checker, fx: Fx, callee: syntax.ExprId) -> ! OutOfMemory {
+    match expr_res(c, fx.file, callee) {
+        some(value as res: resolve.Res) {
+            match res {
+                decl(decl as d: maps.DeclRef) {
+                    var what: []u8 = ""
+                    match decl_of(c, d).kind {
+                        function(is_unsafe: bool, name: _, params: _, result: _, body: _) {
+                            if is_unsafe {
+                                what = "the unsafe function"
+                            }
+                        }
+                        extern_fn(name: _, params: _, variadic: _, result: _) {
+                            what = "the C function"
+                        }
+                        _ {
+                        }
+                    }
+                    if what.len > 0 {
+                        let span: syntax.Span = expr_span(fx, callee)
+                        let text: []u8 = file_text(c, fx.file, span)
+                        try require_unsafe(inout c, fx, span.start, try program.format_text(c.alloc, "calling {what} `{text}`"))
+                    }
+                }
+                _ {
+                }
+            }
+        }
+        none {
+        }
+    }
+    return ok
+}
+
+// A use of a top-level name: a `shared` global needs its `lock`, and a C
+// global needs `unsafe` unless `&` takes its address. span is the name, or
+// the whole `pkg.name`.
+fn use_decl(c: inout Checker, fx: Fx, e: syntax.ExprId, decl: maps.DeclRef, span: syntax.Span) -> ! OutOfMemory {
+    let shown: []u8 = file_text(c, fx.file, span)
+    match decl_of(c, decl).kind {
+        global(is_shared: bool, local: _) {
+            if is_shared && !is_locked(fx, decl) {
+                try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "`{shown}` is `shared`: use it inside `lock {shown} \{ ... }`"))
+            }
+        }
+        extern_var(mutable: _, name: _, ty: _) {
+            if !marked(fx.addressed, u32.(e)) {
+                try require_unsafe(inout c, fx, span.start, try program.format_text(c.alloc, "using the C global `{shown}`"))
+            }
+        }
+        _ {
+        }
+    }
+    return ok
+}
+
+fn is_locked(fx: Fx, decl: maps.DeclRef) -> bool {
+    for let d: maps.DeclRef in fx.locked {
+        if d.file == decl.file && d.index == decl.index {
+            return true
+        }
+    }
+    return false
+}
+
+// Exclusivity.
+
+// An argument and how it is passed.
+type ArgMode (e: syntax.ExprId, mode: syntax.Mode)
+
+// Where an argument's storage starts.
+type Root enum {
+    local(id: u32)
+    global(decl: maps.DeclRef)
+}
+
+// One step from a root to an argument's storage.
+type Step enum {
+    field(name: []u8)
+    // An index, when it is a constant.
+    index(at: ?Wide)
+    deref
+}
+
+type AccessPath (root: Root, steps: [..]Step)
+
+// Checks that no `inout` argument overlaps another argument.
+fn exclusive(c: inout Checker, fx: Fx, args: []ArgMode) -> ! OutOfMemory {
+    var paths: [..]?AccessPath = make(c.alloc)
+    for let a: ArgMode in args {
+        try push(inout paths, try access_path(c, fx, a.e))
+    }
+    for let i: usize in 0..args.len {
+        if args[i].mode != syntax.Mode.inout_mode {
+            continue
+        }
+        match paths[i] {
+            none {
+            }
+            some(value as path_a: AccessPath) {
+                for let j: usize in 0..args.len {
+                    // A pair of `inout` arguments is reported once.
+                    if j == i || (args[j].mode == syntax.Mode.inout_mode && j < i) {
+                        continue
+                    }
+                    match paths[j] {
+                        none {
+                        }
+                        some(value as path_b: AccessPath) {
+                            if overlaps(path_a, path_b) {
+                                let span: syntax.Span = expr_span(fx, args[j].e)
+                                let b_text: []u8 = file_text(c, fx.file, span)
+                                let a_text: []u8 = file_text(c, fx.file, expr_span(fx, args[i].e))
+                                try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "`{b_text}` overlaps `{a_text}`, which is passed `inout`; an `inout` argument must not overlap another argument"))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return ok
+}
+
+// The storage a place expression names, as a root and steps.
+fn access_path(c: Checker, fx: Fx, e: syntax.ExprId) -> ?AccessPath ! OutOfMemory {
+    let res: ?resolve.Res = expr_res(c, fx.file, e)
+    var global: ?maps.DeclRef = none
+    match res {
+        some(value as r: resolve.Res) {
+            match r {
+                decl(decl as d: maps.DeclRef) {
+                    global = some.(value: d)
+                }
+                _ {
+                }
+            }
+        }
+        none {
+        }
+    }
+    match fx.ast.exprs[usize.(e)].kind {
+        paren(inner: syntax.ExprId) {
+            return access_path(c, fx, inner)
+        }
+        name(name: _) {
+            match global {
+                some(value as d: maps.DeclRef) {
+                    return ok.(value: global_root(c, d))
+                }
+                none {
+                }
+            }
+            match res {
+                some(value as r: resolve.Res) {
+                    match r {
+                        local(id: u32) {
+                            return ok.(value: some.(value: AccessPath.(root: Root.local.(id: id), steps: make(c.alloc))))
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            return ok.(value: none)
+        }
+        field(value: syntax.ExprId, name: syntax.Span) {
+            match global {
+                some(value as d: maps.DeclRef) {
+                    return ok.(value: global_root(c, d))
+                }
+                none {
+                }
+            }
+            match try access_path(c, fx, value) {
+                some(value as p: AccessPath) {
+                    var path: AccessPath = p
+                    try push(inout path.steps, Step.field.(name: file_text(c, fx.file, name)))
+                    return ok.(value: some.(value: path))
+                }
+                none {
+                    return ok.(value: none)
+                }
+            }
+        }
+        index(value: syntax.ExprId, index as i: syntax.Index) {
+            match try access_path(c, fx, value) {
+                some(value as p: AccessPath) {
+                    var at: ?Wide = none
+                    match i {
+                        value(value as ie: syntax.ExprId) {
+                            at = const_int(c, fx.file, ie, 0)
+                        }
+                        _ {
+                        }
+                    }
+                    var path: AccessPath = p
+                    try push(inout path.steps, Step.index.(at: at))
+                    return ok.(value: some.(value: path))
+                }
+                none {
+                    return ok.(value: none)
+                }
+            }
+        }
+        deref(inner: syntax.ExprId) {
+            match try access_path(c, fx, inner) {
+                some(value as p: AccessPath) {
+                    var path: AccessPath = p
+                    try push(inout path.steps, Step.deref)
+                    return ok.(value: some.(value: path))
+                }
+                none {
+                    return ok.(value: none)
+                }
+            }
+        }
+        _ {
+            return ok.(value: none)
+        }
+    }
+}
+
+fn global_root(c: Checker, d: maps.DeclRef) -> ?AccessPath {
+    match decl_of(c, d).kind {
+        global(is_shared: _, local: _), extern_var(mutable: _, name: _, ty: _) {
+            return some.(value: AccessPath.(root: Root.global.(decl: d), steps: make(c.alloc)))
+        }
+        _ {
+            return none
+        }
+    }
+}
+
+fn same_root(a: Root, b: Root) -> bool {
+    match a {
+        local(id as x: u32) {
+            return match b {
+                local(id as y: u32) { x == y }
+                global(decl: _) { false }
+            }
+        }
+        global(decl as x: maps.DeclRef) {
+            return match b {
+                global(decl as y: maps.DeclRef) { x.file == y.file && x.index == y.index }
+                local(id: _) { false }
+            }
+        }
+    }
+}
+
+// Whether two access paths can name the same storage: the same root, and
+// no step where they go to different fields or different constant
+// indexes.
+fn overlaps(a: AccessPath, b: AccessPath) -> bool {
+    if !same_root(a.root, b.root) {
+        return false
+    }
+    var n: usize = a.steps.len
+    if b.steps.len < n {
+        n = b.steps.len
+    }
+    for let i: usize in 0..n {
+        match a.steps[i] {
+            field(name as m: []u8) {
+                match b.steps[i] {
+                    field(name as k: []u8) {
+                        if !program.bytes_equal(m, k) {
+                            return false
+                        }
+                    }
+                    _ {
+                    }
+                }
+            }
+            index(at as m: ?Wide) {
+                match b.steps[i] {
+                    index(at as k: ?Wide) {
+                        match m {
+                            some(value as x: Wide) {
+                                match k {
+                                    some(value as y: Wide) {
+                                        if !wide_equal(x, y) {
+                                            return false
+                                        }
+                                    }
+                                    none {
+                                    }
+                                }
+                            }
+                            none {
+                            }
+                        }
+                    }
+                    _ {
+                    }
+                }
+            }
+            deref {
+            }
+        }
+    }
+    return true
+}
+
+// The `Format` rule.
+
+// Whether a value of ty holds a `Format`, which points into the frame that
+// made it. A declared type is checked where it is declared, so it never
+// holds one.
+fn holds_format(c: Checker, ty: TyId) -> bool {
+    match get(c.types, ty) {
+        named(id: NamedId) {
+            return match id {
+                builtin(which: BuiltinNamed) { which == BuiltinNamed.format || which == BuiltinNamed.panic_info }
+                decl(decl: _) { false }
+            }
+        }
+        tuple(fields: Range) {
+            for let f: TupleField in tuple_fields(c.types, fields) {
+                if holds_format(c, f.ty) {
+                    return true
+                }
+            }
+            return false
+        }
+        view(elem: TyId) {
+            return holds_format(c, elem)
+        }
+        array(len: _, elem: TyId) {
+            return holds_format(c, elem)
+        }
+        growable(elem: TyId) {
+            return holds_format(c, elem)
+        }
+        pointer(elem: TyId) {
+            return holds_format(c, elem)
+        }
+        optional(elem: TyId) {
+            return holds_format(c, elem)
+        }
+        result(value: ?TyId, error: TyId) {
+            match value {
+                some(value as v: TyId) {
+                    if holds_format(c, v) {
+                        return true
+                    }
+                }
+                none {
+                }
+            }
+            return holds_format(c, error)
+        }
+        function(params: Range, result: ?TyId) {
+            match result {
+                some(value as r: TyId) {
+                    if holds_format(c, r) {
+                        return true
+                    }
+                }
+                none {
+                }
+            }
+            for let p: FnParam in fn_params(c.types, params) {
+                if !is_format_param(c, p.ty) && holds_format(c, p.ty) {
+                    return true
+                }
+            }
+            return false
+        }
+        _ {
+            return false
+        }
+    }
+}
+
+fn is_format_param(c: Checker, ty: TyId) -> bool {
+    return is_builtin_named(c, ty, BuiltinNamed.format) || is_builtin_named(c, ty, BuiltinNamed.panic_info)
+}
+
+// ty is written somewhere other than a parameter.
+fn no_format(c: inout Checker, file: u32, start: u32, ty: TyId) -> ! OutOfMemory {
+    if !holds_format(c, ty) {
+        return ok
+    }
+    if is_builtin_named(c, ty, BuiltinNamed.format) {
+        return report(inout c, file, start, "a `Format` can only be a parameter: it points into the frame of the call that made it")
+    }
+    let shown: []u8 = try show(inout c, ty)
+    return report(inout c, file, start, try program.format_text(c.alloc, "`{shown}` holds a `Format`, which can only be a parameter: it points into the frame of the call that made it"))
+}
+
+// A parameter's type may be `Format` itself, but not hold one.
+fn format_param(c: inout Checker, file: u32, start: u32, ty: TyId) -> ! OutOfMemory {
+    if !is_format_param(c, ty) {
+        try no_format(inout c, file, start, ty)
+    }
+    return ok
+}
+
+// The fields, payloads and members of a declared type.
+fn no_format_in_type(c: inout Checker, file: u32, def: syntax.TypeDef, ty: TyId) -> ! OutOfMemory {
+    let ast: syntax.Ast = ast_of(c, file)
+    var info_def: ?NamedDef = none
+    match info_of(c, ty) {
+        some(value as info: NamedInfo) {
+            info_def = some.(value: info.def)
+        }
+        none {
+        }
+    }
+    let nothing: NamedDef = NamedDef.union_def.(fields: Range.(start: 0, len: 0))
+    var d: NamedDef = nothing
+    match info_def {
+        some(value as x: NamedDef) {
+            d = x
+        }
+        none {
+            return ok
+        }
+    }
+    match def {
+        plain(ty as t: syntax.TypeId) {
+            match d {
+                plain(underlying: TyId, pub_fields: _) {
+                    var done: bool = false
+                    match ast.types[usize.(t)].kind {
+                        tuple(fields: syntax.List) {
+                            match get(c.types, underlying) {
+                                tuple(fields as tys: Range) {
+                                    let written: []u32 = syntax.items(ast.extra, fields)
+                                    let lowered: []TupleField = tuple_fields(c.types, tys)
+                                    for let i: usize in 0..written.len {
+                                        if i < lowered.len {
+                                            let ft: syntax.TypeId = ast.fields[usize.(written[i])].ty
+                                            try no_format(inout c, file, ast.types[usize.(ft)].span.start, lowered[i].ty)
+                                        }
+                                    }
+                                    done = true
+                                }
+                                _ {
+                                }
+                            }
+                        }
+                        _ {
+                        }
+                    }
+                    if !done {
+                        try no_format(inout c, file, ast.types[usize.(t)].span.start, underlying)
+                    }
+                }
+                _ {
+                }
+            }
+        }
+        enum_type(int_type: _, variants: syntax.List) {
+            match d {
+                enum_def(info: EnumInfo) {
+                    let lowered: []Variant = enum_variants(c.types, info)
+                    var k: usize = 0
+                    for let i: u32 in syntax.items(ast.extra, variants) {
+                        match ast.variants[usize.(i)] {
+                            named(name: _, payload: ?syntax.TypeId, value: _) {
+                                if k < lowered.len {
+                                    match payload {
+                                        some(value as p: syntax.TypeId) {
+                                            match lowered[k].payload {
+                                                some(value as pt: TyId) {
+                                                    try no_format(inout c, file, ast.types[usize.(p)].span.start, pt)
+                                                }
+                                                none {
+                                                }
+                                            }
+                                        }
+                                        none {
+                                        }
+                                    }
+                                }
+                                k += 1
+                            }
+                            open(span: _) {
+                            }
+                        }
+                    }
+                }
+                _ {
+                }
+            }
+        }
+        union_type(fields: syntax.List) {
+            match d {
+                union_def(fields as tys: Range) {
+                    let written: []u32 = syntax.items(ast.extra, fields)
+                    let lowered: []TupleField = tuple_fields(c.types, tys)
+                    for let i: usize in 0..written.len {
+                        if i < lowered.len {
+                            let ft: syntax.TypeId = ast.fields[usize.(written[i])].ty
+                            try no_format(inout c, file, ast.types[usize.(ft)].span.start, lowered[i].ty)
+                        }
+                    }
+                }
+                _ {
+                }
+            }
+        }
+    }
+    return ok
+}
+
+// Constant initializers.
+
+// A global's initializer is computed before the program runs, so it must
+// be a constant.
+fn constant(c: inout Checker, file: u32, e: syntax.ExprId) -> ! OutOfMemory {
+    match non_constant(c, file, e) {
+        some(value as start: u32) {
+            try report(inout c, file, start, "a global's value is computed before the program runs, so this must be a constant")
+        }
+        none {
+        }
+    }
+    return ok
+}
+
+fn first_non_constant(c: Checker, file: u32, es: []u32) -> ?u32 {
+    for let e: u32 in es {
+        match non_constant(c, file, syntax.ExprId.(e)) {
+            some(value as s: u32) {
+                return some.(value: s)
+            }
+            none {
+            }
+        }
+    }
+    return none
+}
+
+// Where the first part of e that is not a constant starts.
+fn non_constant(c: Checker, file: u32, e: syntax.ExprId) -> ?u32 {
+    let ast: syntax.Ast = ast_of(c, file)
+    let x: syntax.Expr = ast.exprs[usize.(e)]
+    match x.kind {
+        int, float, char {
+            return none
+        }
+        str(parts: syntax.List) {
+            for let i: u32 in syntax.items(ast.extra, parts) {
+                match ast.str_parts[usize.(i)] {
+                    interpolation(value: _) {
+                        return some.(value: x.span.start)
+                    }
+                    text(span: _) {
+                    }
+                }
+            }
+            return none
+        }
+        paren(inner: syntax.ExprId) {
+            return non_constant(c, file, inner)
+        }
+        unary(op: syntax.UnaryOp, operand: syntax.ExprId) {
+            if op == syntax.UnaryOp.address_of {
+                return some.(value: x.span.start)
+            }
+            return non_constant(c, file, operand)
+        }
+        binary(op: _, left: syntax.ExprId, right: syntax.ExprId) {
+            match non_constant(c, file, left) {
+                some(value as s: u32) {
+                    return some.(value: s)
+                }
+                none {
+                    return non_constant(c, file, right)
+                }
+            }
+        }
+        tuple(items: syntax.List) {
+            for let i: u32 in syntax.items(ast.extra, items) {
+                match non_constant(c, file, ast.tuple_items[usize.(i)].value) {
+                    some(value as s: u32) {
+                        return some.(value: s)
+                    }
+                    none {
+                    }
+                }
+            }
+            return none
+        }
+        array(elems: syntax.List) {
+            return first_non_constant(c, file, syntax.items(ast.extra, elems))
+        }
+        construct(ty: _, value: syntax.ExprId) {
+            return non_constant(c, file, value)
+        }
+        name(name: _) {
+            return variable_use(c, file, e, x.span.start)
+        }
+        field(value: syntax.ExprId, name: syntax.Span) {
+            match expr_res(c, file, e) {
+                some(value as res: resolve.Res) {
+                    match res {
+                        decl(decl: _) {
+                            return variable_use(c, file, e, x.span.start)
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            // A variant, as in `Color.red`.
+            if is_type_expr(c, file, value) {
+                return none
+            }
+            if program.bytes_equal(file_text(c, file, name), "len") {
+                return non_constant(c, file, value)
+            }
+            return some.(value: x.span.start)
+        }
+        call(callee: syntax.ExprId, args: syntax.List) {
+            var target: syntax.ExprId = callee
+            match ast.exprs[usize.(callee)].kind {
+                index(value: syntax.ExprId, index: _) {
+                    target = value
+                }
+                _ {
+                }
+            }
+            match res_builtin(expr_res(c, file, target)) {
+                some(value as name: []u8) {
+                    match name {
+                        "from_address", "fill", "c_string", "truncate" {
+                            for let i: u32 in syntax.items(ast.extra, args) {
+                                match non_constant(c, file, ast.args[usize.(i)].value) {
+                                    some(value as s: u32) {
+                                        return some.(value: s)
+                                    }
+                                    none {
+                                    }
+                                }
+                            }
+                            return none
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            return some.(value: x.span.start)
+        }
+        _ {
+            return some.(value: x.span.start)
+        }
+    }
+}
+
+// A name that refers to a `var` global or a C global is not a constant.
+fn variable_use(c: Checker, file: u32, e: syntax.ExprId, start: u32) -> ?u32 {
+    match expr_res(c, file, e) {
+        some(value as res: resolve.Res) {
+            match res {
+                decl(decl as d: maps.DeclRef) {
+                    if variable_decl(c, d) {
+                        return some.(value: start)
+                    }
+                }
+                _ {
+                }
+            }
+        }
+        none {
+        }
+    }
+    return none
+}
+
+// Whether a top-level name is not a constant: `var` globals and C globals.
+// Functions are constants: their addresses are fixed.
+fn variable_decl(c: Checker, decl: maps.DeclRef) -> bool {
+    return match decl_of(c, decl).kind {
+        global(is_shared: _, local: syntax.Local) { local.mutable }
+        extern_var(mutable: _, name: _, ty: _) { true }
+        _ { false }
+    }
+}
+
+fn is_type_expr(c: Checker, file: u32, e: syntax.ExprId) -> bool {
+    match expr_res(c, file, e) {
+        some(value as res: resolve.Res) {
+            match res {
+                builtin(name: []u8) {
+                    return resolve.is_builtin_type(name)
+                }
+                decl(decl as d: maps.DeclRef) {
+                    return match decl_of(c, d).kind {
+                        type_decl(name: _, def: _) { true }
+                        _ { false }
+                    }
+                }
+                _ {
+                    return false
+                }
+            }
+        }
+        none {
+            return false
+        }
+    }
+}

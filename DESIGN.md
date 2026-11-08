@@ -2005,8 +2005,9 @@ lexer and then the parser.
 - **Layout.** `main.tern` is the driver. The `syntax` package holds the
   tokens, the lexer, line lookup, the syntax tree and the parser. The
   `sexp` package prints a tree as stage 1's `ternc parse` does.
-  `program` loads a program's packages, `resolve` resolves names, and
-  `maps` holds the hash maps they use, one per key and value type.
+  `program` loads a program's packages, `resolve` resolves names,
+  `check` checks types and the safety rules, and `maps` holds the hash
+  maps they use, one per key and value type.
 - **`ternc check DIR --std DIR`** reports what stage 1's `check` does.
   It loads, resolves and checks the whole program in one `heap.Arena`.
   Messages other than the lexer's and parser's are built as text with
@@ -2034,8 +2035,15 @@ lexer and then the parser.
 - **The checker is tested against stage 1 too.** Every program a
   resolver or checker test writes is also run through both compilers'
   `check`, which must print the same output, and so is every package
-  directory in `examples` and `toolchain/ternc` and the loader's
-  fixtures.
+  directory in `examples`, ternc, std and the run tests, and the
+  loader's fixtures. `toolchain/stage1/tests/check/malformed` triggers
+  every checker error the checker's tests do not.
+- **The checker's types** are interned as stage 1's are. A tuple's
+  fields and a function's parameters live in arrays of their own, and
+  interning encodes a type as a list of words. Constant expressions are
+  128-bit, as in stage 1, in `check/wide.tern`, since tern has no
+  `i128`. On ternc's own source, ternc's `check` built with `-O` takes
+  20 ms against stage 1's 12 ms.
 - **The parser is tested like the lexer.** `ternc parse FILE` prints
   what stage 1's prints: the S-expression tree, or the diagnostics. The
   test compares the two on every tern file and every tree-sitter corpus
@@ -2079,6 +2087,22 @@ Friction found while porting the parser:
   are local so keel inlines them; the same file takes 23 ms.
 - `==` does not apply to optionals, so comparing the next operator with
   a known one takes a `match`.
+
+Friction found while porting the checker:
+
+- A newtype has no operators, so comparing two `TyId`s takes a helper,
+  `same_ty`. This is the open question of opting in to a newtype's
+  operators.
+- An empty array literal `[]` does not parse, so an empty view comes
+  from an empty `[..]T`.
+- The strict exclusivity rule rejects `ty(inout r, r.ast.params[i].ty)`,
+  since the argument reads through `r`. Each such call copies the item
+  into a local first.
+- An arm with several patterns cannot bind payloads, so arms that would
+  share a body, such as `view(elem)` and `pointer(elem)`, repeat it.
+- A function's name blocks that name for locals in the whole package,
+  which the checker hit often: `decl`, `shift_amount` and
+  `variant_payload` all clashed and were renamed.
 
 ## Deferred
 

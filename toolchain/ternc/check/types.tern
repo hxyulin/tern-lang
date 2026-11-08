@@ -1,0 +1,713 @@
+// The checker's types, interned so that equal types have equal ids.
+// Ported from stage 1's types module.
+//
+// A tuple's fields and a function's parameters live in arrays of their
+// own, and a Ty refers to a range of one. Interning encodes a type as a
+// list of words, with each field name replaced by its interned number, and
+// looks the words up in a hash table.
+
+import maps
+import program
+import syntax
+
+pub type TyId u32
+
+pub type IntTy enum {
+    i8
+    i16
+    i32
+    i64
+    isize
+    u8
+    u16
+    u32
+    u64
+    usize
+}
+
+pub fn int_signed(int: IntTy) -> bool {
+    return match int {
+        i8, i16, i32, i64, isize { true }
+        u8, u16, u32, u64, usize { false }
+    }
+}
+
+// Both targets are 64-bit, so isize and usize have 64 bits.
+pub fn int_bits(int: IntTy) -> u32 {
+    return match int {
+        i8, u8 { 8 }
+        i16, u16 { 16 }
+        i32, u32 { 32 }
+        i64, u64, isize, usize { 64 }
+    }
+}
+
+pub fn int_min(int: IntTy) -> Wide {
+    if !int_signed(int) {
+        return wide(0)
+    }
+    return wide_neg(wide(u64.(1) << u64.(int_bits(int) - 1)))
+}
+
+pub fn int_max(int: IntTy) -> Wide {
+    let bits: u64 = u64.(int_bits(int))
+    if int_signed(int) {
+        return wide((u64.(1) << (bits - 1)) - 1)
+    }
+    if bits == 64 {
+        return wide(~u64.(0))
+    }
+    return wide((u64.(1) << bits) - 1)
+}
+
+pub fn int_name(int: IntTy) -> []u8 {
+    return match int {
+        i8 { "i8" }
+        i16 { "i16" }
+        i32 { "i32" }
+        i64 { "i64" }
+        isize { "isize" }
+        u8 { "u8" }
+        u16 { "u16" }
+        u32 { "u32" }
+        u64 { "u64" }
+        usize { "usize" }
+    }
+}
+
+pub fn int_from_name(name: []u8) -> ?IntTy {
+    return match name {
+        "i8" { some.(value: IntTy.i8) }
+        "i16" { some.(value: IntTy.i16) }
+        "i32" { some.(value: IntTy.i32) }
+        "i64" { some.(value: IntTy.i64) }
+        "isize" { some.(value: IntTy.isize) }
+        "u8" { some.(value: IntTy.u8) }
+        "u16" { some.(value: IntTy.u16) }
+        "u32" { some.(value: IntTy.u32) }
+        "u64" { some.(value: IntTy.u64) }
+        "usize" { some.(value: IntTy.usize) }
+        _ { none }
+    }
+}
+
+fn int_number(int: IntTy) -> u32 {
+    return match int {
+        i8 { 0 }
+        i16 { 1 }
+        i32 { 2 }
+        i64 { 3 }
+        isize { 4 }
+        u8 { 5 }
+        u16 { 6 }
+        u32 { 7 }
+        u64 { 8 }
+        usize { 9 }
+    }
+}
+
+// The built-in named types.
+pub type BuiltinNamed enum {
+    allocator
+    format
+    panic_info
+    out_of_memory
+}
+
+fn builtin_number(b: BuiltinNamed) -> u32 {
+    return match b {
+        allocator { 0 }
+        format { 1 }
+        panic_info { 2 }
+        out_of_memory { 3 }
+    }
+}
+
+// A nominal type: a `type` declaration or a built-in record or enum.
+pub type NamedId enum {
+    decl(decl: maps.DeclRef)
+    builtin(which: BuiltinNamed)
+}
+
+pub type Range (pub start: u32, pub len: u32)
+
+pub type TupleField (pub name: []u8, pub ty: TyId)
+
+pub type FnParam (pub mode: syntax.Mode, pub ty: TyId)
+
+pub type Ty enum {
+    int(int: IntTy)
+    float(bits: u32)
+    boolean
+    named(id: NamedId)
+    // Fields in Types.fields.
+    tuple(fields: Range)
+    view(elem: TyId)
+    array(len: u64, elem: TyId)
+    growable(elem: TyId)
+    pointer(elem: TyId)
+    optional(elem: TyId)
+    // `T ! E`, or `! E` with no value.
+    result(value: ?TyId, error: TyId)
+    // Parameters in Types.params.
+    function(params: Range, result: ?TyId)
+    // The type of `panic(...)` and other expressions that never finish.
+    never
+    // Stands in after an error, so one mistake is reported once.
+    error
+}
+
+pub type Variant (pub name: []u8, pub payload: ?TyId, pub value: ?Wide)
+
+pub type EnumInfo (
+    // In Types.variants.
+    pub variants: Range,
+    pub int: ?IntTy,
+    pub open: bool,
+)
+
+pub type NamedDef enum {
+    // A record, newtype or any other type given a name. For a record,
+    // pub_fields says which fields are `pub`, in Types.pub_fields.
+    plain(underlying: TyId, pub_fields: Range)
+    enum_def(info: EnumInfo)
+    // Members in Types.fields.
+    union_def(fields: Range)
+}
+
+pub type NamedInfo (
+    // For messages: `File`, or `io.File` outside the root package.
+    pub display: []u8,
+    // None for built-in types.
+    pub package: ?u32,
+    pub def: NamedDef,
+)
+
+pub type Types (
+    alloc: Allocator,
+    pub tys: [..]Ty,
+    pub fields: [..]TupleField,
+    pub params: [..]FnParam,
+    pub variants: [..]Variant,
+    pub pub_fields: [..]bool,
+    // Each type's words, for interning: keys[i] is in words.
+    words: [..]u32,
+    keys: [..]Range,
+    // Open addressing over keys: a type's id plus one, or zero.
+    slots: [..]u32,
+    // Field names, numbered for the words.
+    names: [..][]u8,
+    name_slots: [..]u32,
+    // The named types' definitions: one per built-in, and one per type
+    // declaration, indexed by the declaration's number.
+    builtin_infos: [4]?NamedInfo,
+    pub decl_infos: [..]?NamedInfo,
+    // The number of each file's first declaration.
+    decl_base: [..]u32,
+)
+
+pub fn new_types(alloc: Allocator, p: program.Program) -> Types ! OutOfMemory {
+    var t: Types = Types.(
+        alloc: alloc,
+        tys: make(alloc),
+        fields: make(alloc),
+        params: make(alloc),
+        variants: make(alloc),
+        pub_fields: make(alloc),
+        words: make(alloc),
+        keys: make(alloc),
+        slots: make(alloc),
+        names: make(alloc),
+        name_slots: make(alloc),
+        builtin_infos: [none, none, none, none],
+        decl_infos: make(alloc),
+        decl_base: make(alloc),
+    )
+    var count: u32 = 0
+    for let f: program.File in p.files {
+        try push(inout t.decl_base, count)
+        count += u32.(f.ast.decls.len)
+    }
+    for let _: u32 in 0..count {
+        try push(inout t.decl_infos, none)
+    }
+    return ok.(value: t)
+}
+
+pub fn decl_number(t: Types, decl: maps.DeclRef) -> u32 {
+    return t.decl_base[usize.(decl.file)] + decl.index
+}
+
+pub fn same_ty(a: TyId, b: TyId) -> bool {
+    return u32.(a) == u32.(b)
+}
+
+pub fn get(t: Types, id: TyId) -> Ty {
+    return t.tys[usize.(id)]
+}
+
+pub fn tuple_fields(t: Types, r: Range) -> []TupleField {
+    return t.fields[usize.(r.start)..usize.(r.start + r.len)]
+}
+
+pub fn fn_params(t: Types, r: Range) -> []FnParam {
+    return t.params[usize.(r.start)..usize.(r.start + r.len)]
+}
+
+pub fn enum_variants(t: Types, info: EnumInfo) -> []Variant {
+    return t.variants[usize.(info.variants.start)..usize.(info.variants.start + info.variants.len)]
+}
+
+pub fn named_info(t: Types, id: NamedId) -> ?NamedInfo {
+    return match id {
+        decl(decl as d: maps.DeclRef) { t.decl_infos[usize.(decl_number(t, d))] }
+        builtin(which: BuiltinNamed) { t.builtin_infos[usize.(builtin_number(which))] }
+    }
+}
+
+pub fn set_named_info(t: inout Types, id: NamedId, info: NamedInfo) {
+    match id {
+        decl(decl as d: maps.DeclRef) {
+            let n: u32 = decl_number(t, d)
+            t.decl_infos[usize.(n)] = some.(value: info)
+        }
+        builtin(which: BuiltinNamed) {
+            t.builtin_infos[usize.(builtin_number(which))] = some.(value: info)
+        }
+    }
+}
+
+// Hashing word lists.
+
+fn hash_words(w: []u32) -> u64 {
+    var h: u64 = 0xcbf29ce484222325
+    for let x: u32 in w {
+        h = wrapping_mul(h ^ u64.(x), 0x100000001b3)
+    }
+    return h
+}
+
+fn same_words(a: []u32, b: []u32) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for let i: usize in 0..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn key_words(t: Types, i: u32) -> []u32 {
+    let r: Range = t.keys[usize.(i)]
+    return t.words[usize.(r.start)..usize.(r.start + r.len)]
+}
+
+// The number of a field name, interning it.
+fn name_number(t: inout Types, name: []u8) -> u32 ! OutOfMemory {
+    if (t.names.len + 1) * 2 > t.name_slots.len {
+        var size: usize = t.name_slots.len * 2
+        if size < 64 {
+            size = 64
+        }
+        clear(inout t.name_slots)
+        for let _: usize in 0..size {
+            try push(inout t.name_slots, 0)
+        }
+        for let i: usize in 0..t.names.len {
+            place_name(inout t, u32.(i))
+        }
+    }
+    let mask: u64 = u64.(t.name_slots.len) - 1
+    var at: u64 = name_hash(name) & mask
+    for {
+        let slot: u32 = t.name_slots[usize.(at)]
+        if slot == 0 {
+            let n: u32 = u32.(t.names.len)
+            try push(inout t.names, name)
+            t.name_slots[usize.(at)] = n + 1
+            return ok.(value: n)
+        }
+        if program.bytes_equal(t.names[usize.(slot - 1)], name) {
+            return ok.(value: slot - 1)
+        }
+        at = (at + 1) & mask
+    }
+}
+
+fn name_hash(name: []u8) -> u64 {
+    var h: u64 = 0xcbf29ce484222325
+    for let b: u8 in name {
+        h = wrapping_mul(h ^ u64.(b), 0x100000001b3)
+    }
+    return h
+}
+
+fn place_name(t: inout Types, n: u32) {
+    let mask: u64 = u64.(t.name_slots.len) - 1
+    var at: u64 = name_hash(t.names[usize.(n)]) & mask
+    for t.name_slots[usize.(at)] != 0 {
+        at = (at + 1) & mask
+    }
+    t.name_slots[usize.(at)] = n + 1
+}
+
+fn place_key(t: inout Types, id: u32) {
+    let mask: u64 = u64.(t.slots.len) - 1
+    var at: u64 = hash_words(key_words(t, id)) & mask
+    for t.slots[usize.(at)] != 0 {
+        at = (at + 1) & mask
+    }
+    t.slots[usize.(at)] = id + 1
+}
+
+fn opt_word(id: ?TyId) -> u32 {
+    return match id {
+        none { 0 }
+        some(value as v: TyId) { u32.(v) + 1 }
+    }
+}
+
+// Appends the words of ty to out.
+fn encode(t: inout Types, ty: Ty, out: inout [..]u32) -> ! OutOfMemory {
+    match ty {
+        int(int: IntTy) {
+            try push(inout out, 0)
+            try push(inout out, int_number(int))
+        }
+        float(bits: u32) {
+            try push(inout out, 1)
+            try push(inout out, bits)
+        }
+        boolean {
+            try push(inout out, 2)
+        }
+        named(id: NamedId) {
+            match id {
+                decl(decl as d: maps.DeclRef) {
+                    try push(inout out, 3)
+                    try push(inout out, d.file)
+                    try push(inout out, d.index)
+                }
+                builtin(which: BuiltinNamed) {
+                    try push(inout out, 4)
+                    try push(inout out, builtin_number(which))
+                }
+            }
+        }
+        tuple(fields: Range) {
+            try push(inout out, 5)
+            try push(inout out, fields.len)
+            for let i: u32 in 0..fields.len {
+                let f: TupleField = t.fields[usize.(fields.start + i)]
+                try push(inout out, try name_number(inout t, f.name))
+                try push(inout out, u32.(f.ty))
+            }
+        }
+        view(elem: TyId) {
+            try push(inout out, 6)
+            try push(inout out, u32.(elem))
+        }
+        array(len: u64, elem: TyId) {
+            try push(inout out, 7)
+            try push(inout out, u32.(len >> 32))
+            try push(inout out, u32.(len & 0xffff_ffff))
+            try push(inout out, u32.(elem))
+        }
+        growable(elem: TyId) {
+            try push(inout out, 8)
+            try push(inout out, u32.(elem))
+        }
+        pointer(elem: TyId) {
+            try push(inout out, 9)
+            try push(inout out, u32.(elem))
+        }
+        optional(elem: TyId) {
+            try push(inout out, 10)
+            try push(inout out, u32.(elem))
+        }
+        result(value: ?TyId, error: TyId) {
+            try push(inout out, 11)
+            try push(inout out, opt_word(value))
+            try push(inout out, u32.(error))
+        }
+        function(params: Range, result: ?TyId) {
+            try push(inout out, 12)
+            try push(inout out, params.len)
+            for let i: u32 in 0..params.len {
+                let p: FnParam = t.params[usize.(params.start + i)]
+                let mode: u32 = match p.mode {
+                    let_mode { 0 }
+                    inout_mode { 1 }
+                }
+                try push(inout out, mode)
+                try push(inout out, u32.(p.ty))
+            }
+            try push(inout out, opt_word(result))
+        }
+        never {
+            try push(inout out, 13)
+        }
+        error {
+            try push(inout out, 14)
+        }
+    }
+    return ok
+}
+
+// The id of ty, adding it if it is new. A tuple's fields or a function's
+// parameters must be the last ones in their array: if the type exists,
+// they are dropped again.
+pub fn intern(t: inout Types, ty: Ty) -> TyId ! OutOfMemory {
+    let start: usize = t.words.len
+    var words: [..]u32 = t.words
+    try encode(inout t, ty, inout words)
+    t.words = words
+    let key: []u32 = t.words[start..]
+    if t.slots.len > 0 {
+        let mask: u64 = u64.(t.slots.len) - 1
+        var at: u64 = hash_words(key) & mask
+        for {
+            let slot: u32 = t.slots[usize.(at)]
+            if slot == 0 {
+                break
+            }
+            if same_words(key_words(t, slot - 1), key) {
+                drop_words(inout t, start)
+                drop_parts(inout t, ty)
+                return ok.(value: TyId.(slot - 1))
+            }
+            at = (at + 1) & mask
+        }
+    }
+    let id: u32 = u32.(t.tys.len)
+    try push(inout t.tys, ty)
+    try push(inout t.keys, Range.(start: u32.(start), len: u32.(t.words.len - start)))
+    if (t.tys.len) * 2 > t.slots.len {
+        var size: usize = t.slots.len * 2
+        if size < 256 {
+            size = 256
+        }
+        clear(inout t.slots)
+        for let _: usize in 0..size {
+            try push(inout t.slots, 0)
+        }
+        for let i: u32 in 0..u32.(t.tys.len) {
+            place_key(inout t, i)
+        }
+    } else {
+        place_key(inout t, id)
+    }
+    return ok.(value: TyId.(id))
+}
+
+fn drop_words(t: inout Types, start: usize) {
+    for t.words.len > start {
+        let _: ?u32 = pop(inout t.words)
+    }
+}
+
+// Drops the fields or parameters a duplicate type added last.
+fn drop_parts(t: inout Types, ty: Ty) {
+    match ty {
+        tuple(fields: Range) {
+            for t.fields.len > usize.(fields.start) {
+                let _: ?TupleField = pop(inout t.fields)
+            }
+        }
+        function(params: Range, result: _) {
+            for t.params.len > usize.(params.start) {
+                let _: ?FnParam = pop(inout t.params)
+            }
+        }
+        _ {
+        }
+    }
+}
+
+// Shorthands.
+
+pub fn int_ty(t: inout Types, int: IntTy) -> TyId ! OutOfMemory {
+    return intern(inout t, Ty.int.(int: int))
+}
+
+pub fn usize_ty(t: inout Types) -> TyId ! OutOfMemory {
+    return int_ty(inout t, IntTy.usize)
+}
+
+pub fn bool_ty(t: inout Types) -> TyId ! OutOfMemory {
+    return intern(inout t, Ty.boolean)
+}
+
+pub fn never_ty(t: inout Types) -> TyId ! OutOfMemory {
+    return intern(inout t, Ty.never)
+}
+
+pub fn error_ty(t: inout Types) -> TyId ! OutOfMemory {
+    return intern(inout t, Ty.error)
+}
+
+pub fn bytes_ty(t: inout Types) -> TyId ! OutOfMemory {
+    let byte_ty: TyId = try int_ty(inout t, IntTy.u8)
+    return intern(inout t, Ty.view.(elem: byte_ty))
+}
+
+pub fn named_ty(t: inout Types, id: NamedId) -> TyId ! OutOfMemory {
+    return intern(inout t, Ty.named.(id: id))
+}
+
+// A tuple with these fields, in order.
+pub fn tuple_ty(t: inout Types, fields: []TupleField) -> TyId ! OutOfMemory {
+    let start: u32 = u32.(t.fields.len)
+    for let f: TupleField in fields {
+        try push(inout t.fields, f)
+    }
+    return intern(inout t, Ty.tuple.(fields: Range.(start: start, len: u32.(fields.len))))
+}
+
+// A one-field tuple, such as `(value: T)`.
+pub fn single_field(t: inout Types, name: []u8, ty: TyId) -> TyId ! OutOfMemory {
+    let one: [1]TupleField = [TupleField.(name: name, ty: ty)]
+    return tuple_ty(inout t, one)
+}
+
+pub fn fn_ty(t: inout Types, params: []FnParam, result: ?TyId) -> TyId ! OutOfMemory {
+    let start: u32 = u32.(t.params.len)
+    for let p: FnParam in params {
+        try push(inout t.params, p)
+    }
+    return intern(inout t, Ty.function.(params: Range.(start: start, len: u32.(params.len)), result: result))
+}
+
+pub fn is_error(t: Types, id: TyId) -> bool {
+    return match get(t, id) {
+        error { true }
+        _ { false }
+    }
+}
+
+pub fn is_never(t: Types, id: TyId) -> bool {
+    return match get(t, id) {
+        never { true }
+        _ { false }
+    }
+}
+
+// The integer type of a built-in integer, if id is one.
+pub fn as_int(t: Types, id: TyId) -> ?IntTy {
+    return match get(t, id) {
+        int(int: IntTy) { some.(value: int) }
+        _ { none }
+    }
+}
+
+// Writes how a type is shown in messages.
+pub fn show_into(t: Types, id: TyId, out: inout [..]u8) -> ! OutOfMemory {
+    match get(t, id) {
+        int(int: IntTy) {
+            try append(inout out, int_name(int))
+        }
+        float(bits: u32) {
+            if bits == 32 {
+                try append(inout out, "f32")
+            } else {
+                try append(inout out, "f64")
+            }
+        }
+        boolean {
+            try append(inout out, "bool")
+        }
+        named(id as n: NamedId) {
+            match named_info(t, n) {
+                some(value as info: NamedInfo) {
+                    try append(inout out, info.display)
+                }
+                none {
+                    try append(inout out, "\{unknown}")
+                }
+            }
+        }
+        tuple(fields: Range) {
+            try push(inout out, '(')
+            for let i: u32 in 0..fields.len {
+                if i > 0 {
+                    try append(inout out, ", ")
+                }
+                let f: TupleField = t.fields[usize.(fields.start + i)]
+                try append(inout out, f.name)
+                try append(inout out, ": ")
+                try show_into(t, f.ty, inout out)
+            }
+            try push(inout out, ')')
+        }
+        view(elem: TyId) {
+            try append(inout out, "[]")
+            try show_into(t, elem, inout out)
+        }
+        array(len: u64, elem: TyId) {
+            var buf: [48]u8 = fill[48](0)
+            try push(inout out, '[')
+            try append(inout out, wide_text(inout buf, wide(len)))
+            try push(inout out, ']')
+            try show_into(t, elem, inout out)
+        }
+        growable(elem: TyId) {
+            try append(inout out, "[..]")
+            try show_into(t, elem, inout out)
+        }
+        pointer(elem: TyId) {
+            try push(inout out, '*')
+            try show_into(t, elem, inout out)
+        }
+        optional(elem: TyId) {
+            try push(inout out, '?')
+            try show_into(t, elem, inout out)
+        }
+        result(value: ?TyId, error: TyId) {
+            match value {
+                some(value as v: TyId) {
+                    try show_into(t, v, inout out)
+                    try append(inout out, " ! ")
+                }
+                none {
+                    try append(inout out, "! ")
+                }
+            }
+            try show_into(t, error, inout out)
+        }
+        function(params: Range, result: ?TyId) {
+            try append(inout out, "fn(")
+            for let i: u32 in 0..params.len {
+                if i > 0 {
+                    try append(inout out, ", ")
+                }
+                let p: FnParam = t.params[usize.(params.start + i)]
+                match p.mode {
+                    inout_mode {
+                        try append(inout out, "inout ")
+                    }
+                    let_mode {
+                    }
+                }
+                try show_into(t, p.ty, inout out)
+            }
+            try push(inout out, ')')
+            match result {
+                some(value as r: TyId) {
+                    try append(inout out, " -> ")
+                    try show_into(t, r, inout out)
+                }
+                none {
+                }
+            }
+        }
+        never {
+            try append(inout out, "never")
+        }
+        error {
+            try append(inout out, "\{error}")
+        }
+    }
+    return ok
+}
