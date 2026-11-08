@@ -136,7 +136,7 @@ pub struct FnDecl {
 }
 
 /// How an argument is passed. `Let` is the default and is not written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mode {
     Let,
     Inout,

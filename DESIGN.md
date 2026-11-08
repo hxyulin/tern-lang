@@ -710,6 +710,12 @@ type Header (
 )
 ```
 
+**Decided (2026-11-08): newtypes and operators.** An integer literal
+takes a newtype from context: `let fd: c.int = 3`. Operators do not
+apply to a newtype; code unwraps first, as in `i32.(fd) < 0`. A newtype
+is meant to opt in to its operators, so `Celsius + Celsius` can work
+while `Celsius + Meters` never does, but the opt-in mechanism is open.
+
 Rejected:
 
 - `type Point struct { ... }` (Go): `struct { ... }` would be a type
@@ -1744,6 +1750,13 @@ for interpolation. A line may not end inside an interpolation.
 
 Decided the same day:
 
+- **Checker:** name resolution, then type checking. Types flow from
+  context into literals, `none`, `some.(...)`, `make` and array
+  literals; an operator takes the type of its other operand. Assigning
+  to a `let`, or passing it `inout`, is an error, and so is a call
+  statement that ignores a result. Not checked yet: `unsafe`
+  requirements, `shared` access, use after `sink`, exclusivity, the
+  `Format` parameter rule and constant initializers.
 - **Parser:** hand-written recursive descent, one function per rule of
   the tree-sitter grammar. It prints its tree in tree-sitter's
   S-expression form, so the tests compare it with every corpus tree, and
@@ -1798,6 +1811,10 @@ Not in the first version. `[T]` is reserved for type arguments.
 - The language's name.
 - Target-specific code. `errno` is the first need: a different C
   function on macOS and Linux.
+- An opt-in for a newtype's operators.
+- Writing through a view. The checker lets code write `v[i]` when the
+  view itself is a `var` or an `inout` parameter, which is a guess:
+  nothing says whether `[]T` is read-only.
 - Unsafe function types. A function value with preconditions, such as an
   allocator's `free`, can be called without `unsafe`. One option is
   `unsafe fn(...)` as a type.

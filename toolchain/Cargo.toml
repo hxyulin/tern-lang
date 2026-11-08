@@ -19,3 +19,5 @@ missing_panics_doc = "allow"
 missing_errors_doc = "allow"
 # Parser and printer functions follow the grammar, one arm per rule.
 too_many_lines = "allow"
+# A match with an error arm reads more plainly than `if let ... else`.
+single_match_else = "allow"

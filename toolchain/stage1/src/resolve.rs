@@ -91,14 +91,14 @@ fn builtin(name: &str) -> Option<&'static str> {
 
 /// A top-level declaration: its file and its index in that file's
 /// declarations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeclRef {
     pub file: FileId,
     pub index: usize,
 }
 
 /// A local variable or parameter, numbered within its file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalId(pub u32);
 
 /// What a name refers to.
@@ -120,6 +120,8 @@ pub struct FileNames {
     pub types: Vec<Option<Res>>,
     /// Where each local was declared.
     pub locals: Vec<Span>,
+    /// The local each binding declares, keyed by the start of its name.
+    pub bindings: HashMap<u32, LocalId>,
 }
 
 pub struct Resolution {
@@ -168,6 +170,7 @@ pub fn resolve(program: &Program) -> Resolution {
                 exprs: vec![None; file.ast.exprs.len()],
                 types: vec![None; file.ast.types.len()],
                 locals: Vec::new(),
+                bindings: HashMap::new(),
             },
             diagnostics: Vec::new(),
         };
@@ -376,6 +379,7 @@ impl<'a> FileResolver<'a> {
         let field = field.map(|f| self.name_text(f).to_owned());
         let id = LocalId(u32::try_from(self.out.locals.len()).expect("few locals"));
         self.out.locals.push(name.span);
+        self.out.bindings.insert(name.span.start, id);
         self.locals
             .last_mut()
             .expect("a scope is open")
