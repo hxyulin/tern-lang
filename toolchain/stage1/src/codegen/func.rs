@@ -136,7 +136,7 @@ impl Gen<'_> {
                     fx.ins().store(v, addr);
                     fx.locals.insert(id, Addr::Slot(slot));
                 }
-                (Pass::ByVal | Pass::Ref, Some(v)) => {
+                (Pass::ByVal | Pass::Ref | Pass::Borrow, Some(v)) => {
                     fx.locals.insert(id, Addr::Ptr(v));
                 }
                 _ => {}
@@ -1066,6 +1066,30 @@ impl<'a> FnGen<'_, 'a> {
         self.spill(v, ty)
     }
 
+    /// Whether a `let` argument can pass the address of its storage: a
+    /// local, or a field or element of one held in the local's own memory
+    /// or its `[..]T`. A global, or a value reached through a view or a
+    /// pointer, is copied, since the callee may change it another way.
+    fn borrowable(&mut self, e: ExprId) -> bool {
+        match &self.ast.expr(e).kind {
+            ExprKind::Paren(inner) => self.borrowable(*inner),
+            ExprKind::Name(_) => matches!(self.res(e), Some(Res::Local(_))),
+            ExprKind::Field { value, .. } => {
+                !matches!(self.res(e), Some(Res::Decl(_))) && self.borrowable(*value)
+            }
+            ExprKind::Index {
+                value,
+                index: Index::Expr(_),
+            } => {
+                let ty = self.ty(*value);
+                let core = self.g.core(ty);
+                matches!(self.g.types.get(core), Ty::Array(..) | Ty::Growable(_))
+                    && self.borrowable(*value)
+            }
+            _ => false,
+        }
+    }
+
     fn is_storage(&self, decl: DeclRef) -> bool {
         matches!(
             self.g.decl_kind(decl),
@@ -1258,6 +1282,14 @@ impl<'a> FnGen<'_, 'a> {
             DeclKind::Fn(_) | DeclKind::ExternFn { .. } => {
                 let abi = self.g.decl_abi(decl);
                 let symbol = self.g.symbol(decl);
+                if abi.params.iter().any(|p| matches!(p, Pass::ByVal))
+                    && matches!(self.g.decl_kind(decl), DeclKind::ExternFn { .. })
+                {
+                    self.g.unsupported(format!(
+                        "`{symbol}` takes a record by value, as C does, so it cannot be a \
+                         function value, whose records are passed by pointer"
+                    ));
+                }
                 let callee = self.f.import_function(&symbol, abi.sig);
                 V::S(self.ins().symbol_addr(Symbol::Func(callee)))
             }
@@ -2141,7 +2173,7 @@ impl<'a> FnGen<'_, 'a> {
         }
         // A function value.
         let fty = self.ty(callee);
-        let abi = self.g.fn_abi(fty, false);
+        let abi = self.g.fn_abi(fty, false, false);
         let target = self.expr(callee);
         let target = self.scalar(target);
         let call_args = self.call_args(args, &abi);
@@ -2156,6 +2188,11 @@ impl<'a> FnGen<'_, 'a> {
             Ty::Fn(f) => f.params.iter().map(|(_, t)| *t).collect(),
             _ => Vec::new(),
         };
+        // A call inside an argument that changes or moves a value could
+        // change a borrowed argument before the callee reads it, so then
+        // borrowed arguments are copied.
+        let ast = self.ast;
+        let changes = args.iter().any(|a| changes_in_call(ast, a.value));
         let mut out = Vec::new();
         for (i, arg) in args.iter().enumerate() {
             let pass = abi.params.get(i).copied();
@@ -2173,6 +2210,16 @@ impl<'a> FnGen<'_, 'a> {
                 (Some(Pass::ByVal), Some(t)) => {
                     let v = self.value_as(arg.value, t);
                     out.push(CallArg::Addr(self.spill(v, t)));
+                }
+                (Some(Pass::Borrow), Some(t)) => {
+                    if !changes && self.ty(arg.value) == t && self.borrowable(arg.value) {
+                        out.push(CallArg::Addr(self.addr_of(arg.value)));
+                    } else {
+                        let v = self.value_as(arg.value, t);
+                        let copy = self.temp(t);
+                        self.store(v, t, copy, false);
+                        out.push(CallArg::Addr(copy));
+                    }
                 }
                 _ => {
                     // A C variadic argument: widened as C promotes it.
@@ -2663,4 +2710,63 @@ pub enum CallArg {
     Value(Value),
     Addr(Value),
     None,
+}
+
+/// Whether an expression holds a call that passes an argument `inout` or
+/// `sink`.
+fn changes_in_call(ast: &crate::ast::Ast, e: ExprId) -> bool {
+    let any = |es: &mut dyn Iterator<Item = ExprId>| {
+        let mut found = false;
+        for x in es {
+            found |= changes_in_call(ast, x);
+        }
+        found
+    };
+    match &ast.expr(e).kind {
+        ExprKind::Name(_) | ExprKind::Int | ExprKind::Float | ExprKind::Char => false,
+        ExprKind::Str(parts) => any(&mut parts.iter().filter_map(|p| match p {
+            crate::ast::StrPart::Interpolation(x) => Some(*x),
+            crate::ast::StrPart::Text(_) => None,
+        })),
+        ExprKind::Paren(x)
+        | ExprKind::Deref(x)
+        | ExprKind::Try(x)
+        | ExprKind::Unsafe(x)
+        | ExprKind::Unary { operand: x, .. }
+        | ExprKind::Field { value: x, .. } => changes_in_call(ast, *x),
+        ExprKind::Tuple(fields) => any(&mut fields.iter().map(|(_, x)| *x)),
+        ExprKind::Call { callee, args } => {
+            args.iter().any(|a| a.mode != crate::ast::Mode::Let)
+                || changes_in_call(ast, *callee)
+                || any(&mut args.iter().map(|a| a.value))
+        }
+        ExprKind::Construct { ty, value } => {
+            changes_in_call(ast, *ty) || changes_in_call(ast, *value)
+        }
+        ExprKind::Index { value, index } => {
+            changes_in_call(ast, *value)
+                || match index {
+                    Index::Expr(x) => changes_in_call(ast, *x),
+                    Index::Slice { start, end } => any(&mut start.iter().chain(end).copied()),
+                    Index::Type(_) => false,
+                }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            changes_in_call(ast, *left) || changes_in_call(ast, *right)
+        }
+        ExprKind::If {
+            cond,
+            then,
+            otherwise,
+        } => {
+            let other = match otherwise {
+                crate::ast::IfElse::Branch(x) | crate::ast::IfElse::If(x) => *x,
+            };
+            any(&mut [*cond, *then, other].into_iter())
+        }
+        ExprKind::Match { value, arms } => {
+            changes_in_call(ast, *value) || any(&mut arms.iter().map(|a| a.body))
+        }
+        ExprKind::Array(elems) => any(&mut elems.iter().copied()),
+    }
 }

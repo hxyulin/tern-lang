@@ -5,9 +5,11 @@
 //! and is handled through its address. Every local has a stack slot;
 //! keel's `stack_promote` pass moves the scalar ones into registers.
 //!
-//! Every function uses the C calling convention: a value held in memory
-//! is passed `byval` and returned through `sret`, and an `inout`
-//! argument is passed as a pointer.
+//! Every function uses the C calling convention. A value held in memory
+//! is returned through `sret`, and an `inout` argument is passed as a
+//! pointer. A `let` parameter held in memory is a pointer to the caller's
+//! value, which C sees as `const T *`; a `sink` one, and any record an
+//! `extern` function takes, is passed `byval`, as C passes records.
 
 mod data;
 mod func;
@@ -60,6 +62,8 @@ pub fn generate(program: &Program, names: &Resolution, checked: Checked) -> Resu
         errors: Vec::new(),
     };
     g.module.decls.clear();
+    // The symbols code outside the program may refer to.
+    let mut exported: Vec<String> = Vec::new();
     for (i, file) in program.files.iter().enumerate() {
         let file_id = FileId(u32::try_from(i).expect("few files"));
         for index in 0..file.ast.decls.len() {
@@ -68,7 +72,12 @@ pub fn generate(program: &Program, names: &Resolution, checked: Checked) -> Resu
                 index,
             };
             match &file.ast.decls[index].kind {
-                DeclKind::Fn(_) => g.function(decl),
+                DeclKind::Fn(_) => {
+                    if g.attribute(decl, "export").is_some() {
+                        exported.push(g.symbol(decl));
+                    }
+                    g.function(decl);
+                }
                 DeclKind::Global { .. } => g.global(decl),
                 DeclKind::ExternVar { .. } => {
                     let name = g.symbol(decl);
@@ -97,6 +106,9 @@ pub fn generate(program: &Program, names: &Resolution, checked: Checked) -> Resu
         }
     }
     g.module.decls.extend(called);
+    // The module is the whole program, so everything not exported is
+    // local to it, which lets keel inline it.
+    keel_ir::internalize(&mut g.module, |name| exported.iter().any(|e| e == name));
     if let Some(first) = g.errors.into_iter().next() {
         return Err(first);
     }
@@ -126,6 +138,8 @@ pub enum Pass {
     Scalar,
     /// The address of the value; the callee gets its own copy.
     ByVal,
+    /// The address of the caller's value, which the callee only reads.
+    Borrow,
     /// The address of the caller's place.
     Ref,
     /// A value with no bytes, which is not passed.
@@ -238,8 +252,9 @@ impl<'a> Gen<'a> {
         param
     }
 
-    /// The ABI of a function type.
-    pub fn fn_abi(&mut self, fn_ty: TyId, variadic: bool) -> FnAbi {
+    /// The ABI of a function type. `c_records` is set for an `extern`
+    /// function, which takes records by value as C does.
+    pub fn fn_abi(&mut self, fn_ty: TyId, variadic: bool, c_records: bool) -> FnAbi {
         let ty = self.core(fn_ty);
         let Ty::Fn(f) = self.types.get(ty).clone() else {
             unreachable!("a function type");
@@ -268,11 +283,12 @@ impl<'a> Gen<'a> {
                 (Mode::Inout, _) => Pass::Ref,
                 (_, Repr::Unit) => Pass::Skip,
                 (_, Repr::Scalar(_)) => Pass::Scalar,
+                (Mode::Let, Repr::Memory) if !c_records => Pass::Borrow,
                 (_, Repr::Memory) => Pass::ByVal,
             };
             match pass {
                 Pass::Scalar => sig.params.push(self.abi_param(*ty)),
-                Pass::Ref => sig.params.push(AbiParam::new(Type::Ptr)),
+                Pass::Ref | Pass::Borrow => sig.params.push(AbiParam::new(Type::Ptr)),
                 Pass::ByVal => {
                     let layout = self.keel_layout(*ty);
                     sig.params.push(AbiParam {
@@ -299,8 +315,9 @@ impl<'a> Gen<'a> {
             self.decl_kind(decl),
             DeclKind::ExternFn { variadic: true, .. }
         );
+        let c_records = matches!(self.decl_kind(decl), DeclKind::ExternFn { .. });
         let ty = self.fn_ty(decl);
-        self.fn_abi(ty, variadic)
+        self.fn_abi(ty, variadic, c_records)
     }
 
     /// The data object holding a string's bytes and a NUL after them.

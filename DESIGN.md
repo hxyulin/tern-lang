@@ -949,6 +949,30 @@ The cost is giving up a custom internal ABI. It is small: on x86-64 and
 AArch64 the C convention already returns records up to 16 bytes in
 registers. A view passes as a pointer and a length.
 
+**Decided (2026-11-08): a `let` parameter held in memory is a pointer.**
+A record, tuple, view, array or other value held in memory that a tern
+function takes as `let` arrives as a pointer to the caller's value, on
+every target; C sees `fn f(b: Big)` as `void f(const Big *b)`. This
+makes the promise of [Mutable value semantics](#mutable-value-semantics)
+real: before, every such argument was copied, which made ternc's parser
+four times slower. Function types follow the same rule. An `extern`
+function takes records by value, as C does, so a call to C still copies,
+and an `extern` function that takes a record by value cannot be a
+function value. Rejected: keeping C's by-value records exactly and
+skipping the copy only where C already passes a pointer (AArch64,
+records over 16 bytes), which leaves the copies on x86-64.
+
+The caller passes the address of its own storage when the argument is
+a local, or a field or element held in a local's memory or `[..]T`. It
+copies when the callee could change the value another way: the argument
+is a global, or is reached through a view or a pointer, or another
+argument of the same call holds a call that passes something `inout` or
+`sink`. A callee that changes the caller's value through an alias the
+compiler cannot see, such as a global that an `inout` parameter also
+names, makes the change visible through the parameter; this is defined
+behavior, as for `inout` under [Exclusivity](#exclusivity). The
+`borrow` run test covers each case.
+
 ### Untagged unions
 
 **Decided (2026-11-08).**
@@ -1877,9 +1901,15 @@ not. The user agreed to each.
   has a stack slot, and keel's `stack_promote` pass moves scalars into
   registers.
 - **The C calling convention, with the specified layouts.** A value in
-  memory is passed `byval` and returned through `sret`; an `inout`
-  argument is a pointer. The layouts stay Leaning: the user asked to
-  change them as development needs.
+  memory is returned through `sret`; an `inout` argument is a pointer.
+  A `let` parameter in memory is a pointer to the caller's value (see
+  [One calling convention](#one-calling-convention)); a `sink` one, and
+  a record an `extern` function takes, is passed `byval`. The layouts
+  stay Leaning: the user asked to change them as development needs.
+- **Everything but `@export` functions is local to the program**
+  (2026-11-08). The module is the whole program, so keel may inline any
+  other function; before this, every function was a public symbol and
+  keel's inliner skipped them all.
 - **Checks are inline.** Arithmetic uses keel's overflow instructions,
   and indexing, slicing, division, shifts and conversions compare
   first. A failed check builds a `PanicInfo` whose message carries the
@@ -1949,15 +1979,16 @@ Friction found while porting the lexer, and what became of it:
   returns `! OutOfMemory` and each call takes a `try`. The user judged
   this acceptable.
 
-Friction found while porting the parser, not yet acted on:
+Friction found while porting the parser:
 
 - A function's name cannot name a local anywhere in its package, so
   the parser's helpers took names such as `next_kind` and `subscript`
   to leave `kind` and `index` free for locals in the lexer.
-- A `let` parameter of a record type is passed `byval`, so it is copied
-  on every call. The parser reads tokens through `next_kind(p: Parser)`,
-  which copies the 600-byte `Parser` twice; parsing a 32,000-line file
-  takes 96 ms against stage 1's 9 ms, and the copies lead the profile.
+- A `let` parameter of a record type was passed `byval`, so it was
+  copied on every call: `next_kind(p: Parser)` copied the 600-byte
+  `Parser` twice. Parsing a 32,000-line file took 96 ms against stage
+  1's 9 ms. Acted on: such parameters are now pointers, and functions
+  are local so keel inlines them; the same file takes 23 ms.
 - `==` does not apply to optionals, so comparing the next operator with
   a known one takes a `match`.
 
