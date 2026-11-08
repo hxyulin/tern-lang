@@ -100,6 +100,8 @@ The running list. Each new keyword needs a reason.
 | `pub` | visible outside the package |
 | `unsafe` | unchecked operations, and functions with unchecked preconditions |
 | `uses` | the mutable globals a function reads or writes |
+| `extern` | a C function declared without a body |
+| `union` | untagged unions, for C interop |
 
 `true` and `false` are predeclared names, not keywords, as in Go.
 
@@ -654,6 +656,111 @@ the same as an output parameter.
 Rejected: an `out` parameter mode (Ada, C#, Hylo's `set`). It would be a
 second way to return values.
 
+## C interop and layout
+
+### Attributes
+
+**Decided (2026-11-08).**
+
+```
+@packed
+type Header (magic: u32, len: u16)
+
+@section(".text.boot") @export("reset_handler")
+pub fn reset() { ... }
+```
+
+- `@name` or `@name(args)`, with integer and string literal arguments
+  only. Attributes go before a declaration, on its line or the lines
+  above.
+- The compiler defines every attribute. There are no user attributes, so
+  attributes cannot grow into a macro system.
+- An attribute may change layout, ABI or linking, never what the code
+  means, so a reviewer can skim them. Untagged unions change meaning, so
+  they get a keyword instead.
+- `@name` is one token, so a highlighter needs only the lexer.
+
+Attributes so far: `@packed`, `@align(N)`, `@export`, `@export("name")`,
+`@section("name")`, `@interrupt`.
+
+### C layout for every record
+
+**Decided (2026-11-08), "for now".** Field order already fixes a record's
+layout, so every record uses C's rules: declaration order, natural
+alignment, C padding. No `repr(C)` to forget, and the layout reads off
+the declaration.
+
+- The compiler never reorders fields to save padding; ordering fields
+  well is the author's job.
+- `@packed` removes padding; `@align(N)` raises a type's alignment.
+- Integer enums have their integer type's layout. Enums with payloads have
+  an unspecified layout and cannot cross the C boundary.
+- `?*T` is a nullable C pointer.
+
+### `extern` functions
+
+**Decided (2026-11-08).**
+
+```
+extern fn write(fd: c.int, buf: *u8, n: usize) -> isize
+extern fn printf(format: *u8, ...) -> c.int
+```
+
+- An `extern fn` declares a C function and has no body.
+- Calling one is always `unsafe`, because C can do anything.
+- Parameters and results use integers, floats, pointers, `?*T`, records
+  and integer enums. Views and `str` cannot cross: pass a pointer and a
+  length.
+- `...` marks a C variadic function. It comes last, and only in an
+  `extern` declaration.
+- C's integer types come from a standard package: `c.int`, `c.long`,
+  `c.size_t`.
+- `@export` or `@export("name")` gives a function an unmangled symbol so
+  C can call it.
+- Library names and linking belong to the build system.
+
+### One calling convention
+
+**Decided (2026-11-08).** Every function uses the platform's C calling
+convention, so any `fn(...)` value can be passed to C as a callback, such
+as for `qsort` or an interrupt table. No separate `extern "C" fn` type.
+
+The cost is giving up a custom internal ABI. It is small: on x86-64 and
+AArch64 the C convention already returns records up to 16 bytes in
+registers. A view passes as a pointer and a length.
+
+### Untagged unions
+
+**Decided (2026-11-08).**
+
+```
+type Word union (bits: u32, value: f32)
+
+var w: Word = Word.(bits: 0x3F80_0000)
+let v: f32 = unsafe { w.value }
+```
+
+- Members are written like named tuple fields and read with `.`.
+- Reading a member requires `unsafe`, because it reinterprets bytes.
+  Writing one is safe: the danger is only in a later read of another
+  member, which is already `unsafe`.
+- The user asked whether unions should be `unsafe` more broadly. Marking
+  the declaration or writes `unsafe` would add noise without adding
+  safety. Making some reads safe, for unions whose members accept every
+  bit pattern such as `u32` and `[4]u8`, is possible later.
+- A union appears only in a `type` declaration, like an enum.
+
+### C strings
+
+**Decided (2026-11-08).** The built-in `c_string("text")` takes a string
+literal and produces a `*u8` to static, NUL-terminated bytes, computed at
+compile time. No new literal form like Rust's `c"..."`.
+
+### Interrupt handlers
+
+`@interrupt fn uart_isr()` sets the handler ABI. What a handler may
+safely touch is part of the concurrency design.
+
 ## Packages
 
 ### Packages are directories
@@ -941,9 +1048,8 @@ unsafe {
 - A lint requires a `// SAFETY:` comment above each `unsafe` block, so the
   reviewer reads why it is sound. From Rust's lints.
 
-**Deferred** to a part on C interop and layout: untagged unions, and an
-attribute syntax for packed and aligned layout, interrupt handlers and
-`extern` functions.
+Untagged unions, attributes and `extern` functions are in
+[C interop and layout](#c-interop-and-layout).
 
 The user asked whether a systems language needs storable references. The
 answer recorded here: safe code covers passing, returning, views and

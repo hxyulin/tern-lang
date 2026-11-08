@@ -12,6 +12,9 @@
 const commaSep1 = (rule) => seq(rule, repeat(seq(',', rule)), optional(','));
 const commaSep = (rule) => optional(commaSep1(rule));
 
+// Attributes before a declaration, on its own line or the line above.
+const attributes = ($) => repeat(seq(field('attribute', $.attribute), optional($._terminator)));
+
 // Braces hold items separated by line ends or `;`. Parentheses hold items
 // separated by commas.
 const lines = ($, rule) =>
@@ -60,6 +63,8 @@ module.exports = grammar({
       'pub',
       'unsafe',
       'uses',
+      'extern',
+      'union',
     ],
   },
 
@@ -80,11 +85,60 @@ module.exports = grammar({
     import_path: ($) => seq($.identifier, repeat(seq('.', $.identifier))),
 
     _declaration: ($) =>
-      choice($.function_declaration, $.type_declaration, $.global_declaration),
+      choice(
+        $.function_declaration,
+        $.extern_declaration,
+        $.type_declaration,
+        $.global_declaration,
+      ),
+
+    // @packed, @align(16), @export("reset_handler"). The compiler defines
+    // every attribute. An attribute may change layout, ABI or linking, but
+    // never what the code means.
+    attribute: ($) =>
+      seq(
+        field('name', $.attribute_name),
+        optional(seq(token.immediate('('), commaSep($._attribute_argument), ')')),
+      ),
+
+    attribute_name: (_) => /@[A-Za-z][A-Za-z0-9_]*/,
+
+    _attribute_argument: ($) => choice($.integer_literal, $.string_literal),
+
+    // extern fn write(fd: c.int, buf: *u8, n: usize) -> isize
+    // Calling one is always unsafe.
+    extern_declaration: ($) =>
+      seq(
+        attributes($),
+        optional(field('visibility', $.visibility)),
+        'extern',
+        'fn',
+        field('name', $.identifier),
+        field('parameters', $.extern_parameter_list),
+        optional(seq('->', field('result', $._type))),
+      ),
+
+    // `...` marks a C variadic function and comes last.
+    extern_parameter_list: ($) =>
+      seq(
+        '(',
+        optional(
+          seq(
+            $.parameter,
+            repeat(seq(',', $.parameter)),
+            optional(seq(',', $.variadic)),
+            optional(','),
+          ),
+        ),
+        ')',
+      ),
+
+    variadic: (_) => '...',
 
     // A top-level let or var. Only top-level declarations can be pub.
     global_declaration: ($) =>
       seq(
+        attributes($),
         optional(field('visibility', $.visibility)),
         field('binding', choice($.let_declaration, $.var_declaration)),
       ),
@@ -98,6 +152,7 @@ module.exports = grammar({
     // An unsafe fn can be called only inside an unsafe block.
     function_declaration: ($) =>
       seq(
+        attributes($),
         optional(field('visibility', $.visibility)),
         optional(field('safety', $.unsafe)),
         'fn',
@@ -140,11 +195,15 @@ module.exports = grammar({
     // type Name T. An enum appears only here, so every enum has a name.
     type_declaration: ($) =>
       seq(
+        attributes($),
         optional(field('visibility', $.visibility)),
         'type',
         field('name', $.identifier),
-        field('type', choice($._type, $.enum_type)),
+        field('type', choice($._type, $.enum_type, $.union_type)),
       ),
+
+    // type Word union (bits: u32, value: f32). Reading a member is unsafe.
+    union_type: ($) => seq('union', '(', commaSep1($.tuple_type_field), ')'),
 
     // enum { circle(radius: f32); empty }, enum u8 { nop = 0; halt = 1; _ }
     // A trailing `_` makes the enum open: every value of the integer type

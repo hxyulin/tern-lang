@@ -1,0 +1,192 @@
+================================================================================
+Attributes
+================================================================================
+
+@packed
+type Header (magic: u32, len: u16)
+
+@align(16) type Page [4096]u8
+
+@section(".text.boot") @export("reset_handler")
+pub fn reset() {
+    main()
+}
+
+@interrupt
+fn uart_isr() {
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_declaration
+    (attribute
+      (attribute_name))
+    (identifier)
+    (tuple_type
+      (tuple_type_field
+        (identifier)
+        (type_name
+          (identifier)))
+      (tuple_type_field
+        (identifier)
+        (type_name
+          (identifier)))))
+  (type_declaration
+    (attribute
+      (attribute_name)
+      (integer_literal))
+    (identifier)
+    (array_type
+      (integer_literal)
+      (type_name
+        (identifier))))
+  (function_declaration
+    (attribute
+      (attribute_name)
+      (string_literal
+        (string_content)))
+    (attribute
+      (attribute_name)
+      (string_literal
+        (string_content)))
+    (visibility)
+    (identifier)
+    (parameter_list)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list)))))
+  (function_declaration
+    (attribute
+      (attribute_name))
+    (identifier)
+    (parameter_list)
+    (block)))
+
+================================================================================
+Extern functions
+================================================================================
+
+extern fn write(fd: c.int, buf: *u8, n: usize) -> isize
+pub extern fn printf(format: *u8, ...) -> c.int
+extern fn abort()
+
+fn hello() {
+    unsafe {
+        let _: c.int = printf(c_string("hi %d\n"), 3)
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (extern_declaration
+    (identifier)
+    (extern_parameter_list
+      (parameter
+        (identifier)
+        (type_name
+          (identifier)
+          (identifier)))
+      (parameter
+        (identifier)
+        (pointer_type
+          (type_name
+            (identifier))))
+      (parameter
+        (identifier)
+        (type_name
+          (identifier))))
+    (type_name
+      (identifier)))
+  (extern_declaration
+    (visibility)
+    (identifier)
+    (extern_parameter_list
+      (parameter
+        (identifier)
+        (pointer_type
+          (type_name
+            (identifier))))
+      (variadic))
+    (type_name
+      (identifier)
+      (identifier)))
+  (extern_declaration
+    (identifier)
+    (extern_parameter_list))
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (unsafe_statement
+        (block
+          (let_declaration
+            (discard)
+            (type_name
+              (identifier)
+              (identifier))
+            (call_expression
+              (identifier)
+              (argument_list
+                (argument
+                  (call_expression
+                    (identifier)
+                    (argument_list
+                      (argument
+                        (string_literal
+                          (string_content)
+                          (escape_sequence))))))
+                (argument
+                  (integer_literal))))))))))
+
+================================================================================
+Untagged union
+================================================================================
+
+type Word union (bits: u32, value: f32)
+
+fn f() {
+    var w: Word = Word.(bits: 0x3F80_0000)
+    let v: f32 = unsafe { w.value }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_declaration
+    (identifier)
+    (union_type
+      (tuple_type_field
+        (identifier)
+        (type_name
+          (identifier)))
+      (tuple_type_field
+        (identifier)
+        (type_name
+          (identifier)))))
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (var_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (construct_expression
+          (identifier)
+          (tuple_literal
+            (tuple_field
+              (identifier)
+              (integer_literal)))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (unsafe_expression
+          (branch
+            (field_expression
+              (identifier)
+              (identifier))))))))

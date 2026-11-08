@@ -1,4 +1,4 @@
-["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as" "unsafe" "uses"] @keyword
+["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as" "unsafe" "uses" "extern" "union"] @keyword
 
 (unsafe) @keyword
 
@@ -47,3 +47,5 @@
 (variant name: (identifier) @constant)
 (variant_pattern name: (identifier) @constant)
 (global_use name: (identifier) @variable)
+(attribute_name) @attribute
+(variadic) @punctuation.special
