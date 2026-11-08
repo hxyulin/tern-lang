@@ -122,6 +122,9 @@ pub struct FileNames {
     pub locals: Vec<Span>,
     /// The local each binding declares, keyed by the start of its name.
     pub bindings: HashMap<u32, LocalId>,
+    /// The `shared` global each name in a `lock` takes, keyed by the start
+    /// of the name.
+    pub locks: HashMap<u32, DeclRef>,
 }
 
 pub struct Resolution {
@@ -171,6 +174,7 @@ pub fn resolve(program: &Program) -> Resolution {
                 types: vec![None; file.ast.types.len()],
                 locals: Vec::new(),
                 bindings: HashMap::new(),
+                locks: HashMap::new(),
             },
             diagnostics: Vec::new(),
         };
@@ -712,7 +716,9 @@ impl<'a> FileResolver<'a> {
                             self.program.file(decl.file).ast.decls[decl.index].kind,
                             DeclKind::Global { shared: true, .. }
                         );
-                        if !shared {
+                        if shared {
+                            self.out.locks.insert(global.name.span.start, decl);
+                        } else {
                             let text = self.name_text(global.name);
                             self.error(
                                 global.name.span,

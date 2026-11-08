@@ -1754,9 +1754,9 @@ Decided the same day:
   context into literals, `none`, `some.(...)`, `make` and array
   literals; an operator takes the type of its other operand. Assigning
   to a `let`, or passing it `inout`, is an error, and so is a call
-  statement that ignores a result. Not checked yet: `unsafe`
-  requirements, `shared` access, use after `sink`, exclusivity, the
-  `Format` parameter rule and constant initializers.
+  statement that ignores a result. The same pass checks `unsafe`,
+  `shared` access, moves, exclusivity, the `Format` parameter rule and
+  constant initializers.
 - **Parser:** hand-written recursive descent, one function per rule of
   the tree-sitter grammar. It prints its tree in tree-sitter's
   S-expression form, so the tests compare it with every corpus tree, and
@@ -1766,6 +1766,53 @@ Decided the same day:
   arenas and refer to each other by index.
 - **Scope:** the whole language except concurrency and the details of C
   interop, aiming first to compile `examples/ini`.
+
+**Leaning (2026-11-08):** details the safety checks had to settle. The
+user asked to finish the checks; these follow the decided rules where
+they reach, and fill gaps where they do not.
+
+- **What moves.** A type moves instead of copying when it holds a
+  `[..]T`, directly or through a record, tuple, array, enum payload,
+  optional or result. The compiler cannot tell that a record such as
+  `io.File` owns a descriptor, so such a record still copies (see Open
+  questions).
+- **A move takes a whole local.** Moving a moving type out of a field,
+  element, pointer or global is an error; code destructures the record
+  instead, or passes the whole record `sink`. A parameter passed
+  without `sink`, an `inout` parameter and a `for` binding do not own
+  their value, so they cannot be moved either.
+- **Where values move.** Binding, returning, assigning, storing in a
+  construction or array literal, `push`, and passing `sink`. Passing to
+  a plain parameter, interpolating and comparing do not move. `sink`
+  moves a local of any type; the others move only a moving type.
+- **Flow.** A local moved on any path that reaches a point counts as
+  moved there; `x = ...` gives it a value again. A local declared
+  outside a loop and moved on a path back to the loop's top is an
+  error. A `defer` moves what it passes `sink` when its block ends, so
+  the value stays usable until then.
+- **`match` payloads.** A payload bound by a `match` on a local belongs
+  to that local: moving the payload moves the local. A payload of a
+  `match` on a call's result is owned; on a field or global it is
+  borrowed.
+- **`unsafe`.** The body of an `unsafe fn` is not an `unsafe` block, so
+  each unchecked operation inside still sits in one, as std already
+  writes it. `volatile_load`, `volatile_store` and `from_pointer` need
+  `unsafe`, since they read or write through a pointer. Assigning to a
+  union member, and taking the address of a member or a C global with
+  `&`, does not read it, so needs no `unsafe`.
+- **Exclusivity** compares access paths: the same local or global, then
+  fields and constant indexes. Any other argument that overlaps an
+  `inout` one is an error, so `add(inout p.x, p.x)` is rejected; write
+  `let n: u32 = p.x` first.
+- **Constants** also include function names, whose addresses are fixed,
+  so an interrupt table or `heap.c_allocator` is a constant. Cycles
+  between `let` globals are not checked yet.
+- **`Format`** may be a parameter's whole type and nothing else.
+  `PanicInfo` holds one, so the same rule applies to it.
+- **Named function types.** A function value takes a named function type
+  from context, as a literal takes a newtype, and a value of a named
+  function type can be called. Without this, `[2]Handler` could not
+  hold functions.
 
 ## Deferred
 
@@ -1817,7 +1864,12 @@ Not in the first version. `[T]` is reserved for type arguments.
   nothing says whether `[]T` is read-only.
 - Unsafe function types. A function value with preconditions, such as an
   allocator's `free`, can be called without `unsafe`. One option is
-  `unsafe fn(...)` as a type.
+  `unsafe fn(...)` as a type. The same gap lets code call a C function
+  through a function value without `unsafe`.
+- Moving types the compiler cannot recognize. `io.File` owns a
+  descriptor but holds only a `c.int`, so it copies, and nothing stops
+  `close` on both copies. An attribute or keyword that marks a type as
+  moving would close this.
 
 Raised by the programs in `examples/` on 2026-11-08. They parse, but a
 checker would have to settle these. Dropping temporal safety settled

@@ -5,9 +5,12 @@
 //! `none`, a `some.(...)` or an array literal takes the type its position
 //! expects, and an operator takes the type of its other operand.
 //!
-//! Not checked yet: `unsafe` requirements, access to `shared` globals,
-//! use after `sink`, exclusivity of `inout` arguments, the rule that a
-//! `Format` is only a parameter, and constant global initializers.
+//! The same pass checks the local safety rules: `unsafe`, `shared`
+//! globals, moves (in [`moves`]), and exclusivity, the `Format` rule and
+//! constant initializers (in [`rules`]).
+
+mod moves;
+mod rules;
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,6 +26,7 @@ use crate::source::Span;
 use crate::types::{
     BuiltinNamed, EnumInfo, FnTy, IntTy, NamedDef, NamedId, NamedInfo, Ty, TyId, Types, Variant,
 };
+use moves::{LoopFlow, Moved};
 
 pub struct Checked {
     pub types: Types,
@@ -35,6 +39,7 @@ pub fn check(program: &Program, names: &Resolution) -> Checked {
         names,
         types: Types::new(),
         fn_tys: HashMap::new(),
+        move_only: HashMap::new(),
         diagnostics: Vec::new(),
     };
     for (i, file) in program.files.iter().enumerate() {
@@ -74,6 +79,25 @@ enum Item {
 struct LocalInfo {
     ty: TyId,
     mutable: bool,
+    owner: Owner,
+    /// How many loops enclose the binding.
+    loop_depth: usize,
+}
+
+/// Whether a function owns a local's value, which decides whether it can
+/// move it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// A `let` or `var` local, or a `sink` parameter.
+    Own,
+    /// A parameter passed without `sink`.
+    Param(Mode),
+    /// A `for` loop's binding.
+    Loop,
+    /// A payload bound by a `match` on this local.
+    Part(LocalId),
+    /// A payload bound by a `match` on a field, element or global.
+    Borrowed,
 }
 
 /// The function being checked.
@@ -83,8 +107,41 @@ struct Fx<'a> {
     /// `None` for a function that returns nothing, and outside functions.
     result: Option<TyId>,
     locals: HashMap<LocalId, LocalInfo>,
-    /// One entry per enclosing loop: whether it has a `break`.
-    loops: Vec<bool>,
+    /// One entry per enclosing loop.
+    loops: Vec<LoopFlow>,
+    in_unsafe: bool,
+    /// The globals the enclosing `lock` takes.
+    locked: Vec<DeclRef>,
+    /// Places being assigned to, and places whose address `&` takes. A
+    /// union member or C global here is not read.
+    written: HashSet<ExprId>,
+    addressed: HashSet<ExprId>,
+    /// The local that `x = ...` gives a new value, which may have been
+    /// moved.
+    assign_target: Option<ExprId>,
+    /// The locals moved on the way to the current point.
+    moved: Moved,
+    /// The locals a `defer` in an enclosing block passes `sink`.
+    deferred: Moved,
+}
+
+impl<'a> Fx<'a> {
+    fn new(file: FileId, ast: &'a Ast) -> Fx<'a> {
+        Fx {
+            file,
+            ast,
+            result: None,
+            locals: HashMap::new(),
+            loops: Vec::new(),
+            in_unsafe: false,
+            locked: Vec::new(),
+            written: HashSet::new(),
+            addressed: HashSet::new(),
+            assign_target: None,
+            moved: Moved::new(),
+            deferred: Moved::new(),
+        }
+    }
 }
 
 /// An enum's variants, each with its payload type, and whether the enum
@@ -103,6 +160,8 @@ struct Checker<'a> {
     names: &'a Resolution,
     types: Types,
     fn_tys: HashMap<DeclRef, TyId>,
+    /// Whether each type holds a `[..]T`, and so moves instead of copying.
+    move_only: HashMap<TyId, bool>,
     diagnostics: Vec<(FileId, Diagnostic)>,
 }
 
@@ -534,7 +593,22 @@ impl<'a> Checker<'a> {
         match (self.types.get(actual), self.types.get(expected)) {
             (Ty::Never | Ty::Error, _) | (_, Ty::Error) => true,
             (Ty::Array(_, a) | Ty::Growable(a), Ty::View(e)) => a == e,
+            // A function value takes a named function type from context,
+            // as a literal takes a newtype.
+            (Ty::Fn(_), Ty::Named(_)) => self.fn_underlying(expected) == Some(actual),
             _ => false,
+        }
+    }
+
+    /// The function type behind a named function type.
+    fn fn_underlying(&self, ty: TyId) -> Option<TyId> {
+        match &self.named_info(ty)?.def {
+            NamedDef::Plain { underlying, .. }
+                if matches!(self.types.get(*underlying), Ty::Fn(_)) =>
+            {
+                Some(*underlying)
+            }
+            _ => None,
         }
     }
 
@@ -651,20 +725,22 @@ impl<'a> Checker<'a> {
 
     fn decl(&mut self, file: FileId, decl: DeclRef, kind: &'a DeclKind) {
         let ast = &self.program.file(file).ast;
-        let mut fx = Fx {
-            file,
-            ast,
-            result: None,
-            locals: HashMap::new(),
-            loops: Vec::new(),
-        };
+        let mut fx = Fx::new(file, ast);
         match kind {
             DeclKind::Fn(f) => {
                 fx.result = f.result.map(|r| self.lower(file, r));
+                if let (Some(result), Some(ty)) = (fx.result, f.result) {
+                    self.no_format(file, ast.ty(ty).span, result);
+                }
                 for param in &f.params {
                     let ty = self.lower(file, param.ty);
+                    self.format_param(file, ast.ty(param.ty).span, ty);
+                    let owner = match param.mode {
+                        Mode::Sink => Owner::Own,
+                        mode => Owner::Param(mode),
+                    };
                     if let Some(name) = param.name {
-                        self.bind(&mut fx, name, ty, param.mode != Mode::Let);
+                        self.bind(&mut fx, name, ty, param.mode != Mode::Let, owner);
                     }
                 }
                 let diverges = self.block(&mut fx, &f.body);
@@ -683,35 +759,57 @@ impl<'a> Checker<'a> {
                     self.error(file, f.name.span, message);
                 }
             }
-            DeclKind::ExternFn { .. } => {
-                self.decl_fn_ty(decl);
-            }
-            DeclKind::ExternVar { ty, .. } => {
-                self.lower(file, *ty);
-            }
-            DeclKind::Type { .. } => {
-                self.named(NamedId::Decl(decl));
-            }
-            DeclKind::Global { local, .. } => match &local.binding {
-                Binding::Name { ty, .. } => {
-                    let ty = self.lower(file, *ty);
-                    self.check(&mut fx, local.value, ty);
+            DeclKind::ExternFn { params, result, .. } => {
+                let ty = self.decl_fn_ty(decl);
+                if let Ty::Fn(f) = self.types.get(ty).clone() {
+                    let spans = params.iter().map(|p| p.ty).chain(*result);
+                    let tys = f.params.iter().map(|(_, t)| *t).chain(f.result);
+                    for (span, ty) in spans.zip(tys) {
+                        self.no_format(file, ast.ty(span).span, ty);
+                    }
                 }
-                Binding::Destructure(fields) => {
-                    let value = self.value(&mut fx, local.value, None);
-                    let span = ast.expr(local.value).span;
-                    self.destructure(&mut fx, fields, value, span, false);
+            }
+            DeclKind::ExternVar { ty: ty_id, .. } => {
+                let ty = self.lower(file, *ty_id);
+                self.no_format(file, ast.ty(*ty_id).span, ty);
+            }
+            DeclKind::Type { def, .. } => {
+                let ty = self.named(NamedId::Decl(decl));
+                self.no_format_in_type(file, def, ty);
+            }
+            DeclKind::Global { local, .. } => {
+                match &local.binding {
+                    Binding::Name { ty: ty_id, .. } => {
+                        let ty = self.lower(file, *ty_id);
+                        self.no_format(file, ast.ty(*ty_id).span, ty);
+                        self.check(&mut fx, local.value, ty);
+                    }
+                    Binding::Destructure(fields) => {
+                        let value = self.value(&mut fx, local.value, None);
+                        let span = ast.expr(local.value).span;
+                        self.destructure(&mut fx, fields, value, span, false, Owner::Own);
+                    }
                 }
-            },
+                self.constant(file, local.value);
+            }
         }
     }
 
-    fn bind(&mut self, fx: &mut Fx, name: Name, ty: TyId, mutable: bool) {
+    fn bind(&mut self, fx: &mut Fx, name: Name, ty: TyId, mutable: bool, owner: Owner) {
         if let Some(&id) = self.names.files[fx.file.0 as usize]
             .bindings
             .get(&name.span.start)
         {
-            fx.locals.insert(id, LocalInfo { ty, mutable });
+            let loop_depth = fx.loops.len();
+            fx.locals.insert(
+                id,
+                LocalInfo {
+                    ty,
+                    mutable,
+                    owner,
+                    loop_depth,
+                },
+            );
         }
     }
 
@@ -724,6 +822,7 @@ impl<'a> Checker<'a> {
         value: TyId,
         span: Span,
         mutable: bool,
+        owner: Owner,
     ) {
         if self.types.is_error(value) {
             return;
@@ -752,6 +851,7 @@ impl<'a> Checker<'a> {
             }
             if let Some(ty) = field.ty {
                 let declared = self.lower(fx.file, ty);
+                self.no_format(fx.file, fx.ast.ty(ty).span, declared);
                 if !self.types.is_error(declared) && declared != *field_ty {
                     let message = format!(
                         "field `{name}` is `{}`, not `{}`",
@@ -760,7 +860,13 @@ impl<'a> Checker<'a> {
                     );
                     self.error(fx.file, fx.ast.ty(ty).span, message);
                 }
-                self.bind(fx, field.rename.unwrap_or(field.field), *field_ty, mutable);
+                self.bind(
+                    fx,
+                    field.rename.unwrap_or(field.field),
+                    *field_ty,
+                    mutable,
+                    owner,
+                );
             }
         }
     }
@@ -768,9 +874,23 @@ impl<'a> Checker<'a> {
     // Statements. Each returns whether it never finishes normally.
 
     fn block(&mut self, fx: &mut Fx, block: &Block) -> bool {
+        let deferred_before: HashSet<LocalId> = fx.deferred.keys().copied().collect();
         let mut diverges = false;
         for &stmt in &block.stmts {
             diverges |= self.stmt(fx, stmt);
+        }
+        // This block's `defer`s run at its end, and move what they sink.
+        let ended: Vec<LocalId> = fx
+            .deferred
+            .keys()
+            .filter(|id| !deferred_before.contains(id))
+            .copied()
+            .collect();
+        for id in ended {
+            let span = fx.deferred.remove(&id).expect("listed above");
+            if !diverges {
+                fx.moved.entry(id).or_insert(span);
+            }
         }
         diverges
     }
@@ -779,18 +899,21 @@ impl<'a> Checker<'a> {
         let span = fx.ast.stmt(id).span;
         match &fx.ast.stmt(id).kind {
             StmtKind::Local(local) => match &local.binding {
-                Binding::Name { name, ty } => {
-                    let ty = self.lower(fx.file, *ty);
+                Binding::Name { name, ty: ty_id } => {
+                    let ty = self.lower(fx.file, *ty_id);
+                    self.no_format(fx.file, fx.ast.ty(*ty_id).span, ty);
                     let value = self.check(fx, local.value, ty);
+                    self.consume(fx, local.value, ty);
                     if let Some(name) = name {
-                        self.bind(fx, *name, ty, local.mutable);
+                        self.bind(fx, *name, ty, local.mutable, Owner::Own);
                     }
                     matches!(self.types.get(value), Ty::Never)
                 }
                 Binding::Destructure(fields) => {
                     let value = self.value(fx, local.value, None);
+                    self.consume(fx, local.value, value);
                     let span = fx.ast.expr(local.value).span;
-                    self.destructure(fx, fields, value, span, local.mutable);
+                    self.destructure(fx, fields, value, span, local.mutable, Owner::Own);
                     false
                 }
             },
@@ -801,22 +924,32 @@ impl<'a> Checker<'a> {
             StmtKind::If(if_stmt) => {
                 let bool = self.types.bool();
                 self.check(fx, if_stmt.cond, bool);
+                let before = fx.moved.clone();
                 let then = self.block(fx, &if_stmt.then);
+                let after_then = std::mem::replace(&mut fx.moved, before.clone());
                 let otherwise = match &if_stmt.otherwise {
                     Some(Else::Block(block)) => self.block(fx, block),
                     Some(Else::If(stmt)) => self.stmt(fx, *stmt),
                     None => false,
                 };
+                let after_else = std::mem::take(&mut fx.moved);
+                fx.moved = moves::join(vec![(after_then, then), (after_else, otherwise)], before);
                 then && otherwise
             }
             StmtKind::Match { value, arms } => {
                 let scrutinee = self.value(fx, *value, None);
+                let owner = self.payload_owner(fx, *value);
                 let mut coverage = Coverage::default();
-                let mut all = true;
+                let before = fx.moved.clone();
+                let mut paths = Vec::new();
                 for arm in arms {
-                    self.patterns(fx, &arm.patterns, scrutinee, &mut coverage);
-                    all &= self.block(fx, &arm.body);
+                    fx.moved.clone_from(&before);
+                    self.patterns(fx, &arm.patterns, scrutinee, &mut coverage, owner);
+                    let diverges = self.block(fx, &arm.body);
+                    paths.push((std::mem::take(&mut fx.moved), diverges));
                 }
+                let all = paths.iter().all(|(_, d)| *d);
+                fx.moved = moves::join(paths, before);
                 let span = fx.ast.expr(*value).span;
                 self.exhaustive(fx, span, scrutinee, &coverage);
                 all
@@ -834,26 +967,35 @@ impl<'a> Checker<'a> {
                         iterable,
                     } => self.for_in(fx, *mutable, binding, iterable),
                 }
-                fx.loops.push(false);
-                self.block(fx, &for_loop.body);
-                let has_break = fx.loops.pop().expect("the loop was pushed");
-                matches!(for_loop.kind, ForKind::Forever) && !has_break
+                let forever = matches!(for_loop.kind, ForKind::Forever);
+                self.loop_body(fx, &for_loop.body, forever)
             }
             StmtKind::Break => {
                 match fx.loops.last_mut() {
-                    Some(has_break) => *has_break = true,
+                    Some(flow) => moves::union_into(&mut flow.breaks, &fx.moved),
                     None => self.error(fx.file, span, "`break` is only allowed inside a loop"),
                 }
                 true
             }
             StmtKind::Continue => {
-                if fx.loops.is_empty() {
-                    self.error(fx.file, span, "`continue` is only allowed inside a loop");
+                match fx.loops.last_mut() {
+                    Some(flow) => moves::union_into(&mut flow.continues, &fx.moved),
+                    None => self.error(fx.file, span, "`continue` is only allowed inside a loop"),
                 }
                 true
             }
             StmtKind::Defer(call) => {
-                if let Item::Value(ty) = self.expr(fx, *call, None)
+                // The call runs when the block ends, so what it passes
+                // `sink` stays usable until then.
+                let before = fx.moved.clone();
+                let item = self.expr(fx, *call, None);
+                let after = std::mem::replace(&mut fx.moved, before);
+                for (id, at) in after {
+                    if !fx.moved.contains_key(&id) {
+                        fx.deferred.insert(id, at);
+                    }
+                }
+                if let Item::Value(ty) = item
                     && !self.types.is_error(ty)
                 {
                     let message = format!(
@@ -864,7 +1006,38 @@ impl<'a> Checker<'a> {
                 }
                 false
             }
-            StmtKind::Unsafe(block) | StmtKind::Lock { body: block, .. } => self.block(fx, block),
+            StmtKind::Unsafe(block) => {
+                let outer = std::mem::replace(&mut fx.in_unsafe, true);
+                let diverges = self.block(fx, block);
+                fx.in_unsafe = outer;
+                diverges
+            }
+            StmtKind::Lock { globals, body } => {
+                if !fx.locked.is_empty() {
+                    self.error(
+                        fx.file,
+                        span,
+                        "`lock` blocks do not nest; take every global in one `lock a, b`",
+                    );
+                }
+                let outer = fx.locked.len();
+                for global in globals {
+                    let start = global.name.span.start;
+                    if let Some(&decl) = self.names.files[fx.file.0 as usize].locks.get(&start) {
+                        if fx.locked[outer..].contains(&decl) {
+                            let message = format!(
+                                "`{}` is already taken by this `lock`",
+                                self.text(fx.file, global.name.span)
+                            );
+                            self.error(fx.file, global.name.span, message);
+                        }
+                        fx.locked.push(decl);
+                    }
+                }
+                let diverges = self.block(fx, body);
+                fx.locked.truncate(outer);
+                diverges
+            }
             StmtKind::Assign { left, op, right } => {
                 self.assign(fx, *left, *op, *right);
                 false
@@ -904,15 +1077,41 @@ impl<'a> Checker<'a> {
             }
             (Some(result), Some(value)) => {
                 self.check(fx, value, result);
+                self.consume(fx, value, result);
             }
         }
     }
 
     fn assign(&mut self, fx: &mut Fx, left: ExprId, op: AssignOp, right: ExprId) {
+        // `x = ...` gives a moved local a value again; any other
+        // assignment reads it first.
+        let whole = paren_inner(fx, left);
+        let local = match (op, &fx.ast.expr(whole).kind) {
+            (AssignOp::Set, ExprKind::Name(_)) => {
+                match self.names.files[fx.file.0 as usize].exprs[whole.index()] {
+                    Some(Res::Local(id)) => Some(id),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if local.is_some() {
+            fx.assign_target = Some(whole);
+        }
+        let spine = rules::spine(fx, left);
+        fx.written.extend(&spine);
         let ty = self.value(fx, left, None);
+        for e in &spine {
+            fx.written.remove(e);
+        }
+        fx.assign_target = None;
         self.require_mutable(fx, left, "assign to");
         if op == AssignOp::Set {
             self.check(fx, right, ty);
+            self.consume(fx, right, ty);
+            if let Some(id) = local {
+                fx.moved.remove(&id);
+            }
             return;
         }
         if self.types.is_error(ty) {
@@ -957,16 +1156,21 @@ impl<'a> Checker<'a> {
                 self.check(fx, *start, ty);
                 self.check(fx, *end, ty);
                 if let Some(name) = name {
-                    self.bind(fx, *name, ty, mutable);
+                    // Bound inside the loop: each pass has its own.
+                    fx.loops.push(LoopFlow::default());
+                    self.bind(fx, *name, ty, mutable, Owner::Own);
+                    fx.loops.pop();
                 }
             }
             Iterable::Expr(e) => {
                 let ty = self.value(fx, *e, None);
                 let span = fx.ast.expr(*e).span;
                 let elem = self.element_of_iterable(fx, ty, span);
+                fx.loops.push(LoopFlow::default());
                 match binding {
                     Binding::Name { name, ty } => {
                         let declared = self.lower(fx.file, *ty);
+                        self.no_format(fx.file, fx.ast.ty(*ty).span, declared);
                         if !self.coerces(elem, declared) {
                             let message = format!(
                                 "the loop yields `{}`, not `{}`",
@@ -976,13 +1180,14 @@ impl<'a> Checker<'a> {
                             self.error(fx.file, fx.ast.ty(*ty).span, message);
                         }
                         if let Some(name) = name {
-                            self.bind(fx, *name, declared, mutable);
+                            self.bind(fx, *name, declared, mutable, Owner::Loop);
                         }
                     }
                     Binding::Destructure(fields) => {
-                        self.destructure(fx, fields, elem, span, mutable);
+                        self.destructure(fx, fields, elem, span, mutable, Owner::Loop);
                     }
                 }
+                fx.loops.pop();
             }
         }
     }
@@ -1018,13 +1223,27 @@ impl<'a> Checker<'a> {
 
     // Patterns.
 
-    fn patterns(&mut self, fx: &mut Fx, pats: &[PatId], scrutinee: TyId, coverage: &mut Coverage) {
+    fn patterns(
+        &mut self,
+        fx: &mut Fx,
+        pats: &[PatId],
+        scrutinee: TyId,
+        coverage: &mut Coverage,
+        owner: Owner,
+    ) {
         for &pat in pats {
-            self.pattern(fx, pat, scrutinee, coverage);
+            self.pattern(fx, pat, scrutinee, coverage, owner);
         }
     }
 
-    fn pattern(&mut self, fx: &mut Fx, pat: PatId, scrutinee: TyId, coverage: &mut Coverage) {
+    fn pattern(
+        &mut self,
+        fx: &mut Fx,
+        pat: PatId,
+        scrutinee: TyId,
+        coverage: &mut Coverage,
+        owner: Owner,
+    ) {
         let span = fx.ast.pat(pat).span;
         if self.types.is_error(scrutinee) {
             coverage.wildcard = true;
@@ -1053,7 +1272,7 @@ impl<'a> Checker<'a> {
                 }
                 match (payload, variant_payload) {
                     (Some(fields), Some(payload)) => {
-                        self.destructure(fx, fields, *payload, span, false);
+                        self.destructure(fx, fields, *payload, span, false, owner);
                     }
                     (Some(_), None) => {
                         self.error(fx.file, span, format!("`{text}` carries no payload"));
@@ -1252,13 +1471,19 @@ impl<'a> Checker<'a> {
             },
             ExprKind::Str(parts) => Item::Value(self.string(fx, parts, expected)),
             ExprKind::Paren(inner) => self.expr(fx, *inner, expected),
-            ExprKind::Unsafe(inner) => Item::Value(self.value(fx, *inner, expected)),
+            ExprKind::Unsafe(inner) => {
+                let outer = std::mem::replace(&mut fx.in_unsafe, true);
+                let ty = self.value(fx, *inner, expected);
+                fx.in_unsafe = outer;
+                Item::Value(ty)
+            }
             ExprKind::Tuple(fields) => Item::Value(self.tuple(fx, span, fields, expected)),
             ExprKind::Call { callee, args } => self.call(fx, span, *callee, args, expected),
             ExprKind::Field { value, name } => self.field(fx, e, *value, *name),
             ExprKind::Construct { ty, value } => self.construct(fx, span, *ty, *value, expected),
             ExprKind::Index { value, index } => Item::Value(self.index(fx, *value, index)),
             ExprKind::Deref(pointer) => {
+                self.require_unsafe(fx, span, "reading or writing through a pointer with `.*`");
                 let ty = self.value(fx, *pointer, None);
                 match self.types.get(ty) {
                     Ty::Pointer(elem) => Item::Value(*elem),
@@ -1292,9 +1517,10 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Match { value, arms } => {
                 let scrutinee = self.value(fx, *value, None);
+                let owner = self.payload_owner(fx, *value);
                 let mut coverage = Coverage::default();
                 for arm in arms {
-                    self.patterns(fx, &arm.patterns, scrutinee, &mut coverage);
+                    self.patterns(fx, &arm.patterns, scrutinee, &mut coverage, owner);
                 }
                 let value_span = fx.ast.expr(*value).span;
                 self.exhaustive(fx, value_span, scrutinee, &coverage);
@@ -1332,12 +1558,16 @@ impl<'a> Checker<'a> {
 
     fn name(&mut self, fx: &mut Fx, e: ExprId, name: Name, expected: Option<TyId>) -> Item {
         match self.names.files[fx.file.0 as usize].exprs[e.index()] {
-            Some(Res::Local(id)) => Item::Value(
-                fx.locals
-                    .get(&id)
-                    .map_or_else(|| self.types.error(), |l| l.ty),
-            ),
+            Some(Res::Local(id)) => {
+                self.use_local(fx, e, id, name.span);
+                Item::Value(
+                    fx.locals
+                        .get(&id)
+                        .map_or_else(|| self.types.error(), |l| l.ty),
+                )
+            }
             Some(Res::Decl(decl)) => {
+                self.use_decl(fx, e, decl, name.span);
                 let text = self.text(fx.file, name.span);
                 self.decl_item(decl, text)
             }
@@ -1503,16 +1733,16 @@ impl<'a> Checker<'a> {
             }
             for ((_, value), (_, ty)) in fields.iter().zip(&want) {
                 self.check(fx, *value, *ty);
+                self.consume(fx, *value, *ty);
             }
             return expected;
         }
         let fields: Vec<(String, TyId)> = fields
             .iter()
             .map(|(name, value)| {
-                (
-                    self.text(fx.file, name.span).to_owned(),
-                    self.value(fx, *value, None),
-                )
+                let ty = self.value(fx, *value, None);
+                self.consume(fx, *value, ty);
+                (self.text(fx.file, name.span).to_owned(), ty)
             })
             .collect();
         self.types.intern(Ty::Tuple(fields))
@@ -1527,6 +1757,7 @@ impl<'a> Checker<'a> {
             Ty::Array(len, elem) => {
                 for &e in elems {
                     self.check(fx, e, elem);
+                    self.consume(fx, e, elem);
                 }
                 if elems.len() as u64 != len {
                     let message = format!("expected {len} elements, found {}", elems.len());
@@ -1546,6 +1777,8 @@ impl<'a> Checker<'a> {
     fn field(&mut self, fx: &mut Fx, e: ExprId, value: ExprId, name: Name) -> Item {
         let text = self.text(fx.file, name.span);
         if let Some(Res::Decl(decl)) = self.names.files[fx.file.0 as usize].exprs[e.index()] {
+            let span = fx.ast.expr(e).span;
+            self.use_decl(fx, e, decl, span);
             return self.decl_item(decl, text);
         }
         let base = match self.expr(fx, value, None) {
@@ -1579,6 +1812,17 @@ impl<'a> Checker<'a> {
                         self.show(base)
                     );
                     self.error(fx.file, name.span, message);
+                }
+                let union = matches!(
+                    self.named_info(base),
+                    Some(NamedInfo {
+                        def: NamedDef::Union(_),
+                        ..
+                    })
+                );
+                if union && !fx.written.contains(&e) && !fx.addressed.contains(&e) {
+                    let what = format!("reading the union member `{text}`");
+                    self.require_unsafe(fx, name.span, &what);
                 }
                 Item::Value(ty)
             }
@@ -1720,6 +1964,7 @@ impl<'a> Checker<'a> {
     /// a tuple literal for a record, or one value in parentheses.
     fn construct_value(&mut self, fx: &mut Fx, value: ExprId, underlying: TyId) {
         self.check(fx, value, underlying);
+        self.consume(fx, value, underlying);
     }
 
     fn construct_builtin(
@@ -1883,7 +2128,12 @@ impl<'a> Checker<'a> {
                     Ty::Pointer(elem) => Some(*elem),
                     _ => None,
                 });
+                let spine = rules::spine(fx, operand);
+                fx.addressed.extend(&spine);
                 let ty = self.value(fx, operand, inner_expected);
+                for e in &spine {
+                    fx.addressed.remove(e);
+                }
                 if self.place(fx, operand).is_none() {
                     self.error(fx.file, span, "`&` takes a variable, field or element");
                 }
@@ -2061,10 +2311,17 @@ impl<'a> Checker<'a> {
         {
             return self.builtin_call(fx, span, name, Some(index), args, expected);
         }
+        self.unsafe_callee(fx, callee);
         match self.expr(fx, callee, None) {
             Item::Builtin(name) => self.builtin_call(fx, span, name, None, args, expected),
-            Item::Value(ty) => match self.types.get(ty).clone() {
+            Item::Value(ty) => match self.types.get(self.fn_underlying(ty).unwrap_or(ty)).clone() {
                 Ty::Fn(f) => {
+                    let modes: Vec<(ExprId, Mode)> = args
+                        .iter()
+                        .zip(&f.params)
+                        .map(|(arg, (mode, _))| (arg.value, *mode))
+                        .collect();
+                    self.exclusive(fx, &modes);
                     if f.params.len() != args.len() {
                         let message = format!(
                             "expected {} arguments, found {}",
@@ -2127,6 +2384,9 @@ impl<'a> Checker<'a> {
             self.require_mutable(fx, arg.value, "pass `inout`");
         } else {
             self.check(fx, arg.value, param);
+            if mode == Mode::Sink {
+                self.sink(fx, arg.value, param);
+            }
         }
     }
 
@@ -2155,6 +2415,9 @@ impl<'a> Checker<'a> {
         args: &[Arg],
         expected: Option<TyId>,
     ) -> Item {
+        if matches!(name, "volatile_load" | "volatile_store" | "from_pointer") {
+            self.require_unsafe(fx, span, &format!("`{name}`"));
+        }
         let wants_type_arg = matches!(name, "fill" | "from_address" | "cast" | "truncate");
         if wants_type_arg != type_arg.is_some() {
             let message = if wants_type_arg {
@@ -2223,6 +2486,7 @@ impl<'a> Checker<'a> {
                 }
             }
             "push" | "append" => {
+                self.exclusive(fx, &[(a, Mode::Inout), (args[1].value, Mode::Let)]);
                 let v = self.value(fx, a, None);
                 self.require_mutable(fx, a, "pass `inout`");
                 match self.types.get(v).clone() {
@@ -2233,6 +2497,7 @@ impl<'a> Checker<'a> {
                             self.types.intern(Ty::View(elem))
                         };
                         self.check(fx, args[1].value, item);
+                        self.consume(fx, args[1].value, item);
                     }
                     Ty::Error => {}
                     _ => {
@@ -2248,6 +2513,7 @@ impl<'a> Checker<'a> {
                     let message = format!("`free` takes a `[..]T`, not `{}`", self.show(v));
                     self.error(fx.file, fx.ast.expr(a).span, message);
                 }
+                self.sink(fx, a, v);
                 return Item::Nothing;
             }
             "copy" => {
