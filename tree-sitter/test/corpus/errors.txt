@@ -317,3 +317,41 @@ fn f() {
           (variant_pattern
             (identifier))
           (block))))))
+
+================================================================================
+Panic in a match expression arm
+================================================================================
+
+fn f() {
+    let k: Kind = match op { add { Kind.additive }; _ { panic("unknown operator") } }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (match_expression
+          (identifier)
+          (match_expression_arm
+            (variant_pattern
+              (identifier))
+            (branch
+              (field_expression
+                (identifier)
+                (identifier))))
+          (match_expression_arm
+            (discard)
+            (branch
+              (call_expression
+                (identifier)
+                (argument_list
+                  (argument
+                    (string_literal
+                      (string_content))))))))))))

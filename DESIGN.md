@@ -262,8 +262,8 @@ loops with known bounds. Code that cannot afford it uses
 `wrapping_add` for an intended wrap, or an `unsafe` `unchecked_add` where
 the author knows it cannot overflow.
 
-**Open:** what a trap does on each target, such as which handler runs on
-a microcontroller. It belongs with the runtime.
+A trap is a [`panic`](#stopping-the-program-panic) with a message the
+compiler writes.
 
 ### Strings and text
 
@@ -609,6 +609,34 @@ all wrapping is. The INI example uses this form.
 
 Rejected: `Result[T, E]` as a built-in generic. It uses the reserved
 `[T]` form but is longer in every signature.
+
+### Stopping the program: `panic`
+
+**Decided (2026-11-08).** The built-in `panic("message")` stops the
+program. It is for states the code cannot recover from and for
+unfinished paths while code is being written. Errors a caller can handle
+go through results, as above.
+
+```
+let k: Kind = match op {
+    add { Kind.additive }
+    _ { panic("parse_op: unknown operator") }
+}
+```
+
+- It is a function, not a keyword, and never returns. A `panic` call can
+  stand where any value is expected, as in the arm above, and a function
+  needs no `return` after one.
+- One built-in covers Rust's `panic!`, `todo!` and `unreachable!`, so
+  there is one way to stop.
+- Bounds, overflow and division traps take the same path, with a message
+  the compiler writes.
+- The user asked for a "bail" function. `panic` is used because `bail`
+  means an early error return in Rust's anyhow crate.
+
+**Open, with the runtime:** what stopping does on each target. Likely a
+message with the source location and an abort on hosted targets, and a
+handler the program provides on bare metal.
 
 ### No user generics; built-in generic types
 
