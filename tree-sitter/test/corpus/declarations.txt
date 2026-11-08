@@ -361,16 +361,16 @@ fn f() {
           arguments: (argument_list))))))
 
 ================================================================================
-Functions that use mutable globals
+Mutable globals and view results
 ================================================================================
 
 var counter: u32 = 0
 
-fn bump() uses inout counter {
+fn bump() {
     counter += 1
 }
 
-fn report(s: str, t: str) -> str in s uses counter, inout log.out {
+fn report(s: str, t: str) -> str {
     write(inout log.out, "{counter}")
     return s
 }
@@ -387,11 +387,6 @@ fn report(s: str, t: str) -> str in s uses counter, inout log.out {
   (function_declaration
     (identifier)
     (parameter_list)
-    (uses_clause
-      (global_use
-        (parameter_mode)
-        (global_name
-          (identifier))))
     (block
       (assignment_statement
         (identifier)
@@ -409,16 +404,6 @@ fn report(s: str, t: str) -> str in s uses counter, inout log.out {
           (identifier))))
     (type_name
       (identifier))
-    (identifier)
-    (uses_clause
-      (global_use
-        (global_name
-          (identifier)))
-      (global_use
-        (parameter_mode)
-        (global_name
-          (identifier)
-          (identifier))))
     (block
       (expression_statement
         (call_expression

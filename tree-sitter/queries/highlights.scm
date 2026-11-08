@@ -1,4 +1,4 @@
-["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as" "unsafe" "uses" "extern" "union" "lock"] @keyword
+["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as" "unsafe" "extern" "union" "lock"] @keyword
 
 (shared) @keyword
 

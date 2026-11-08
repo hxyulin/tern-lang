@@ -6,13 +6,13 @@ shared var rx: Ring = Ring.(head: 0, tail: 0)
 pub shared var ticks: u64 = 0
 
 @interrupt
-fn uart_isr() uses inout rx {
+fn uart_isr() {
     lock rx {
         push(inout rx, read_data_register())
     }
 }
 
-fn next_byte() -> ?u8 uses inout rx, ticks {
+fn next_byte() -> ?u8 {
     lock rx, ticks {
         if ticks == 0 {
             return none
@@ -21,7 +21,7 @@ fn next_byte() -> ?u8 uses inout rx, ticks {
     }
 }
 
-fn read_remote() uses inout net.queue {
+fn read_remote() {
     lock net.queue {
         clear(inout net.queue)
     }
@@ -58,11 +58,6 @@ fn read_remote() uses inout net.queue {
       (attribute_name))
     (identifier)
     (parameter_list)
-    (uses_clause
-      (global_use
-        (parameter_mode)
-        (global_name
-          (identifier))))
     (block
       (lock_statement
         (global_name
@@ -85,14 +80,6 @@ fn read_remote() uses inout net.queue {
     (optional_type
       (type_name
         (identifier)))
-    (uses_clause
-      (global_use
-        (parameter_mode)
-        (global_name
-          (identifier)))
-      (global_use
-        (global_name
-          (identifier))))
     (block
       (lock_statement
         (global_name
@@ -117,12 +104,6 @@ fn read_remote() uses inout net.queue {
   (function_declaration
     (identifier)
     (parameter_list)
-    (uses_clause
-      (global_use
-        (parameter_mode)
-        (global_name
-          (identifier)
-          (identifier))))
     (block
       (lock_statement
         (global_name

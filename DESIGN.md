@@ -43,8 +43,11 @@ Two observations about AI-assisted programming motivated a new language:
    signatures alone, in parallel. No checks cross function boundaries.
 3. **Systems level.** No garbage collector and no required runtime, so
    the language works for embedded targets and OS development.
-4. **Memory safe by default.** Hardware access and other unchecked
-   operations go in `unsafe` blocks.
+4. **Spatial memory safety.** Indexing is bounds-checked, there is no
+   null, and pointer arithmetic is a built-in. Use after free and
+   dangling views are not checked in the first version (see
+   [Temporal safety](#temporal-safety-not-checked)). Hardware access and
+   other unchecked operations go in `unsafe` blocks.
 5. **One way to do each thing at the syntax level**, with no paradigm
    forced on program structure. The user's first framing was
    "unopinionated, but not many ways to do the same thing".
@@ -99,7 +102,6 @@ The running list. Each new keyword needs a reason.
 | `import`, `as` | import a package, renaming it on a clash |
 | `pub` | visible outside the package |
 | `unsafe` | unchecked operations, and functions with unchecked preconditions |
-| `uses` | the mutable globals a function reads or writes |
 | `extern` | a C function declared without a body |
 | `union` | untagged unions, for C interop |
 | `shared` | a global reachable from interrupt handlers or other contexts |
@@ -765,10 +767,10 @@ is in [Concurrency](#concurrency).
 
 ## Concurrency
 
-Without storable references, tasks can share memory only through mutable
-globals, raw pointers (already `unsafe`), and library types built on
-`unsafe`. Everything else is a value that moves. So safe concurrency only
-needs rules for shared globals.
+Tasks share memory through mutable globals, views, raw pointers and
+library types built on `unsafe`. The design gives rules for globals only.
+A view shared with another context is unchecked, like every other view
+lifetime (see [Temporal safety](#temporal-safety-not-checked)).
 
 The user asked on 2026-11-08 for the syntax and design now. A compiler
 will not implement this for a long time.
@@ -782,13 +784,13 @@ will not implement this for a long time.
 shared var rx: Ring = Ring.(head: 0, tail: 0)
 
 @interrupt
-fn uart_isr() uses inout rx {
+fn uart_isr() {
     lock rx {
         push(inout rx, read_data_register())
     }
 }
 
-fn next_byte() -> ?u8 uses inout rx {
+fn next_byte() -> ?u8 {
     lock rx {
         return pop(inout rx)
     }
@@ -803,16 +805,17 @@ fn next_byte() -> ?u8 uses inout rx {
   decides what a lock does: mask interrupts on a single-core
   microcontroller, save interrupt state and take a spinlock in an SMP
   kernel, take a mutex in user space. The same source works in all three.
-- An `@interrupt` function's `uses` list may name only `shared` globals.
-  Since `uses` covers everything a function reaches, this is checked from
-  the handler's signature alone, with no whole-program analysis. The user
-  asked whether the compiler can check code in a parallel context or must
-  rely on the user; `uses` makes the check cheap.
-- `lock` blocks do not nest. `lock a, b { ... }` takes several globals in
-  a fixed order. A call inside a `lock` block cannot reach a function that
-  locks, which the callee's `uses` list shows. Together these rule out
-  deadlock.
+- The check is local: touching a `shared` global outside a `lock` block
+  is an error.
+- `lock` blocks do not nest lexically. `lock a, b { ... }` takes several
+  globals in a fixed order.
 - `lock` names globals only, not expressions.
+
+Not checked, since `uses` lists were dropped on 2026-11-08: that an
+interrupt handler reaches only `shared` globals, and that a call inside
+`lock` does not reach another `lock`, which could deadlock. Both need to
+know every global a callee touches. The author and the reviewer check
+them, as in C.
 
 `shared` is a keyword, not an attribute, because it changes which rules
 apply; attributes never change what code means.
@@ -888,6 +891,35 @@ which inflates the diff a reviewer reads.
 No garbage collector, because the language targets embedded and kernel
 code (goal 3). The model has these layers.
 
+### Temporal safety: not checked
+
+**Decided (2026-11-08).** The first version checks spatial safety only:
+bounds, null, and use after `sink`. It does not check that a view or
+pointer outlives what it points into. This is where Zig and Odin stand.
+
+The earlier design checked temporal safety without lifetimes: views could
+not be stored in fields or globals, a returned view named its source with
+`in`, and functions listed their globals with `uses`. The example programs
+showed the cost. A parser that returns `pair(key: str, value: str)` needed
+a new kind of type, a view type, that every containing type inherits. The
+user judged that this is not clearly simpler than Rust's lifetimes, and
+asked to drop the requirement from the initial design.
+
+What safe code can now do wrong:
+
+```
+var all: List[Line] = ...
+push(inout all, try ini.parse_line(text[0..n]))
+free(inout text)        // compiles; each Line in all now dangles
+```
+
+A reviewer has to catch this, as in C and Zig. The mitigations need no
+syntax: a debug allocator that poisons freed memory and detects use after
+free, as Zig's does, and sanitizers.
+
+The syntax keeps the door open. A later checker could be a lint over the
+same code, so this decision can be reversed without changing programs.
+
 ### Bounds checks, no null, no pointer arithmetic
 
 **Decided.** Safe code gets bounds-checked indexing, no null, and no
@@ -923,10 +955,10 @@ against the Google Research listing and the authors' preprint.
 
 ### Second-class references and parameter modes
 
-**Decided.** A safe reference is a way to pass a parameter, not a type. It
-cannot be stored in a variable or a field, or returned (except views,
-below). It always points into a caller's frame and ends when the call
-returns, so it cannot dangle and needs no lifetime annotations.
+**Decided.** A reference parameter is a way to pass a parameter, not a
+type. It cannot be stored in a variable or a field, or returned. It
+always points into a caller's frame and ends when the call returns.
+Views, below, are the storable kind of reference, and are not checked.
 
 Parameter modes:
 
@@ -970,44 +1002,52 @@ swap(inout v[i], inout v[j])    // error: i != j is not provable
 Built-ins such as `swap_at(inout v, i, j)` cover the indexed case. From
 Swift's Law of Exclusivity (Swift Evolution proposal SE-0176).
 
-Because references never alias, the backend can mark every reference
-parameter `noalias`.
+The check stays after temporal safety was dropped, because it is local to
+one call. It no longer proves that an `inout` parameter is unaliased: the
+callee can reach the same value through a global, a view or a pointer.
+
+**Open:** whether that aliasing is undefined behavior, as for Fortran
+arguments and C's `restrict`. If it is, the backend can mark every
+`inout` parameter `noalias`; if not, it cannot.
 
 ### Views
 
 **Decided.** Slices are a built-in view type, `[]T`, and `str` is a byte
-view. The user called slices "a big issue" for strictly second-class
-references: without views, `fn trim(s: str) -> str` is illegal.
+view. A view is a pointer and a length into memory owned by something
+else.
 
-Rules:
-
-1. A view can be a local variable, a parameter or a return value. It
-   cannot be a struct field or a global.
-2. A function that returns a view takes exactly one view or reference
-   parameter, and the result borrows from that argument. This is Rust's
-   lifetime elision without named lifetimes.
-
-   **Decided (2026-11-08):** a function with more than one such parameter
-   names the one the result borrows from with `in`:
-   `fn find(haystack: str, needle: str) -> ?str in haystack`. It reads
-   "returns a str inside haystack" and reuses a keyword where `from` would
-   add one.
-3. While a view of `v` is live in a function, the function cannot mutate,
-   move or resize `v`.
+**Decided (2026-11-08):** views are ordinary values. A view can be a
+local, a parameter, a return value, a field, an enum payload or a global.
+Nothing checks that it outlives what it points into (see
+[Temporal safety](#temporal-safety-not-checked)).
 
 ```
+pub type Line enum {
+    section(name: str)
+    pair(key: str, value: str)
+}
+
 fn trim(s: str) -> str { ... }
-
-var line: String = read_line()
-let t: str = trim(line)       // t borrows line
-print(t)
-push(inout line, 'x')         // fine: t is not used again
+fn find(haystack: str, needle: str) -> ?str { ... }
 ```
 
-Rule 3 needs a borrow check, but only within one function: compare each
-view's live range with later writes to what it borrows. That is the cheap
-part of Rust's non-lexical lifetimes. Rust's cost comes from lifetimes in
-signatures and structs, which rules 1 and 2 exclude.
+A string literal is a view of static data, so `let prompt: str = "> "`
+is a valid global.
+
+Rejected on 2026-11-08 with temporal safety: views only as locals,
+parameters and results; `-> ?str in haystack` to name the source of a
+returned view; a borrow check within each function; and `view type` for
+types that hold views.
+
+### Length
+
+**Decided (2026-11-08).** Arrays and views have a `.len` property:
+`buf.len`, `s[1..].len`. Length is part of what these values are, so it
+reads as a property, not a call. For `[N]T` it is the constant `N`. The
+name `len` is still free for fields of user types.
+
+Library types such as the growable array use functions, as in Java,
+where an array has `length` and a list has `size()`.
 
 ### Slicing
 
@@ -1017,12 +1057,6 @@ only inside brackets. `s[..]` is not allowed; it is just `s`.
 
 **Open:** what indexing and slicing a `str` mean now that `str` is a byte
 view: byte offsets, as in Go, are the likely answer.
-
-**Open:** a `static str` type that points only to static data and can be
-stored anywhere, so string literals can go in struct fields.
-
-**Open:** a struct that holds input across calls, such as a parser. It
-stores an owned buffer plus offsets, or a raw pointer in `unsafe` code.
 
 ### Fixed arrays
 
@@ -1119,86 +1153,52 @@ unsafe {
 - A lint requires a `// SAFETY:` comment above each `unsafe` block, so the
   reviewer reads why it is sound. From Rust's lints.
 
+**Decided (2026-11-08):** `unsafe` stays after temporal safety was
+dropped, with a narrower promise. It marks raw pointer dereferences, union
+reads, C calls and other operations that can break spatial safety, the
+lines a reviewer should read twice. It does not mean code outside it is
+free of memory errors: a view can dangle anywhere.
+
 Untagged unions, attributes and `extern` functions are in
 [C interop and layout](#c-interop-and-layout).
 
-The user asked whether a systems language needs storable references. The
-answer recorded here: safe code covers passing, returning, views and
-graphs, and the rest is unsafe in Rust too. What the design leaves out is
-Rust's middle tier, safe references stored in structs (`&'a T`), which
-requires lifetime parameters, variance and region inference across
-functions.
+The user asked whether a systems language needs storable references.
+With temporal safety dropped, views are the storable reference, and raw
+pointers cover the rest. Rust's safe references stored in structs
+(`&'a T`) need lifetime parameters, variance and region inference across
+functions, which this design leaves out.
 
 ### Mutable globals
 
-**Decided (2026-11-08).** A function lists the mutable globals it touches
-in its signature, with `uses`. Reading or writing a global is then safe,
-with no `unsafe` and no runtime cost.
+**Decided (2026-11-08).** A `var` global can be read and written from any
+function in its package, or from anywhere if it is `pub`. No annotation
+and no `unsafe`.
 
 ```
 var counter: u32 = 0
 
-fn bump() uses inout counter {
+fn bump() {
     counter += 1
 }
-
-fn report() uses counter, inout log.out {
-    write(inout log.out, "{counter}")
-}
 ```
 
-The problem it solves, even without threads: a callee can reach a global
-behind the caller's back, which breaks both local checks.
-
-```
-var buf: Buffer = ...
-
-fn reset() uses inout buf { clear(inout buf) }
-
-fn f() uses inout buf {
-    let v: []u8 = buf.data[0..4]
-    reset()          // error: reset writes buf while v is a live view of it
-    print(v)
-}
-```
-
-Without `uses`, `f` could not see that `reset` frees what `v` points
-into, and `bump(inout counter)` would alias if `bump` also wrote
-`counter` directly, making `noalias` wrong.
-
-Rules:
-
-- `uses g` lets a function read `g`. `uses inout g` lets it write `g`
-  too. A global acts like a hidden parameter with that mode.
-- A body may touch a global only if the signature lists it, and every call
-  in the body must be covered by the caller's own list. This is checked
-  from signatures alone.
-- At each call, the compiler compares the callee's list with the caller's
-  live views and `inout` arguments, the same exclusivity and view checks
-  as for parameters.
-- `let` globals cannot change and need no `uses`.
 - Global initializers are constant: literals, constructions and other
   constants. Nothing runs before `main`, matching "no user code at
   compile time".
-- A function with a `uses` list cannot become a `fn(...)` value, which
-  would hide its global access. Function types may carry `uses` later if
-  needed.
+- A global reachable from an interrupt handler is declared `shared` and
+  accessed inside `lock`. See [Concurrency](#concurrency).
 
-Cost, accepted by the user: the list propagates. If a deep helper starts
-writing a global, every caller up the chain adds it, as with Java's
-checked exceptions. A global used everywhere, such as a logger, can be
-passed as an `inout` parameter instead.
+Rejected on 2026-11-08 with temporal safety: `uses` lists, where each
+function named the globals it and its callees read, or with `inout`
+wrote. They let the compiler check that a callee could not free what the
+caller held a view into, and check interrupt handlers from their
+signatures. The cost was a list that propagates up every caller, as with
+Java's checked exceptions, and it leaked private globals into other
+packages' signatures. Without view checks, little of the benefit was
+left.
 
-Rejected: Swift's dynamic exclusivity checks for globals. Shorter
-signatures, but a flag check per access and a rule invisible in review.
-Also rejected: the earlier leaning, which required `unsafe` for every
-access.
-
-Interrupt handlers preempt even on one core, so a plain `var` global is
-not safe to share with one. See [Concurrency](#concurrency) for `shared`
-globals.
-
-**Open:** whether `unsafe` code may touch a global without listing it.
+Also rejected earlier: Swift's dynamic exclusivity checks for globals,
+and requiring `unsafe` for every access to a global.
 
 ### Cleanup: `defer`
 
@@ -1240,6 +1240,8 @@ Rejected on 2026-11-08:
   unbounded chain. Many embedded and kernel targets have no heap.
 - **First-class references with lifetimes** (Rust): the frontend cost flux
   ran into, and the main source of difficulty when reading Rust.
+- **Second-class views with `uses` lists** (this design until
+  2026-11-08): see [Temporal safety](#temporal-safety-not-checked).
 
 ## Compiler design
 
@@ -1254,8 +1256,8 @@ Rejected on 2026-11-08:
 - No user code runs at compile time.
 - Without user generics, one source function becomes about one backend
   function. keel is the likely backend.
-- The safety checks are local: exclusivity at each call site, and view
-  liveness within each function. Nothing crosses function boundaries.
+- The safety checks are local: bounds, null, use after `sink`, and
+  exclusivity at each call site. Nothing crosses function boundaries.
 
 ## Deferred
 
@@ -1266,12 +1268,11 @@ internal ones. Without iterators, `for` works only on built-in arrays,
 views and ranges.
 
 Candidate A, external iterators without traits. The compiler knows the
-`next` protocol by name, as in Zig. An iterator that holds a view needs a
-**view struct**, a struct that may contain views and follows the view
-rules itself. This is Rust's `struct Iter<'a>` with one implicit lifetime.
+`next` protocol by name, as in Zig. Since views can be fields, an
+iterator is an ordinary struct holding a view.
 
 ```
-view type LineIter (rest: str)
+type LineIter (rest: str)
 
 fn lines(s: str) -> LineIter { ... }
 fn next(it: inout LineIter) -> ?str { ... }
@@ -1332,18 +1333,14 @@ Not in the first version. `[T]` is reserved for type arguments.
 - What an interpolated string produces at runtime, which depends on the
   allocator model.
 - The allocator model, and whether a built-in map exists.
-- `static str`, and how long-lived structs refer to input.
 - Iterators and nested functions (see Deferred).
 - The language's name.
 
 Raised by the programs in `examples/` on 2026-11-08. They parse, but a
-checker would have to settle these:
+checker would have to settle these. Dropping temporal safety settled
+views in enum payloads, `uses` across packages, global `str` constants
+and length.
 
-- **Views in enum payloads.** The natural parser result is
-  `type Line enum { section(name: str); pair(key: str, value: str) }`,
-  borrowing from the input line. View rule 1 forbids views in struct
-  fields; whether enum payloads and returned named tuples count is not
-  decided. This is the view-struct question from Iterators again.
 - **Payload bindings cannot be renamed.** `some(value: u8)` binds
   `value`, so a match nested inside another arm shadows the outer
   `value`.
@@ -1353,19 +1350,10 @@ checker would have to settle these:
   each arm.
 - **A fallible call in `defer`.** `defer io.close(inout f)` ignores a
   result, which is otherwise an error.
-- **Private globals in another package's `uses`.** `main` calls
-  `board.read_byte()`, so it must list `uses inout board.rx`, which
-  `board` keeps private.
-- **Interrupt handlers and `fn` values.** A handler has a `uses` list, so
-  it cannot be a `fn()` value in a vector table. The example exports it
-  by symbol name instead.
 - **Constant initializers.** Whether `from_address[*Regs](0x4000_C000)`
   counts as constant in a global, and whether it needs `unsafe`, since
   creating a pointer is safe.
 - **`str` and `[]u8`.** The examples write `str.(line[..n])`. Whether
   the two are the same type is not decided.
-- **A global `str` constant.** A `let` global cannot hold a view, so
-  `let prompt: str = "> "` waits on `static str`.
-- **Length.** The examples use a built-in `len(s)`.
 - **Import roots.** The examples import packages from their own project
   as `import board`. How a path resolves to a directory is not decided.

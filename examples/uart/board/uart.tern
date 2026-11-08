@@ -31,11 +31,10 @@ pub fn init(baud_divisor: u32) {
     }
 }
 
-// The vector table refers to this symbol by name. A function with a uses
-// list cannot be a fn() value, so the table cannot hold it directly.
+// The vector table in the startup assembly refers to this symbol by name.
 @interrupt
 @export("UART0_IRQHandler")
-pub fn isr() uses inout rx, inout overruns {
+pub fn isr() {
     for rx_ready() {
         let b: u8 = read_data()
         lock rx, overruns {
@@ -46,14 +45,14 @@ pub fn isr() uses inout rx, inout overruns {
     }
 }
 
-pub fn read_byte() -> ?u8 uses inout rx {
+pub fn read_byte() -> ?u8 {
     lock rx {
         return ring.pop(inout rx)
     }
 }
 
 // Returns the bytes dropped since the last call.
-pub fn take_overruns() -> u32 uses inout overruns {
+pub fn take_overruns() -> u32 {
     lock overruns {
         let n: u32 = overruns
         overruns = 0

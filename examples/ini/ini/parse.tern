@@ -19,14 +19,14 @@ pub type ParseError enum {
 
 pub fn parse_line(line: str) -> Line ! ParseError {
     let t: str = trim(strip_comment(line))
-    if len(t) == 0 {
+    if t.len == 0 {
         return ok.(value: Line.blank)
     }
     if t[0] == '[' {
-        if t[len(t) - 1] != ']' {
+        if t[t.len - 1] != ']' {
             return err.(error: ParseError.unclosed_section)
         }
-        let name: str = trim(t[1..len(t) - 1])
+        let name: str = trim(t[1..t.len - 1])
         return ok.(value: Line.section.(name: name))
     }
     match index_of(t, '=') {
@@ -35,7 +35,7 @@ pub fn parse_line(line: str) -> Line ! ParseError {
         }
         some(value: usize) {
             let key: str = trim(t[..value])
-            if len(key) == 0 {
+            if key.len == 0 {
                 return err.(error: ParseError.empty_key)
             }
             let rest: str = trim(t[value + 1..])
@@ -45,7 +45,7 @@ pub fn parse_line(line: str) -> Line ! ParseError {
 }
 
 fn strip_comment(s: str) -> str {
-    for let i: usize in 0..len(s) {
+    for let i: usize in 0..s.len {
         match s[i] {
             ';' {
                 return s[..i]
@@ -62,7 +62,7 @@ fn strip_comment(s: str) -> str {
 
 fn trim(s: str) -> str {
     var a: usize = 0
-    var b: usize = len(s)
+    var b: usize = s.len
     for a < b && is_space(s[a]) {
         a += 1
     }
@@ -77,7 +77,7 @@ fn is_space(c: u8) -> bool {
 }
 
 fn index_of(s: str, c: u8) -> ?usize {
-    for let i: usize in 0..len(s) {
+    for let i: usize in 0..s.len {
         if s[i] == c {
             return some.(value: i)
         }

@@ -1,8 +1,8 @@
 ================================================================================
-Borrowed result and sink at the call site
+View result and sink at the call site
 ================================================================================
 
-fn find(haystack: str, needle: str) -> ?str in haystack {
+fn find(haystack: str, needle: str) -> ?str {
     consume(sink f)
     return none
 }
@@ -24,7 +24,6 @@ fn find(haystack: str, needle: str) -> ?str in haystack {
     (optional_type
       (type_name
         (identifier)))
-    (identifier)
     (block
       (expression_statement
         (call_expression
@@ -43,7 +42,7 @@ Slices
 fn f() {
     let a: []u8 = buf[2..n]
     let b: []u8 = buf[i + 1..]
-    let c: []u8 = buf[..len(buf) - 1]
+    let c: []u8 = buf[..buf.len - 1]
     let d: u8 = buf[i]
 }
 
@@ -84,11 +83,9 @@ fn f() {
           (identifier)
           (slice
             (additive_expression
-              (call_expression
+              (field_expression
                 (identifier)
-                (argument_list
-                  (argument
-                    (identifier))))
+                (identifier))
               (integer_literal)))))
       (let_declaration
         (identifier)
@@ -320,3 +317,47 @@ fn f() {
         (array_literal
           (identifier)
           (identifier))))))
+
+================================================================================
+Views in fields, payloads and globals
+================================================================================
+
+let prompt: str = "> "
+
+type LineIter (rest: str)
+
+type Line enum {
+    pair(key: str, value: str)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (global_declaration
+    (let_declaration
+      (identifier)
+      (type_name
+        (identifier))
+      (string_literal
+        (string_content))))
+  (type_declaration
+    (identifier)
+    (tuple_type
+      (tuple_type_field
+        (identifier)
+        (type_name
+          (identifier)))))
+  (type_declaration
+    (identifier)
+    (enum_type
+      (variant
+        (identifier)
+        (tuple_type
+          (tuple_type_field
+            (identifier)
+            (type_name
+              (identifier)))
+          (tuple_type_field
+            (identifier)
+            (type_name
+              (identifier))))))))

@@ -141,7 +141,7 @@ fn f() {
     for let i: u32 in 0..n {
         g(i)
     }
-    for let j: u32 in a + 1..len(v) - 1 {
+    for let j: u32 in a + 1..v.len - 1 {
         g(j)
     }
     for var (k: Key, v: _) in pairs {
@@ -209,11 +209,9 @@ fn f() {
               (identifier)
               (integer_literal))
             (additive_expression
-              (call_expression
+              (field_expression
                 (identifier)
-                (argument_list
-                  (argument
-                    (identifier))))
+                (identifier))
               (integer_literal))))
         (block
           (expression_statement
