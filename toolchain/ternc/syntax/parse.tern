@@ -847,17 +847,301 @@ fn destruct_field(p: inout Parser) -> u32 ! Stop {
 fn block(p: inout Parser) -> Block ! Stop {
     let from: u32 = token_start(p)
     try expect(inout p, TokenKind.l_brace, "`\{`")
-    if next_kind(p) != TokenKind.r_brace {
-        return err.(error: not_parsed_yet(inout p, "statements"))
-    }
-    advance(inout p)
-    let stmts: List = List.(start: u32.(p.ast.extra.len), len: 0)
+    let stmts: List = try lines(inout p, statement_item)
     return ok.(value: Block.(stmts: stmts, span: span_from(p, from)))
+}
+
+fn statement_item(p: inout Parser) -> u32 ! Stop {
+    return ok.(value: u32.(try statement(inout p)))
+}
+
+fn add_stmt(p: inout Parser, k: StmtKind, from: u32) -> StmtId ! Stop {
+    let s: Stmt = Stmt.(kind: k, span: span_from(p, from))
+    try memory(push(inout p.ast.stmts, s))
+    return ok.(value: StmtId.(u32.(p.ast.stmts.len - 1)))
+}
+
+fn statement(p: inout Parser) -> StmtId ! Stop {
+    let from: u32 = token_start(p)
+    if next_kind(p) == TokenKind.kw_if {
+        return if_statement(inout p)
+    }
+    let k: StmtKind = try statement_kind(inout p)
+    return add_stmt(inout p, k, from)
+}
+
+fn statement_kind(p: inout Parser) -> StmtKind ! Stop {
+    match next_kind(p) {
+        kw_let, kw_var {
+            let l: Local = try local(inout p)
+            return ok.(value: StmtKind.local.(local: l))
+        }
+        kw_return {
+            advance(inout p)
+            match next_kind(p) {
+                semicolon, r_brace, eof {
+                    return ok.(value: StmtKind.return_stmt.(value: none))
+                }
+                _ {
+                    let value: ExprId = try expression(inout p)
+                    return ok.(value: StmtKind.return_stmt.(value: some.(value: value)))
+                }
+            }
+        }
+        kw_match {
+            advance(inout p)
+            let value: ExprId = try expression(inout p)
+            try expect(inout p, TokenKind.l_brace, "`\{`")
+            let arms: List = try lines(inout p, statement_arm)
+            return ok.(value: StmtKind.match_stmt.(value: value, arms: arms))
+        }
+        kw_for {
+            return for_statement(inout p)
+        }
+        kw_break {
+            advance(inout p)
+            return ok.(value: StmtKind.break_stmt)
+        }
+        kw_continue {
+            advance(inout p)
+            return ok.(value: StmtKind.continue_stmt)
+        }
+        kw_defer {
+            advance(inout p)
+            let call: ExprId = try postfix(inout p)
+            try require_call(inout p, call, ParseProblem.defer_needs_call)
+            return ok.(value: StmtKind.defer_stmt.(call: call))
+        }
+        kw_unsafe {
+            advance(inout p)
+            let body: Block = try block(inout p)
+            return ok.(value: StmtKind.unsafe_stmt.(body: body))
+        }
+        kw_lock {
+            advance(inout p)
+            let mark: usize = p.scratch.len
+            for {
+                let index: u32 = try global_name(inout p)
+                try gather(inout p, index)
+                if !eat(inout p, TokenKind.comma) {
+                    break
+                }
+            }
+            let globals: List = try finish(inout p, mark)
+            let body: Block = try block(inout p)
+            return ok.(value: StmtKind.lock_stmt.(globals: globals, body: body))
+        }
+        kw_try {
+            let value: ExprId = try unary(inout p)
+            return ok.(value: StmtKind.expr.(value: value))
+        }
+        ident, int, float, char, str, str_start, l_paren {
+            let left: ExprId = try postfix(inout p)
+            match assign_op(next_kind(p)) {
+                some(value as op: AssignOp) {
+                    advance(inout p)
+                    let right: ExprId = try expression(inout p)
+                    return ok.(value: StmtKind.assign.(left: left, op: op, right: right))
+                }
+                none {
+                    try require_call(inout p, left, ParseProblem.not_a_statement)
+                    return ok.(value: StmtKind.expr.(value: left))
+                }
+            }
+        }
+        _ {
+            return err.(error: expected(inout p, "a statement"))
+        }
+    }
+}
+
+fn require_call(p: inout Parser, e: ExprId, problem: ParseProblem) -> ! Stop {
+    let node: Expr = p.ast.exprs[usize.(e)]
+    match node.kind {
+        call(callee: _, args: _) {
+            return ok
+        }
+        _ {
+            return err.(error: fail_at(inout p, node.span, problem))
+        }
+    }
+}
+
+fn statement_arm(p: inout Parser) -> u32 ! Stop {
+    let pats: List = try patterns(inout p)
+    let body: Block = try block(inout p)
+    try memory(push(inout p.ast.arms, Arm.(patterns: pats, body: ArmBody.block.(body: body))))
+    return ok.(value: u32.(p.ast.arms.len - 1))
+}
+
+fn global_name(p: inout Parser) -> u32 ! Stop {
+    let first: Span = try name(inout p)
+    var g: GlobalName = GlobalName.(package: none, name: first)
+    if eat(inout p, TokenKind.dot) {
+        let second: Span = try name(inout p)
+        g = GlobalName.(package: some.(value: first), name: second)
+    }
+    try memory(push(inout p.ast.globals, g))
+    return ok.(value: u32.(p.ast.globals.len - 1))
+}
+
+fn if_statement(p: inout Parser) -> StmtId ! Stop {
+    let from: u32 = token_start(p)
+    advance(inout p)
+    let cond: ExprId = try expression(inout p)
+    let then: Block = try block(inout p)
+    var otherwise: ?Else = none
+    if eat(inout p, TokenKind.kw_else) {
+        if next_kind(p) == TokenKind.kw_if {
+            let nested: StmtId = try if_statement(inout p)
+            otherwise = some.(value: Else.if_stmt.(stmt: nested))
+        } else {
+            let body: Block = try block(inout p)
+            otherwise = some.(value: Else.block.(body: body))
+        }
+    }
+    let k: StmtKind = StmtKind.if_stmt.(cond: cond, then: then, otherwise: otherwise)
+    return add_stmt(inout p, k, from)
+}
+
+fn for_statement(p: inout Parser) -> StmtKind ! Stop {
+    advance(inout p)
+    let k: ForKind = try for_kind(inout p)
+    let body: Block = try block(inout p)
+    return ok.(value: StmtKind.for_stmt.(kind: k, body: body))
+}
+
+fn for_kind(p: inout Parser) -> ForKind ! Stop {
+    match next_kind(p) {
+        l_brace {
+            return ok.(value: ForKind.forever)
+        }
+        kw_let, kw_var {
+            let mutable: bool = next_kind(p) == TokenKind.kw_var
+            advance(inout p)
+            let b: Binding = try binding(inout p)
+            try expect(inout p, TokenKind.kw_in, "`in`")
+            let first: ExprId = try expression(inout p)
+            var iterable: Iterable = Iterable.value.(value: first)
+            if eat(inout p, TokenKind.dot_dot) {
+                try require_additive(inout p, first)
+                let end: ExprId = try expression(inout p)
+                try require_additive(inout p, end)
+                iterable = Iterable.range.(start: first, end: end)
+            }
+            return ok.(value: ForKind.for_in.(mutable: mutable, binding: b, iterable: iterable))
+        }
+        _ {
+            let cond: ExprId = try expression(inout p)
+            return ok.(value: ForKind.while_loop.(cond: cond))
+        }
+    }
+}
+
+// Range and slice bounds are arithmetic: anything that binds tighter than
+// comparison, except bitwise operators.
+fn require_additive(p: inout Parser, e: ExprId) -> ! Stop {
+    let node: Expr = p.ast.exprs[usize.(e)]
+    var arithmetic: bool = true
+    match node.kind {
+        binary(op: BinaryOp, left: _, right: _) {
+            let group: OpGroup = op_group(op)
+            arithmetic = group == OpGroup.additive || group == OpGroup.multiplicative
+        }
+        if_expr(cond: _, then: _, otherwise: _), match_expr(value: _, arms: _), unsafe_expr(body: _), array(elems: _) {
+            arithmetic = false
+        }
+        _ {
+        }
+    }
+    if arithmetic {
+        return ok
+    }
+    return err.(error: fail_at(inout p, node.span, ParseProblem.range_bound))
+}
+
+fn assign_op(k: TokenKind) -> ?AssignOp {
+    return match k {
+        eq { some.(value: AssignOp.set) }
+        plus_eq { some.(value: AssignOp.add) }
+        minus_eq { some.(value: AssignOp.sub) }
+        star_eq { some.(value: AssignOp.mul) }
+        slash_eq { some.(value: AssignOp.div) }
+        percent_eq { some.(value: AssignOp.rem) }
+        amp_eq { some.(value: AssignOp.bit_and) }
+        pipe_eq { some.(value: AssignOp.bit_or) }
+        caret_eq { some.(value: AssignOp.bit_xor) }
+        shl_eq { some.(value: AssignOp.shl) }
+        shr_eq { some.(value: AssignOp.shr) }
+        _ { none }
+    }
+}
+
+// Patterns.
+
+// One or more patterns separated by commas.
+fn patterns(p: inout Parser) -> List ! Stop {
+    let mark: usize = p.scratch.len
+    for {
+        let index: u32 = try pattern(inout p)
+        try gather(inout p, index)
+        if !eat(inout p, TokenKind.comma) {
+            return finish(inout p, mark)
+        }
+    }
+}
+
+fn pattern(p: inout Parser) -> u32 ! Stop {
+    let from: u32 = token_start(p)
+    let k: PatternKind = try pattern_kind(inout p)
+    let pat: Pattern = Pattern.(kind: k, span: span_from(p, from))
+    try memory(push(inout p.ast.pats, pat))
+    return ok.(value: u32.(p.ast.pats.len - 1))
+}
+
+fn pattern_kind(p: inout Parser) -> PatternKind ! Stop {
+    match next_kind(p) {
+        ident {
+            let n: Span = try name(inout p)
+            if eat(inout p, TokenKind.l_paren) {
+                let payload: List = try destructuring(inout p)
+                return ok.(value: PatternKind.variant.(name: n, payload: some.(value: payload)))
+            }
+            return ok.(value: PatternKind.variant.(name: n, payload: none))
+        }
+        int, char, str, str_start {
+            let value: ExprId = try primary(inout p)
+            return ok.(value: PatternKind.literal.(value: value))
+        }
+        minus {
+            advance(inout p)
+            if next_kind(p) != TokenKind.int {
+                return err.(error: expected(inout p, "an integer after `-` in a pattern"))
+            }
+            let value: ExprId = try primary(inout p)
+            return ok.(value: PatternKind.negative.(value: value))
+        }
+        underscore {
+            advance(inout p)
+            return ok.(value: PatternKind.discard)
+        }
+        _ {
+            return err.(error: expected(inout p, "a pattern"))
+        }
+    }
 }
 
 // Expressions.
 
 fn expression(p: inout Parser) -> ExprId ! Stop {
+    return err.(error: not_parsed_yet(inout p, "expressions"))
+}
+
+fn postfix(p: inout Parser) -> ExprId ! Stop {
+    return err.(error: not_parsed_yet(inout p, "expressions"))
+}
+
+fn unary(p: inout Parser) -> ExprId ! Stop {
     return err.(error: not_parsed_yet(inout p, "expressions"))
 }
 
