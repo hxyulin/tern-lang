@@ -86,28 +86,53 @@ pub fn build(root: &Path, out: &Path, options: &Options) -> Result<(), String> {
         return std::fs::write(out, module.to_string())
             .map_err(|e| format!("cannot write {}: {e}", out.display()));
     }
-    if options.optimize {
-        keel_opt::optimize(&mut module).map_err(|e| format!("internal error: {e}"))?;
-    }
+    let selection = if options.optimize {
+        optimize(&mut module)?;
+        keel_codegen::SelectionOptions::ALL
+    } else {
+        keel_codegen::SelectionOptions::default()
+    };
     if options.assembly_only {
-        let assembly = keel_codegen::compile(&module, host())
+        let assembly = keel_codegen::compile_with_options(&module, host(), selection)
             .map_err(|e| format!("internal error: code generation failed: {e}"))?;
         return std::fs::write(out, assembly)
             .map_err(|e| format!("cannot write {}: {e}", out.display()));
     }
     if host() == Target::Aarch64AppleDarwin {
-        let object = assemble(&module)?;
+        let object = assemble(&module, selection)?;
         return link_darwin(&object, out, options);
     }
-    link_with_clang(&module, out, options)
+    link_with_clang(&module, selection, out, options)
+}
+
+/// Runs keel's full pipeline, as `keel compile -O3` does, with the host's
+/// vector capabilities.
+fn optimize(module: &mut keel_ir::Module) -> Result<(), String> {
+    let internal = |e: &dyn std::fmt::Display| format!("internal error: {e}");
+    let selector = keel_codegen::OptionsSelector(keel_codegen::SelectionOptions::ALL);
+    let capabilities = keel_codegen::x86_features::vector_capabilities(host(), &selector)
+        .map_err(|e| internal(&e))?;
+    let vectors = if host() == Target::X86_64LinuxGnu {
+        keel_opt::VectorTarget::X86Sse2
+    } else {
+        keel_opt::VectorTarget::Aarch64Neon
+    };
+    keel_opt::Pipeline::named(keel_opt::OptimizationTier::Full.pipeline())
+        .map_err(|e| internal(&e))?
+        .context(keel_opt::OptimizationContext::new(vectors, capabilities))
+        .run(module)
+        .map_err(|e| internal(&e))
 }
 
 /// Assembles `module` for Apple arm64 in memory: code generation hands each
 /// function's instructions straight to keel's assembler, with no text.
-fn assemble(module: &keel_ir::Module) -> Result<Vec<u8>, String> {
+fn assemble(
+    module: &keel_ir::Module,
+    selection: keel_codegen::SelectionOptions,
+) -> Result<Vec<u8>, String> {
     let codegen_error =
         |e: keel_codegen::CodegenError| format!("internal error: code generation failed: {e}");
-    let selector = keel_codegen::OptionsSelector(keel_codegen::SelectionOptions::default());
+    let selector = keel_codegen::OptionsSelector(selection);
     let pipeline = keel_codegen::CodegenPipeline {
         selector: &selector,
         allocator: &keel_codegen::regalloc::AllocationTier::Full,
@@ -203,8 +228,13 @@ fn macos_sdk() -> Option<PathBuf> {
 
 /// Writes assembly next to `out` and has clang assemble and link it with
 /// the extra archives, objects and `-l` libraries.
-fn link_with_clang(module: &keel_ir::Module, out: &Path, options: &Options) -> Result<(), String> {
-    let assembly = keel_codegen::compile(module, host())
+fn link_with_clang(
+    module: &keel_ir::Module,
+    selection: keel_codegen::SelectionOptions,
+    out: &Path,
+    options: &Options,
+) -> Result<(), String> {
+    let assembly = keel_codegen::compile_with_options(module, host(), selection)
         .map_err(|e| format!("internal error: code generation failed: {e}"))?;
     let asm_path = out.with_extension("s");
     std::fs::write(&asm_path, assembly)

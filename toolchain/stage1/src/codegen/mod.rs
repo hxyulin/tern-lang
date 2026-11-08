@@ -59,6 +59,8 @@ pub fn generate(program: &Program, names: &Resolution, checked: Checked) -> Resu
         layouts: HashMap::new(),
         strings: HashMap::new(),
         grow: None,
+        panic_helpers: HashMap::new(),
+        panic_sites: 0,
         errors: Vec::new(),
     };
     g.module.decls.clear();
@@ -129,7 +131,21 @@ pub struct Gen<'a> {
     strings: HashMap<Vec<u8>, String>,
     /// The symbol of the helper that grows a `[..]T`, once made.
     grow: Option<String>,
+    /// The cold helper that reports each kind of panic: one per message
+    /// the compiler writes, and `None` for `panic(message)`.
+    panic_helpers: HashMap<Option<Vec<MessagePart>>, String>,
+    /// How many panic sites have their `PanicInfo` in data.
+    panic_sites: usize,
     errors: Vec<Error>,
+}
+
+/// A piece of a panic message the compiler writes: text, or a 64-bit
+/// integer the helper takes as a parameter.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum MessagePart {
+    Text(String),
+    Unsigned,
+    Signed,
 }
 
 /// How one parameter crosses a call.
@@ -352,6 +368,9 @@ impl<'a> Gen<'a> {
         let name = "tern.grow".to_owned();
         let mut f = Function::new(name.clone(), grow_signature());
         f.local = true;
+        // Callers test the capacity first, so this only runs to grow.
+        f.attrs.noinline = true;
+        f.attrs.cold = true;
         let entry = f.create_block();
         let v = f.append_block_param(entry, Type::Ptr);
         let size = f.append_block_param(entry, Type::I64);
@@ -436,6 +455,70 @@ impl<'a> Gen<'a> {
         f.ins(at(stored)).return_(&[one]);
         self.module.functions.push(f);
         self.grow = Some(name.clone());
+        name
+    }
+
+    /// A constant `PanicInfo` for a panic at `line` and `column` of `path`
+    /// in `function`, with an empty message the helper fills in.
+    pub fn panic_site(&mut self, path: &str, function: &str, line: u32, column: u32) -> String {
+        let info_ty = self.types.named_ty(crate::types::NamedId::Builtin(
+            crate::types::BuiltinNamed::PanicInfo,
+        ));
+        let mut fields: Vec<(u64, Vec<DataItem>)> = Vec::new();
+        for (field, text) in [("file", path), ("function", function)] {
+            let symbol = self.string_symbol(text.as_bytes());
+            let (_, off) = self.field(info_ty, field);
+            let len = i64::try_from(text.len()).expect("a short name");
+            fields.push((
+                off,
+                vec![
+                    DataItem::Ptr { symbol, addend: 0 },
+                    DataItem::Int {
+                        ty: Type::I64,
+                        value: len,
+                    },
+                ],
+            ));
+        }
+        for (field, n) in [("line", line), ("column", column)] {
+            let (_, off) = self.field(info_ty, field);
+            let value = i64::from(n);
+            fields.push((
+                off,
+                vec![DataItem::Int {
+                    ty: Type::I32,
+                    value,
+                }],
+            ));
+        }
+        fields.sort_by_key(|(off, _)| *off);
+        let layout = self.layout(info_ty);
+        let mut items = Vec::new();
+        let mut at = 0;
+        for (off, field) in fields {
+            if off > at {
+                items.push(DataItem::Zero(u32::try_from(off - at).expect("small")));
+            }
+            at = off + field.iter().map(DataItem::size).sum::<u64>();
+            items.extend(field);
+        }
+        if layout.size > at {
+            items.push(DataItem::Zero(
+                u32::try_from(layout.size - at).expect("small"),
+            ));
+        }
+        let name = format!("tern.panic_site.{}", self.panic_sites);
+        self.panic_sites += 1;
+        self.module.data.push(DataObject {
+            name: name.clone(),
+            local: true,
+            init: Some(DataInit {
+                constant: true,
+                align: u32::try_from(layout.align).expect("small"),
+                items,
+            }),
+            ..DataObject::default()
+        });
         name
     }
 

@@ -18,7 +18,7 @@ use keel_ir::{
 
 use super::data::{string_bytes, unescape};
 use super::layout::{EnumKind, Repr, int_type, type_size};
-use super::{Gen, Pass};
+use super::{Gen, MessagePart, Pass};
 use crate::ast::{
     Arg, AssignOp, Ast, BinaryOp, Binding, Block as AstBlock, DeclKind, DestructField, Else,
     ExprId, ExprKind, ForKind, IfElse, Index, Iterable, PatId, PatternKind, StmtId, StmtKind,
@@ -2082,78 +2082,146 @@ impl<'a> FnGen<'_, 'a> {
         let fail = self.f.create_block();
         self.brif(ok, pass, fail);
         self.switch_to(fail, true);
-        let pieces: Vec<FormatPiece> = message
-            .iter()
-            .map(|p| match p {
-                Piece::Text(t) => FormatPiece::Text(t.as_bytes().to_vec()),
+        let mut parts = Vec::new();
+        let mut values = Vec::new();
+        for piece in message {
+            match piece {
+                Piece::Text(t) => parts.push(MessagePart::Text((*t).to_owned())),
                 Piece::Unsigned(v) => {
-                    let ty = self.g.types.int(IntTy::U64);
-                    FormatPiece::Value(V::S(*v), ty)
+                    parts.push(MessagePart::Unsigned);
+                    values.push(*v);
                 }
                 Piece::Signed(v) => {
-                    let ty = self.g.types.int(IntTy::I64);
-                    FormatPiece::Value(V::S(*v), ty)
+                    parts.push(MessagePart::Signed);
+                    values.push(*v);
                 }
-            })
-            .collect();
-        let format_ty = self
-            .g
-            .types
-            .named_ty(NamedId::Builtin(BuiltinNamed::Format));
-        let message = self.format(&pieces, format_ty);
-        self.panic(message, span);
+            }
+        }
+        self.call_panic_helper(Some(parts), values, span);
         self.switch_to(pass, true);
     }
 
     /// Reports through the panic handler and aborts.
     fn panic(&mut self, message: V, span: Span) {
-        let info_ty = self
+        let format_ty = self
             .g
             .types
-            .named_ty(NamedId::Builtin(BuiltinNamed::PanicInfo));
-        if let Some(handler) = self.g.panic_handler()
-            && self
+            .named_ty(NamedId::Builtin(BuiltinNamed::Format));
+        let addr = self.spill(message, format_ty);
+        self.call_panic_helper(None, vec![addr], span);
+    }
+
+    /// Calls the cold helper that reports a panic with `message`, passing
+    /// `args` and the address of the site's constant `PanicInfo`. Without a
+    /// panic handler, aborts instead. Keeping the message and `PanicInfo`
+    /// out of the function keeps them out of its frame.
+    fn call_panic_helper(
+        &mut self,
+        message: Option<Vec<MessagePart>>,
+        mut args: Vec<Value>,
+        span: Span,
+    ) {
+        let has_info = self
+            .g
+            .types
+            .named
+            .contains_key(&NamedId::Builtin(BuiltinNamed::PanicInfo));
+        if has_info && self.g.panic_handler().is_some() {
+            let source = &self.g.program.file(self.file).source;
+            let position = source.position(span.start);
+            let path = source.path.display().to_string();
+            let site = self
                 .g
-                .types
-                .named
-                .contains_key(&NamedId::Builtin(BuiltinNamed::PanicInfo))
-        {
-            let info = self.temp(info_ty);
-            let format_ty = self
-                .g
-                .types
-                .named_ty(NamedId::Builtin(BuiltinNamed::Format));
-            let (_, off) = self.g.field(info_ty, "message");
-            let at = self.offset(info, off);
-            self.store(message, format_ty, at, false);
-            let position = self.g.program.file(self.file).source.position(span.start);
-            let path = self
-                .g
-                .program
-                .file(self.file)
-                .source
-                .path
-                .display()
-                .to_string();
-            let bytes_ty = self.g.types.bytes();
-            for (field, text) in [("file", path.as_str()), ("function", self.fn_name)] {
-                let v = self.string_view(text.as_bytes(), bytes_ty);
-                let (_, off) = self.g.field(info_ty, field);
-                let at = self.offset(info, off);
-                self.store(v, bytes_ty, at, false);
-            }
-            for (field, n) in [("line", position.line), ("column", position.column)] {
-                let (_, off) = self.g.field(info_ty, field);
-                let at = self.offset(info, off);
-                let v = self.iconst(Type::I32, i64::from(n));
-                self.ins().store(v, at);
-            }
-            let abi = self.g.decl_abi(handler);
-            let symbol = self.g.symbol(handler);
-            self.direct_call(&symbol, &abi, vec![CallArg::Addr(info)]);
+                .panic_site(&path, self.fn_name, position.line, position.column);
+            let site = Gen::data_addr(&mut self.f, self.block, &site);
+            args.push(site);
+            let params = panic_helper_params(message.as_deref());
+            let name = self.panic_helper(message);
+            let callee = self.f.import_function(&name, Signature::new(&params, &[]));
+            self.ins().call(callee, &args);
+        } else {
+            self.libc("abort", &[], &[], &[]);
         }
-        self.libc("abort", &[], &[], &[]);
         self.trap();
+    }
+
+    /// The cold helper for `message`, made the first time: it builds the
+    /// message and a `PanicInfo` from the site and calls the panic handler.
+    fn panic_helper(&mut self, message: Option<Vec<MessagePart>>) -> String {
+        if let Some(name) = self.g.panic_helpers.get(&message) {
+            return name.clone();
+        }
+        let name = format!("tern.panic.{}", self.g.panic_helpers.len());
+        self.g.panic_helpers.insert(message.clone(), name.clone());
+        let params = panic_helper_params(message.as_deref());
+        let mut f = Function::new(name.clone(), Signature::new(&params, &[]));
+        f.local = true;
+        f.attrs.cold = true;
+        f.attrs.noinline = true;
+        f.attrs.noreturn = true;
+        let entry = f.create_block();
+        let values: Vec<Value> = params
+            .iter()
+            .map(|t| f.append_block_param(entry, *t))
+            .collect();
+        let mut fx = FnGen {
+            g: &mut *self.g,
+            f,
+            file: self.file,
+            ast: self.ast,
+            fn_name: self.fn_name,
+            block: entry,
+            reachable: true,
+            terminated: HashSet::new(),
+            locals: HashMap::new(),
+            result: None,
+            sret: None,
+            defers: Vec::new(),
+            loops: Vec::new(),
+            joined: HashSet::new(),
+            pending_next: None,
+        };
+        let (&site, values) = values.split_last().expect("the site is a parameter");
+        let format_ty = fx.g.types.named_ty(NamedId::Builtin(BuiltinNamed::Format));
+        let text = match message {
+            None => V::M(values[0]),
+            Some(parts) => {
+                let mut values = values.iter();
+                let pieces: Vec<FormatPiece> = parts
+                    .into_iter()
+                    .map(|part| match part {
+                        MessagePart::Text(t) => FormatPiece::Text(t.into_bytes()),
+                        MessagePart::Unsigned => {
+                            let ty = fx.g.types.int(IntTy::U64);
+                            FormatPiece::Value(V::S(*values.next().expect("a value")), ty)
+                        }
+                        MessagePart::Signed => {
+                            let ty = fx.g.types.int(IntTy::I64);
+                            FormatPiece::Value(V::S(*values.next().expect("a value")), ty)
+                        }
+                    })
+                    .collect();
+                fx.format(&pieces, format_ty)
+            }
+        };
+        let info_ty =
+            fx.g.types
+                .named_ty(NamedId::Builtin(BuiltinNamed::PanicInfo));
+        let info = fx.temp(info_ty);
+        let size = fx.g.layout(info_ty).size;
+        fx.memcpy(info, site, size, false);
+        let (_, off) = fx.g.field(info_ty, "message");
+        let at = fx.offset(info, off);
+        fx.store(text, format_ty, at, false);
+        if let Some(handler) = fx.g.panic_handler() {
+            let abi = fx.g.decl_abi(handler);
+            let symbol = fx.g.symbol(handler);
+            fx.direct_call(&symbol, &abi, vec![CallArg::Addr(info)]);
+        }
+        fx.libc("abort", &[], &[], &[]);
+        fx.trap();
+        fx.finish();
+        name
     }
 
     // Calls.
@@ -2361,12 +2429,6 @@ impl<'a> FnGen<'_, 'a> {
                 };
                 let needed = self.ins().iadd(len, extra);
                 let size = self.usize_const(l.size);
-                let align = self.usize_const(l.align);
-                let grow = self.g.grow_symbol();
-                let grow_sig = super::grow_signature();
-                let callee = self.f.import_function(&grow, grow_sig);
-                let inst = self.ins().call(callee, &[v, size, align, needed]);
-                let grown = self.f.first_result(inst);
                 let out = self.temp(ty);
                 let (ok_variant, kind) = self.g.variant(ty, "ok");
                 let (err_variant, _) = self.g.variant(ty, "err");
@@ -2376,6 +2438,19 @@ impl<'a> FnGen<'_, 'a> {
                 let stored = self.f.create_block();
                 let failed = self.f.create_block();
                 let after = self.f.create_block();
+                // Only call tern.grow when the items do not fit.
+                let cap_addr = self.offset(v, 16);
+                let cap = self.ins().load(Type::I64, cap_addr);
+                let fits = self.ins().icmp(IntCC::Ule, needed, cap);
+                let grow_block = self.f.create_block();
+                self.brif(fits, stored, grow_block);
+                self.switch_to(grow_block, true);
+                let align = self.usize_const(l.align);
+                let grow = self.g.grow_symbol();
+                let grow_sig = super::grow_signature();
+                let callee = self.f.import_function(&grow, grow_sig);
+                let inst = self.ins().call(callee, &[v, size, align, needed]);
+                let grown = self.f.first_result(inst);
                 self.brif(grown, stored, failed);
                 self.switch_to(stored, true);
                 let ptr = self.ins().load(Type::Ptr, v);
@@ -2789,4 +2864,19 @@ fn changes_in_call(ast: &crate::ast::Ast, e: ExprId) -> bool {
         }
         ExprKind::Array(elems) => any(&mut elems.iter().copied()),
     }
+}
+
+/// A panic helper's parameters: a 64-bit integer for each value in the
+/// message, or the address of a `Format`, then the site's `PanicInfo`.
+fn panic_helper_params(message: Option<&[MessagePart]>) -> Vec<Type> {
+    let mut params: Vec<Type> = match message {
+        None => vec![Type::Ptr],
+        Some(parts) => parts
+            .iter()
+            .filter(|p| !matches!(p, MessagePart::Text(_)))
+            .map(|_| Type::I64)
+            .collect(),
+    };
+    params.push(Type::Ptr);
+    params
 }

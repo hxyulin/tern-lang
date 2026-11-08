@@ -1970,13 +1970,19 @@ not. The user agreed to each.
   keel's inliner skipped them all.
 - **Checks are inline.** Arithmetic uses keel's overflow instructions,
   and indexing, slicing, division, shifts and conversions compare
-  first. A failed check builds a `PanicInfo` whose message carries the
-  values (`index 5 out of bounds for length 3`), calls the
+  first. A failed check calls a cold helper with the values and the
+  address of the site's constant `PanicInfo`. There is one helper per
+  message (`index 5 out of bounds for length 3`), and one for
+  `panic(...)`. The helper fills in the message, calls the
   `@panic_handler` (the program's own, or std.rt's), and calls `abort`.
+  The function with the check keeps neither in its frame, so keel can
+  still inline it.
 - **`[..]T` grows through one helper,** `tern.grow`, which calls the
   array's allocator through its `alloc` or `resize` function value.
-- **`ternc build DIR`** writes an executable; `-O` runs keel's
-  optimizer, `-S` writes assembly and `--ir` keel's IR. Extra `.a` and
+  `push` and `append` compare the length with the capacity first and
+  call it only when the items do not fit.
+- **`ternc build DIR`** writes an executable; `-O` runs keel's full
+  pipeline and instruction selection, as `keel compile -O3` does, `-S` writes assembly and `--ir` keel's IR. Extra `.a` and
   `.o` arguments are linked with the program, and `-l NAME` links a
   system library: on macOS keel's linker reads the archive and the SDK's
   `libNAME.tbd`, elsewhere both go to clang. This stands in for the
