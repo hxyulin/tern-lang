@@ -1,0 +1,28 @@
+// The C library functions the standard library calls. Calling any of them
+// is unsafe.
+
+import std.c
+
+pub extern fn malloc(size: c.size_t) -> ?*u8
+pub extern fn realloc(p: ?*u8, size: c.size_t) -> ?*u8
+pub extern fn free(p: ?*u8)
+
+pub extern fn open(path: *u8, flags: c.int, ...) -> c.int
+pub extern fn close(fd: c.int) -> c.int
+pub extern fn read(fd: c.int, buf: *u8, n: c.size_t) -> c.ssize_t
+pub extern fn write(fd: c.int, buf: *u8, n: c.size_t) -> c.ssize_t
+
+pub extern fn getenv(name: *u8) -> ?*u8
+pub extern fn strlen(s: *u8) -> c.size_t
+
+// open's flag for reading, the same on macOS and Linux.
+pub let o_rdonly: c.int = c.int.(0)
+
+// The bytes of a NUL-terminated C string, without the NUL.
+//
+// The caller promises that p points to a NUL-terminated string that
+// outlives the view.
+pub unsafe fn text(p: *u8) -> []u8 {
+    // SAFETY: as the caller promises.
+    return unsafe { from_pointer(p, usize.(strlen(p))) }
+}

@@ -1,0 +1,55 @@
+// The hosted runtime: the C entry point, the program's arguments and the
+// default panic handler. The compiler links it into every hosted program.
+
+import std.c
+import std.heap
+import std.io
+import std.libc
+
+// The program's fn main() -> u8, which the compiler exports under this
+// name.
+extern fn tern_main() -> u8
+
+// Set once, before tern_main runs.
+var arguments: ?[][]u8 = none
+
+@export("main")
+fn c_main(argc: c.int, argv: **u8) -> c.int {
+    var all: [..][]u8 = make(heap.c_allocator)
+    let count: usize = usize.(i32.(argc))
+    for let i: usize in 0..count {
+        // SAFETY: C passes argc pointers to NUL-terminated strings that
+        // live as long as the program.
+        let arg: []u8 = unsafe { libc.text(offset(argv, i).*) }
+        match push(inout all, arg) {
+            ok {
+            }
+            err(error: OutOfMemory) {
+                panic("out of memory reading the program's arguments")
+            }
+        }
+    }
+    // all is never freed: the arguments live as long as the program.
+    arguments = some.(value: all)
+    // SAFETY: tern_main is the program's main, written in tern.
+    let status: u8 = unsafe { tern_main() }
+    return c.int.(i32.(status))
+}
+
+pub fn args() -> [][]u8 {
+    match arguments {
+        some(value: [][]u8) {
+            return value
+        }
+        none {
+            panic("os.args called before the runtime started")
+        }
+    }
+}
+
+// A program's own @panic_handler replaces this one. The runtime aborts
+// when it returns.
+@panic_handler
+fn default_panic(info: PanicInfo) {
+    io.eprint("panic: {info.message}\n  at {info.function} ({info.file}:{info.line}:{info.column})\n")
+}

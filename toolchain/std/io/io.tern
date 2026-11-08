@@ -1,0 +1,112 @@
+// Files and standard output, on top of the C library.
+
+import std.c
+import std.fmt
+import std.libc
+
+// Without errno, a failure says only which operation failed. Reading
+// errno needs a different function on macOS and Linux, which waits for a
+// way to write target-specific code.
+pub type Error enum {
+    open_failed
+    read_failed
+    path_too_long
+    out_of_memory
+}
+
+pub fn describe(e: Error) -> []u8 {
+    return match e {
+        open_failed { "cannot open the file" }
+        read_failed { "cannot read the file" }
+        path_too_long { "the path is longer than 1023 bytes" }
+        out_of_memory { "out of memory" }
+    }
+}
+
+pub type File (fd: c.int)
+
+let max_path: usize = 1024
+
+// Opens a file for reading.
+pub fn open(path: []u8) -> File ! Error {
+    var buf: [max_path]u8 = fill[max_path](0)
+    if path.len >= buf.len {
+        return err.(error: Error.path_too_long)
+    }
+    for let i: usize in 0..path.len {
+        buf[i] = path[i]
+    }
+    // SAFETY: buf holds the path and then a 0 byte.
+    let fd: c.int = unsafe { libc.open(&buf[0], libc.o_rdonly) }
+    if i32.(fd) < 0 {
+        return err.(error: Error.open_failed)
+    }
+    return ok.(value: File.(fd: fd))
+}
+
+pub fn close(f: inout File) {
+    if i32.(f.fd) < 0 {
+        return
+    }
+    // SAFETY: f.fd is a descriptor from open, and is closed only once.
+    let _: c.int = unsafe { libc.close(f.fd) }
+    f.fd = c.int.(-1)
+}
+
+// Reads the rest of the file into a new array.
+pub fn read_to_end(alloc: Allocator, f: inout File) -> [..]u8 ! Error {
+    var out: [..]u8 = make(alloc)
+    var buf: [4096]u8 = fill[4096](0)
+    for {
+        // SAFETY: buf has buf.len writable bytes.
+        let n: c.ssize_t = unsafe { libc.read(f.fd, &buf[0], c.size_t.(buf.len)) }
+        let count: isize = isize.(n)
+        if count == 0 {
+            return ok.(value: out)
+        }
+        if count < 0 {
+            free(sink out)
+            return err.(error: Error.read_failed)
+        }
+        match append(inout out, buf[..usize.(count)]) {
+            ok {
+            }
+            err(error: OutOfMemory) {
+                free(sink out)
+                return err.(error: Error.out_of_memory)
+            }
+        }
+    }
+}
+
+let stdout: c.int = c.int.(1)
+let stderr: c.int = c.int.(2)
+
+// Writes to standard output. A failed write is ignored: there is nowhere
+// left to report it.
+pub fn print(f: Format) {
+    write_format(stdout, f)
+}
+
+pub fn eprint(f: Format) {
+    write_format(stderr, f)
+}
+
+fn write_format(fd: c.int, f: Format) {
+    for let chunk: []u8 in fmt.chunks(f) {
+        write_bytes(fd, chunk)
+    }
+}
+
+fn write_bytes(fd: c.int, s: []u8) {
+    var rest: []u8 = s
+    for rest.len > 0 {
+        // SAFETY: rest has rest.len readable bytes.
+        let n: c.ssize_t = unsafe { libc.write(fd, &rest[0], c.size_t.(rest.len)) }
+        let count: isize = isize.(n)
+        if count <= 0 {
+            return
+        }
+        rest = rest[usize.(count)..]
+    }
+}

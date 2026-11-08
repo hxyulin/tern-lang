@@ -1590,6 +1590,67 @@ fn on_panic(info: PanicInfo) {
   and `os.env(name) -> ?[]u8`. They return views of memory the operating
   system set up, which lives as long as the program.
 
+## Standard library
+
+**Decided (2026-11-08).** The standard library is written in tern, in
+`toolchain/std`, and calls the C library through `extern fn` on hosted
+targets. The first packages cover what the examples use:
+
+| Package | Holds |
+| --- | --- |
+| `std.c` | C's integer types: `c.int`, `c.size_t`, ... |
+| `std.libc` | `extern` declarations of the C functions std calls |
+| `std.heap` | `c_allocator`, over `malloc`, `realloc` and `free` |
+| `std.fmt` | `Part`, `hex`, and the `chunks` iterator over a `Format` |
+| `std.io` | `File`, `open`, `close`, `read_to_end`, `print`, `eprint`, `Error` |
+| `std.os` | `args` and `env` |
+| `std.rt` | the C entry point and the default panic handler |
+
+A `std` package imports only other `std` packages.
+
+**Leaning (2026-11-08):** writing std filled these gaps. Each is a
+proposal for the user to confirm.
+
+- **`Allocator`'s fields.** A context pointer and three functions, with
+  sizes and alignments in bytes:
+
+  ```
+  (
+      context: ?*u8,
+      alloc: fn(?*u8, usize, usize) -> ?*u8,               // size, align
+      resize: fn(?*u8, *u8, usize, usize, usize) -> ?*u8,  // p, old size, new size, align
+      free: fn(?*u8, *u8, usize, usize),                   // p, size, align
+  )
+  ```
+
+  `none` from `alloc` or `resize` means out of memory. Passing `free` a
+  pointer this allocator did not return is undefined, yet the function
+  type cannot say so; see the open questions.
+- **`Format`'s representation.** The built-in record
+  `(parts: []fmt.Part)`. `fmt.Part` is an enum: text, a signed or
+  unsigned integer, a `bool`, a hex number, or a nested `Format`. The
+  compiler builds the parts on the stack. `{}` also accepts a `fmt.Part`,
+  which is how `hex(n, digits)` works: it is an ordinary std function, so
+  the "closed set of built-in formatters" is the functions in `std.fmt`
+  that return a `Part`.
+- **A plain string literal is a `Format` where one is expected.** Like a
+  number literal, a string literal takes its type from context: `[]u8` by
+  default, `Format` for a `Format` parameter. Without this,
+  `io.eprint("usage: inicheck FILE\n")` would not compile.
+- **Two more built-ins.** `from_pointer(p, n)` makes a `[]T` from a `*T`
+  and a length, and is unsafe. `append(inout v, items)` adds a view's
+  elements to a `[..]T` and returns `! OutOfMemory`; `read_to_end` uses it
+  rather than pushing one byte at a time. A view's address is `&v[0]`, so
+  no built-in is needed in that direction.
+- **The hosted entry point is std code.** `std.rt` exports C's `main`,
+  saves the arguments, and calls the program's `main`, which the compiler
+  exports as `tern_main`. The compiler links `std.rt` into every hosted
+  program. Its `@panic_handler` is the default; a program's own handler
+  replaces it.
+- **`io.Error` says only which operation failed.** Reading `errno` takes
+  `__error()` on macOS and `__errno_location()` on Linux, and the
+  language has no way yet to write code for one target.
+
 ## Compiler design
 
 **Leaning**, all from the compile-time goal:
@@ -1669,6 +1730,11 @@ Not in the first version. `[T]` is reserved for type arguments.
 
 - Nested functions (see Deferred).
 - The language's name.
+- Target-specific code. `errno` is the first need: a different C
+  function on macOS and Linux.
+- Unsafe function types. A function value with preconditions, such as an
+  allocator's `free`, can be called without `unsafe`. One option is
+  `unsafe fn(...)` as a type.
 
 Raised by the programs in `examples/` on 2026-11-08. They parse, but a
 checker would have to settle these. Dropping temporal safety settled

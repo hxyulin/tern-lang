@@ -52,3 +52,18 @@ fn reports_bad_imports() {
         ]
     );
 }
+
+/// The examples import the standard library in `toolchain/std`.
+#[test]
+fn examples_load_with_std() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let std_dir = manifest.join("../std");
+    for example in ["ini", "uart"] {
+        let program = package::load(&manifest.join("../../examples").join(example), &std_dir);
+        assert!(
+            !program.has_errors(),
+            "{example}:\n{}",
+            program.render_errors()
+        );
+    }
+}

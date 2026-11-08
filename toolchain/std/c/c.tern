@@ -1,0 +1,13 @@
+// C's integer types on the supported targets, aarch64 macOS and x86-64
+// Linux. Both are LP64. Each is a distinct type: converting to or from
+// one is written out, as in i32.(fd).
+//
+// char is missing on purpose: it is signed on aarch64 macOS and unsigned
+// on aarch64 Linux. Bytes cross as u8.
+
+pub type int i32
+pub type uint u32
+pub type long i64
+pub type ulong u64
+pub type size_t usize
+pub type ssize_t isize

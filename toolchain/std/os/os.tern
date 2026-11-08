@@ -1,0 +1,35 @@
+// The program's arguments and environment.
+
+import std.libc
+import std.rt
+
+// The arguments, starting with the program's name. They live as long as
+// the program.
+pub fn args() -> [][]u8 {
+    return rt.args()
+}
+
+let max_name: usize = 256
+
+// The value of an environment variable. The view is valid until the
+// environment changes.
+pub fn env(name: []u8) -> ?[]u8 {
+    var buf: [max_name]u8 = fill[max_name](0)
+    if name.len >= buf.len {
+        return none
+    }
+    for let i: usize in 0..name.len {
+        buf[i] = name[i]
+    }
+    // SAFETY: buf holds the name and then a 0 byte.
+    let value: ?*u8 = unsafe { libc.getenv(&buf[0]) }
+    match value {
+        none {
+            return none
+        }
+        some(value as p: *u8) {
+            // SAFETY: getenv returns a NUL-terminated string.
+            return some.(value: unsafe { libc.text(p) })
+        }
+    }
+}

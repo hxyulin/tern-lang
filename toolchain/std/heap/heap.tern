@@ -1,0 +1,39 @@
+// The C heap as an Allocator.
+
+import std.c
+import std.libc
+
+pub let c_allocator: Allocator = Allocator.(
+    context: none,
+    alloc: c_alloc,
+    resize: c_resize,
+    free: c_free,
+)
+
+// malloc's alignment is 16 bytes on both targets. A larger alignment
+// fails as if memory ran out.
+let max_align: usize = 16
+
+fn c_alloc(_: ?*u8, size: usize, align: usize) -> ?*u8 {
+    if align > max_align {
+        return none
+    }
+    // SAFETY: malloc has no preconditions.
+    return unsafe { libc.malloc(c.size_t.(size)) }
+}
+
+fn c_resize(_: ?*u8, p: *u8, old_size: usize, new_size: usize, align: usize) -> ?*u8 {
+    if align > max_align {
+        return none
+    }
+    // SAFETY: the Allocator contract says p came from this allocator, so
+    // from malloc or realloc.
+    return unsafe { libc.realloc(some.(value: p), c.size_t.(new_size)) }
+}
+
+fn c_free(_: ?*u8, p: *u8, size: usize, align: usize) {
+    // SAFETY: as in c_resize.
+    unsafe {
+        libc.free(some.(value: p))
+    }
+}

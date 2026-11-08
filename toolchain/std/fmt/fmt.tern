@@ -1,0 +1,116 @@
+// Formatting without a heap.
+//
+// The compiler turns an interpolated string literal into a Format, the
+// built-in record (parts: []fmt.Part): its literal text and its values,
+// in order. chunks reads one back as text.
+
+pub type Part enum {
+    text(s: []u8)
+    signed(value: i64)
+    unsigned(value: u64)
+    boolean(value: bool)
+    hex(value: u64, digits: u8)
+    // A Format interpolated into another: "error: {f}".
+    nested(parts: []Part)
+}
+
+// {hex(addr, 8)}: value in hexadecimal, padded with zeros to at least
+// digits digits, and at most 20.
+pub fn hex(value: u64, digits: u8) -> Part {
+    return Part.hex.(value: value, digits: digits)
+}
+
+let max_depth: usize = 8
+
+// Iterates over the text of a Format. A literal part comes out as a view
+// of the literal. A number is formatted into digits, so its view is valid
+// only until the next call to next.
+pub type Chunks (
+    // The parts left to read at each level of nesting, innermost last.
+    stack: [max_depth][]Part,
+    depth: usize,
+    digits: [20]u8,
+)
+
+pub fn chunks(f: Format) -> Chunks {
+    return Chunks.(stack: fill[max_depth](f.parts), depth: 1, digits: fill[20](0))
+}
+
+pub fn next(it: inout Chunks) -> ?[]u8 {
+    for it.depth > 0 {
+        let top: []Part = it.stack[it.depth - 1]
+        if top.len == 0 {
+            it.depth -= 1
+            continue
+        }
+        it.stack[it.depth - 1] = top[1..]
+        match top[0] {
+            text(s: []u8) {
+                return some.(value: s)
+            }
+            signed(value: i64) {
+                return some.(value: decimal_signed(inout it.digits, value))
+            }
+            unsigned(value: u64) {
+                return some.(value: decimal(inout it.digits, value))
+            }
+            boolean(value: bool) {
+                return some.(value: if value { "true" } else { "false" })
+            }
+            hex(value: u64, digits: u8) {
+                return some.(value: hexadecimal(inout it.digits, value, digits))
+            }
+            nested(parts: []Part) {
+                if it.depth == max_depth {
+                    panic("a Format nested more than 8 deep")
+                }
+                it.stack[it.depth] = parts
+                it.depth += 1
+            }
+        }
+    }
+    return none
+}
+
+// Writes the digits at the end of buf and returns them. 20 bytes hold any
+// u64, or any i64 with its sign.
+fn decimal(buf: inout [20]u8, value: u64) -> []u8 {
+    var i: usize = buf.len
+    var v: u64 = value
+    for {
+        i -= 1
+        buf[i] = '0' + truncate[u8](v % 10)
+        v = v / 10
+        if v == 0 {
+            break
+        }
+    }
+    return buf[i..]
+}
+
+fn decimal_signed(buf: inout [20]u8, value: i64) -> []u8 {
+    if value >= 0 {
+        return decimal(inout buf, u64.(value))
+    }
+    // -(value + 1) cannot overflow, even for i64.min.
+    let magnitude: u64 = u64.(-(value + 1)) + 1
+    let digits: []u8 = decimal(inout buf, magnitude)
+    let start: usize = buf.len - digits.len - 1
+    buf[start] = '-'
+    return buf[start..]
+}
+
+fn hexadecimal(buf: inout [20]u8, value: u64, digits: u8) -> []u8 {
+    let symbols: []u8 = "0123456789abcdef"
+    var i: usize = buf.len
+    var v: u64 = value
+    for {
+        i -= 1
+        buf[i] = symbols[usize.(v % 16)]
+        v = v / 16
+        if i == 0 || (v == 0 && buf.len - i >= usize.(digits)) {
+            break
+        }
+    }
+    return buf[i..]
+}

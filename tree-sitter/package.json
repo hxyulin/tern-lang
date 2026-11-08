@@ -6,6 +6,6 @@
   "scripts": {
     "generate": "tree-sitter generate",
     "test": "tree-sitter generate && tree-sitter test && npm run examples",
-    "examples": "tree-sitter parse --quiet --stat ../examples/*/*.tern ../examples/*/*/*.tern"
+    "examples": "tree-sitter parse --quiet --stat ../examples/*/*.tern ../examples/*/*/*.tern ../toolchain/std/*/*.tern"
   }
 }

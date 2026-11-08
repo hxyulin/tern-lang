@@ -40,7 +40,11 @@ cargo run -- parse ../examples/uart/main.tern
 
 `parse` prints the tree in tree-sitter's S-expression form. `check DIR`
 loads the package in `DIR` and every package it imports; so far it
-reports parse and import errors. The tests
+reports parse and import errors.
+
+[toolchain/std](toolchain/std) is the standard library, written in tern
+over the C library. Nothing compiles it yet; the tests check that it and
+the examples parse and that every import resolves. The tests
 parse every program in `examples/`, compare the tree for every corpus
 input the grammar accepts with tree-sitter's, and check that every input
 the grammar rejects gets an error.
