@@ -1,0 +1,235 @@
+// Tokens: what the lexer produces and the parser reads.
+
+pub type TokenKind enum {
+    ident
+    // A lone `_`.
+    underscore
+    // `@name`; the span includes the `@`.
+    attribute
+    int
+    float
+    char
+    // A string literal without interpolation: `"text"`.
+    str
+    // The part of an interpolated string up to its first `{`: `"text{`.
+    str_start
+    // The part between two interpolations: `}text{`.
+    str_mid
+    // The part after the last interpolation: `}text"`.
+    str_end
+
+    // Keywords.
+    kw_as
+    kw_break
+    kw_continue
+    kw_defer
+    kw_else
+    kw_enum
+    kw_extern
+    kw_fn
+    kw_for
+    kw_if
+    kw_import
+    kw_in
+    kw_inout
+    kw_let
+    kw_lock
+    kw_match
+    kw_pub
+    kw_return
+    kw_shared
+    kw_move
+    kw_sink
+    kw_try
+    kw_type
+    kw_union
+    kw_unsafe
+    kw_var
+
+    // Punctuation.
+    l_paren
+    r_paren
+    l_bracket
+    r_bracket
+    l_brace
+    r_brace
+    comma
+    colon
+    // Written, or inserted at a line end. An inserted one has an empty span.
+    semicolon
+    dot
+    dot_dot
+    dot_dot_dot
+    dot_star
+    arrow
+    question
+    bang
+    tilde
+    plus
+    minus
+    star
+    slash
+    percent
+    amp
+    pipe
+    caret
+    shl
+    shr
+    amp_amp
+    pipe_pipe
+    eq
+    eq_eq
+    bang_eq
+    lt
+    lt_eq
+    gt
+    gt_eq
+    plus_eq
+    minus_eq
+    star_eq
+    slash_eq
+    percent_eq
+    amp_eq
+    pipe_eq
+    caret_eq
+    shl_eq
+    shr_eq
+
+    eof
+}
+
+// A token and the bytes it covers, start..end.
+pub type Token (pub kind: TokenKind, pub start: u32, pub end: u32)
+
+// The keyword spelled `text`, if it is one.
+pub fn keyword(text: []u8) -> ?TokenKind {
+    match text {
+        "as" { return some.(value: TokenKind.kw_as) }
+        "break" { return some.(value: TokenKind.kw_break) }
+        "continue" { return some.(value: TokenKind.kw_continue) }
+        "defer" { return some.(value: TokenKind.kw_defer) }
+        "else" { return some.(value: TokenKind.kw_else) }
+        "enum" { return some.(value: TokenKind.kw_enum) }
+        "extern" { return some.(value: TokenKind.kw_extern) }
+        "fn" { return some.(value: TokenKind.kw_fn) }
+        "for" { return some.(value: TokenKind.kw_for) }
+        "if" { return some.(value: TokenKind.kw_if) }
+        "import" { return some.(value: TokenKind.kw_import) }
+        "in" { return some.(value: TokenKind.kw_in) }
+        "inout" { return some.(value: TokenKind.kw_inout) }
+        "let" { return some.(value: TokenKind.kw_let) }
+        "lock" { return some.(value: TokenKind.kw_lock) }
+        "match" { return some.(value: TokenKind.kw_match) }
+        "pub" { return some.(value: TokenKind.kw_pub) }
+        "return" { return some.(value: TokenKind.kw_return) }
+        "shared" { return some.(value: TokenKind.kw_shared) }
+        "move" { return some.(value: TokenKind.kw_move) }
+        "sink" { return some.(value: TokenKind.kw_sink) }
+        "try" { return some.(value: TokenKind.kw_try) }
+        "type" { return some.(value: TokenKind.kw_type) }
+        "union" { return some.(value: TokenKind.kw_union) }
+        "unsafe" { return some.(value: TokenKind.kw_unsafe) }
+        "var" { return some.(value: TokenKind.kw_var) }
+        _ { return none }
+    }
+}
+
+// Whether a line end after a token of this kind inserts a semicolon. Go's
+// rule.
+pub fn ends_statement(kind: TokenKind) -> bool {
+    return match kind {
+        ident, int, float, char, str, str_end,
+        r_paren, r_bracket, r_brace, dot_star,
+        kw_return, kw_break, kw_continue { true }
+        _ { false }
+    }
+}
+
+// The kind's name as stage 1 prints it.
+pub fn kind_name(kind: TokenKind) -> []u8 {
+    return match kind {
+        ident { "Ident" }
+        underscore { "Underscore" }
+        attribute { "Attribute" }
+        int { "Int" }
+        float { "Float" }
+        char { "Char" }
+        str { "Str" }
+        str_start { "StrStart" }
+        str_mid { "StrMid" }
+        str_end { "StrEnd" }
+        kw_as { "As" }
+        kw_break { "Break" }
+        kw_continue { "Continue" }
+        kw_defer { "Defer" }
+        kw_else { "Else" }
+        kw_enum { "Enum" }
+        kw_extern { "Extern" }
+        kw_fn { "Fn" }
+        kw_for { "For" }
+        kw_if { "If" }
+        kw_import { "Import" }
+        kw_in { "In" }
+        kw_inout { "Inout" }
+        kw_let { "Let" }
+        kw_lock { "Lock" }
+        kw_match { "Match" }
+        kw_pub { "Pub" }
+        kw_return { "Return" }
+        kw_shared { "Shared" }
+        kw_move { "Move" }
+        kw_sink { "Sink" }
+        kw_try { "Try" }
+        kw_type { "Type" }
+        kw_union { "Union" }
+        kw_unsafe { "Unsafe" }
+        kw_var { "Var" }
+        l_paren { "LParen" }
+        r_paren { "RParen" }
+        l_bracket { "LBracket" }
+        r_bracket { "RBracket" }
+        l_brace { "LBrace" }
+        r_brace { "RBrace" }
+        comma { "Comma" }
+        colon { "Colon" }
+        semicolon { "Semicolon" }
+        dot { "Dot" }
+        dot_dot { "DotDot" }
+        dot_dot_dot { "DotDotDot" }
+        dot_star { "DotStar" }
+        arrow { "Arrow" }
+        question { "Question" }
+        bang { "Bang" }
+        tilde { "Tilde" }
+        plus { "Plus" }
+        minus { "Minus" }
+        star { "Star" }
+        slash { "Slash" }
+        percent { "Percent" }
+        amp { "Amp" }
+        pipe { "Pipe" }
+        caret { "Caret" }
+        shl { "Shl" }
+        shr { "Shr" }
+        amp_amp { "AmpAmp" }
+        pipe_pipe { "PipePipe" }
+        eq { "Eq" }
+        eq_eq { "EqEq" }
+        bang_eq { "BangEq" }
+        lt { "Lt" }
+        lt_eq { "LtEq" }
+        gt { "Gt" }
+        gt_eq { "GtEq" }
+        plus_eq { "PlusEq" }
+        minus_eq { "MinusEq" }
+        star_eq { "StarEq" }
+        slash_eq { "SlashEq" }
+        percent_eq { "PercentEq" }
+        amp_eq { "AmpEq" }
+        pipe_eq { "PipeEq" }
+        caret_eq { "CaretEq" }
+        shl_eq { "ShlEq" }
+        shr_eq { "ShrEq" }
+        eof { "Eof" }
+    }
+}

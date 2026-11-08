@@ -1,0 +1,188 @@
+// ternc, the tern compiler, written in tern. So far it lexes:
+//
+//   ternc lex FILE    prints each token as stage 1 does
+
+import std.heap
+import std.io
+import std.os
+import syntax
+
+fn main() -> u8 {
+    let args: [][]u8 = os.args()
+    if args.len == 3 {
+        match args[1] {
+            "lex" {
+                return lex_file(args[2])
+            }
+            _ {
+            }
+        }
+    }
+    io.eprint("usage: ternc lex FILE\n")
+    return 2
+}
+
+fn lex_file(path: []u8) -> u8 {
+    match read_all(heap.c_allocator, path) {
+        ok(value as text: [..]u8) {
+            defer free(sink text)
+            match lex_text(path, text) {
+                ok(value as status: u8) {
+                    return status
+                }
+                err(error: _) {
+                    io.eprint("ternc: out of memory\n")
+                    return 1
+                }
+            }
+        }
+        err(error: io.Error) {
+            io.eprint("ternc: cannot read {path}: {io.describe(error)}\n")
+            return 1
+        }
+    }
+}
+
+fn read_all(alloc: Allocator, path: []u8) -> [..]u8 ! io.Error {
+    var f: io.File = try io.open(path)
+    defer io.close(inout f)
+    return io.read_to_end(alloc, inout f)
+}
+
+// Prints the tokens to stdout and the problems to stderr. The status is 1
+// if there are problems.
+fn lex_text(path: []u8, text: []u8) -> u8 ! OutOfMemory {
+    var starts: [..]u32 = try syntax.line_starts(heap.c_allocator, text)
+    defer free(sink starts)
+    let lexed: syntax.Lexed = try syntax.lex(heap.c_allocator, text)
+    let (tokens: [..]syntax.Token, diagnostics: [..]syntax.Diagnostic) = lexed
+    defer free(sink tokens)
+    defer free(sink diagnostics)
+    for let t: syntax.Token in tokens {
+        let pos: syntax.Position = syntax.position(starts, t.start)
+        let bytes: []u8 = text[usize.(t.start)..usize.(t.end)]
+        let name: []u8 = syntax.kind_name(t.kind)
+        if bytes.len == 0 && t.kind == syntax.TokenKind.semicolon {
+            io.print("{pos.line}:{pos.column}\tSemicolon\t(inserted)\n")
+        } else {
+            io.print("{pos.line}:{pos.column}\t{name}\t{bytes}\n")
+        }
+    }
+    for let d: syntax.Diagnostic in diagnostics {
+        render(path, text, starts, d)
+    }
+    if diagnostics.len > 0 {
+        return ok.(value: 1)
+    }
+    return ok.(value: 0)
+}
+
+// Prints path:line:column: error: message, then the source line with a
+// caret under the start of the problem.
+fn render(path: []u8, text: []u8, starts: []u32, d: syntax.Diagnostic) {
+    let pos: syntax.Position = syntax.position(starts, d.start)
+    io.eprint("{path}:{pos.line}:{pos.column}: error: ")
+    print_problem(d.problem)
+    let line: []u8 = syntax.line_text(text, starts, pos.line)
+    io.eprint("\n    {line}\n    ")
+    var pad: usize = usize.(pos.column) - 1
+    if pad > line.len {
+        pad = line.len
+    }
+    for let i: usize in 0..pad {
+        if line[i] == '\t' {
+            io.eprint("\t")
+        } else {
+            io.eprint(" ")
+        }
+    }
+    io.eprint("^\n")
+}
+
+fn print_problem(p: syntax.Problem) {
+    var buf: [8]u8 = fill[8](0)
+    match p {
+        line_ends_in_interpolation {
+            io.eprint("the line ends inside a string interpolation")
+        }
+        comment_not_closed {
+            io.eprint("block comment is not closed")
+        }
+        attribute_name_missing {
+            io.eprint("expected an attribute name after `@`")
+        }
+        non_ascii_code(code: u32) {
+            let hex: []u8 = code_point(inout buf, code)
+            io.eprint("unexpected character U+{hex}; code outside strings and comments is ASCII")
+        }
+        number_suffix {
+            io.eprint("a number literal cannot be followed by a letter or `_`; tern has no type suffixes")
+        }
+        digits_missing {
+            io.eprint("expected digits after the number prefix")
+        }
+        bad_digit(digit: u8, base: u32) {
+            let one: [1]u8 = [digit]
+            let s: []u8 = one
+            io.eprint("`{s}` is not a digit in base {base}")
+        }
+        misplaced_underscore {
+            io.eprint("`_` in a number must stand between two digits")
+        }
+        string_not_closed {
+            io.eprint("string literal is not closed on this line")
+        }
+        bad_hex_escape {
+            io.eprint("`\\x` takes two hex digits from 00 to 7F")
+        }
+        unknown_escape {
+            io.eprint("unknown escape")
+        }
+        unprintable(what: syntax.Literal, code: u32) {
+            let hex: []u8 = code_point(inout buf, code)
+            io.eprint("a {literal_name(what)} holds printable ASCII; write U+{hex} as an escape")
+        }
+        non_ascii_text(what: syntax.Literal, code: u32) {
+            let hex: []u8 = code_point(inout buf, code)
+            io.eprint("a {literal_name(what)} holds ASCII only, found U+{hex}")
+        }
+        empty_char {
+            io.eprint("empty character literal")
+        }
+        char_not_closed {
+            io.eprint("character literal is not closed")
+        }
+        unexpected_char(c: u8) {
+            let one: [1]u8 = [c]
+            let s: []u8 = one
+            io.eprint("unexpected character `{s}`")
+        }
+        unexpected_control(c: u8) {
+            let hex: []u8 = code_point(inout buf, u32.(c))
+            io.eprint("unexpected control character U+{hex}")
+        }
+    }
+}
+
+fn literal_name(what: syntax.Literal) -> []u8 {
+    return match what {
+        string { "string literal" }
+        character { "character literal" }
+    }
+}
+
+// Upper-case hexadecimal with at least four digits, as in U+00E9.
+fn code_point(buf: inout [8]u8, code: u32) -> []u8 {
+    let symbols: []u8 = "0123456789ABCDEF"
+    var i: usize = buf.len
+    var v: u32 = code
+    for {
+        i -= 1
+        buf[i] = symbols[usize.(v % 16)]
+        v = v / 16
+        if v == 0 && buf.len - i >= 4 {
+            break
+        }
+    }
+    return buf[i..]
+}

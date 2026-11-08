@@ -3,7 +3,7 @@
 //! the expected output, `exit` the exit status (0 if absent), and
 //! `stderr`, if present, text the error output must start with.
 //!
-//! Needs `clang` to assemble and link.
+//! On Linux, needs `clang` to assemble and link.
 
 use std::fs;
 use std::path::{Path, PathBuf};

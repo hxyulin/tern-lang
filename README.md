@@ -58,5 +58,16 @@ build and run the programs in `toolchain/stage1/tests/run` and
 `examples/ini`, with and without optimization. `examples/uart` targets a
 microcontroller keel does not support, so it is only checked.
 
+[toolchain/ternc](toolchain/ternc) is the compiler written in tern,
+built by stage 1. So far it lexes: `ternc lex FILE` prints the same
+tokens and errors as stage 1, and a stage 1 test checks that on every
+tern file in the repository.
+
+```
+cd toolchain
+cargo run -- build ternc -o ternc2
+./ternc2 lex std/io/io.tern
+```
+
 [toolchain/std](toolchain/std) is the standard library, written in tern
 over the C library.

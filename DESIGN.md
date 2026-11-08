@@ -1874,6 +1874,40 @@ does. A float converted to an integer saturates instead of panicking
 when it does not fit, and a panic inside the panic handler is not
 detected.
 
+### ternc, the compiler in tern
+
+**Decided (2026-11-08).** From here on the compiler is developed in tern,
+in `toolchain/ternc`, and stage 1 builds it. Stage 1 stays as the
+bootstrap. Keel will gain a C ABI, so ternc can call it later; until
+then ternc is built one front-end part at a time, starting with the
+lexer and then the parser.
+
+- **Layout.** `main.tern` is the driver. The `syntax` package holds the
+  tokens, the lexer and line lookup, and later the parser.
+- **Tested against stage 1.** `ternc lex FILE` prints what stage 1's
+  `ternc lex FILE` prints, errors included. A stage 1 test builds ternc,
+  plain and with `-O`, and requires identical stdout, stderr and exit
+  status on every tern file in the repository, every tree-sitter corpus
+  file, and `toolchain/stage1/tests/lex/malformed.tern`, which triggers
+  every lexer error.
+- **Diagnostics are enums.** A `Format` cannot be stored, so the lexer
+  records a `Problem` with its values, such as
+  `bad_digit(digit: u8, base: u32)`, and the driver turns it into text
+  when it prints it.
+- **Std grows as needed.** The lexer needed no new std functions.
+
+Friction found while porting the lexer:
+
+- `[..]T` has no `pop` or `clear`. The lexer's interpolation stack keeps
+  its own depth count instead.
+- Every `push` can fail, so every lexer function that adds a token
+  returns `! OutOfMemory` and each call takes a `try`.
+- Freeing a record that holds `[..]T` fields takes destructuring every
+  field, because a field cannot be moved out.
+- `offset` is a built-in name, so it cannot name a parameter.
+- Input is not checked to be UTF-8, as stage 1's `read_to_string` does.
+  A non-ASCII byte outside a literal is decoded leniently.
+
 ## Deferred
 
 ### Nested functions

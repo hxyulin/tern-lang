@@ -1,0 +1,65 @@
+// Line and column lookup for byte offsets.
+
+// A 1-based line and column. The column counts bytes.
+pub type Position (pub line: u32, pub column: u32)
+
+// The byte offset where each line starts.
+pub fn line_starts(alloc: Allocator, text: []u8) -> [..]u32 ! OutOfMemory {
+    var starts: [..]u32 = make(alloc)
+    match push(inout starts, 0) {
+        ok {
+        }
+        err(error: OutOfMemory) {
+            free(sink starts)
+            return err.(error: error)
+        }
+    }
+    for let i: usize in 0..text.len {
+        if text[i] == '\n' {
+            match push(inout starts, u32.(i + 1)) {
+                ok {
+                }
+                err(error: OutOfMemory) {
+                    free(sink starts)
+                    return err.(error: error)
+                }
+            }
+        }
+    }
+    return ok.(value: starts)
+}
+
+pub fn position(starts: []u32, at: u32) -> Position {
+    // Find the last line that starts at or before at.
+    var low: usize = 0
+    var high: usize = starts.len
+    for low < high {
+        let mid: usize = low + (high - low) / 2
+        if starts[mid] <= at {
+            low = mid + 1
+        } else {
+            high = mid
+        }
+    }
+    let line: usize = low - 1
+    return Position.(line: u32.(line + 1), column: at - starts[line] + 1)
+}
+
+// The text of a 1-based line without its line ending, or an empty view
+// past the last line.
+pub fn line_text(text: []u8, starts: []u32, line: u32) -> []u8 {
+    let index: usize = usize.(line) - 1
+    if index >= starts.len {
+        return text[text.len..]
+    }
+    let start: usize = usize.(starts[index])
+    var end: usize = start
+    for end < text.len && text[end] != '\n' {
+        end += 1
+    }
+    // A \r ends the line only before a \n.
+    if end < text.len && end > start && text[end - 1] == '\r' {
+        end -= 1
+    }
+    return text[start..end]
+}

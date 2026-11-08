@@ -1,0 +1,705 @@
+// Turns source text into tokens.
+//
+// The lexer keeps two kinds of state, and never needs the parser:
+//
+// - A stack of open string interpolations. Inside "a{x}b" it emits
+//   str_start ("a{), the tokens of x, then str_end (}b"). Each entry
+//   counts the { opened inside that interpolation, so a } closes the
+//   interpolation only when the count is zero.
+// - Whether the last token can end a statement. At a line end after such
+//   a token, the lexer inserts a semicolon with an empty span (Go's rule).
+//
+// Errors are collected and lexing continues, so one run reports them all.
+
+// Which literal a text error is in.
+pub type Literal enum {
+    string
+    character
+}
+
+pub type Problem enum {
+    line_ends_in_interpolation
+    comment_not_closed
+    attribute_name_missing
+    // A byte of code, outside strings and comments, that is not ASCII.
+    non_ascii_code(code: u32)
+    number_suffix
+    digits_missing
+    bad_digit(digit: u8, base: u32)
+    misplaced_underscore
+    string_not_closed
+    bad_hex_escape
+    unknown_escape
+    // An ASCII control character in a literal.
+    unprintable(what: Literal, code: u32)
+    non_ascii_text(what: Literal, code: u32)
+    empty_char
+    char_not_closed
+    unexpected_char(c: u8)
+    unexpected_control(c: u8)
+}
+
+// A problem found in the bytes start..end.
+pub type Diagnostic (pub start: u32, pub end: u32, pub problem: Problem)
+
+pub type Lexed (pub tokens: [..]Token, pub diagnostics: [..]Diagnostic)
+
+// What a run of string text started after.
+type Opening enum {
+    // The opening ".
+    quote
+    // The } that closed an interpolation.
+    brace
+}
+
+type Lexer (
+    src: []u8,
+    pos: usize,
+    tokens: [..]Token,
+    diagnostics: [..]Diagnostic,
+    // One entry per open interpolation: how many { inside it are open.
+    // Only the first depth entries are in use, since [..]T has no pop.
+    open_braces: [..]u32,
+    depth: usize,
+)
+
+pub fn lex(alloc: Allocator, src: []u8) -> Lexed ! OutOfMemory {
+    var l: Lexer = Lexer.(
+        src: src,
+        pos: 0,
+        tokens: make(alloc),
+        diagnostics: make(alloc),
+        open_braces: make(alloc),
+        depth: 0,
+    )
+    let result: ! OutOfMemory = run(inout l)
+    let (
+        src: _,
+        pos: _,
+        tokens: [..]Token,
+        diagnostics: [..]Diagnostic,
+        open_braces: [..]u32,
+        depth: _,
+    ) = l
+    free(sink open_braces)
+    match result {
+        ok {
+            return ok.(value: Lexed.(tokens: tokens, diagnostics: diagnostics))
+        }
+        err(error: OutOfMemory) {
+            free(sink tokens)
+            free(sink diagnostics)
+            return err.(error: error)
+        }
+    }
+}
+
+fn run(l: inout Lexer) -> ! OutOfMemory {
+    for {
+        try skip_trivia(inout l)
+        if at_end(l) {
+            let end: usize = l.pos
+            try line_end(inout l, end)
+            return add_token(inout l, TokenKind.eof, end)
+        }
+        try token(inout l)
+    }
+}
+
+// The byte `ahead` bytes past the current one, or 0 past the end.
+fn peek(l: Lexer, ahead: usize) -> u8 {
+    let at: usize = l.pos + ahead
+    if at >= l.src.len {
+        return 0
+    }
+    return l.src[at]
+}
+
+fn at_end(l: Lexer) -> bool {
+    return l.pos >= l.src.len
+}
+
+// Adds a token from start to the current position.
+fn add_token(l: inout Lexer, kind: TokenKind, start: usize) -> ! OutOfMemory {
+    let end: usize = l.pos
+    try push(inout l.tokens, Token.(kind: kind, start: u32.(start), end: u32.(end)))
+    return ok
+}
+
+fn report(l: inout Lexer, start: usize, end: usize, problem: Problem) -> ! OutOfMemory {
+    let d: Diagnostic = Diagnostic.(start: u32.(start), end: u32.(end), problem: problem)
+    try push(inout l.diagnostics, d)
+    return ok
+}
+
+// Reports a problem from start to the current position.
+fn fail(l: inout Lexer, start: usize, problem: Problem) -> ! OutOfMemory {
+    let end: usize = l.pos
+    return report(inout l, start, end, problem)
+}
+
+// Handles a line end at byte `at`: a newline, a block comment holding
+// one, or the end of the file.
+fn line_end(l: inout Lexer, at: usize) -> ! OutOfMemory {
+    if l.depth > 0 {
+        try report(inout l, at, at, Problem.line_ends_in_interpolation)
+        l.depth = 0
+    }
+    if l.tokens.len > 0 && ends_statement(l.tokens[l.tokens.len - 1].kind) {
+        let semicolon: Token = Token.(kind: TokenKind.semicolon, start: u32.(at), end: u32.(at))
+        try push(inout l.tokens, semicolon)
+    }
+    return ok
+}
+
+fn skip_trivia(l: inout Lexer) -> ! OutOfMemory {
+    for {
+        match peek(l, 0) {
+            ' ', '\t', '\r' {
+                l.pos += 1
+            }
+            '\n' {
+                let at: usize = l.pos
+                try line_end(inout l, at)
+                l.pos += 1
+            }
+            '/' {
+                match peek(l, 1) {
+                    '/' {
+                        for !at_end(l) && peek(l, 0) != '\n' {
+                            l.pos += 1
+                        }
+                    }
+                    '*' {
+                        try block_comment(inout l)
+                    }
+                    _ {
+                        return ok
+                    }
+                }
+            }
+            _ {
+                return ok
+            }
+        }
+    }
+}
+
+// Block comments nest: /* a /* b */ c */ is one comment. A comment that
+// spans lines counts as a line end, as in Go.
+fn block_comment(l: inout Lexer) -> ! OutOfMemory {
+    let start: usize = l.pos
+    l.pos += 2
+    var depth: u32 = 1
+    var has_newline: bool = false
+    for depth > 0 {
+        if at_end(l) {
+            try report(inout l, start, start + 2, Problem.comment_not_closed)
+            break
+        }
+        let c: u8 = peek(l, 0)
+        let next: u8 = peek(l, 1)
+        if c == '/' && next == '*' {
+            depth += 1
+            l.pos += 2
+        } else if c == '*' && next == '/' {
+            depth -= 1
+            l.pos += 2
+        } else {
+            if c == '\n' {
+                has_newline = true
+            }
+            l.pos += 1
+        }
+    }
+    if has_newline {
+        try line_end(inout l, start)
+    }
+    return ok
+}
+
+fn token(l: inout Lexer) -> ! OutOfMemory {
+    let start: usize = l.pos
+    let c: u8 = peek(l, 0)
+    if is_letter(c) || c == '_' {
+        return word(inout l, start)
+    }
+    if is_digit(c) {
+        return number(inout l, start)
+    }
+    match c {
+        '"' {
+            l.pos += 1
+            return string_text(inout l, start, Opening.quote)
+        }
+        '\'' {
+            return char_literal(inout l, start)
+        }
+        '@' {
+            l.pos += 1
+            if is_letter(peek(l, 0)) {
+                skip_word_chars(inout l)
+                return add_token(inout l, TokenKind.attribute, start)
+            }
+            return fail(inout l, start, Problem.attribute_name_missing)
+        }
+        '{' {
+            if l.depth > 0 {
+                l.open_braces[l.depth - 1] += 1
+            }
+            l.pos += 1
+            return add_token(inout l, TokenKind.l_brace, start)
+        }
+        '}' {
+            l.pos += 1
+            if l.depth == 0 {
+                return add_token(inout l, TokenKind.r_brace, start)
+            }
+            if l.open_braces[l.depth - 1] == 0 {
+                return string_text(inout l, start, Opening.brace)
+            }
+            l.open_braces[l.depth - 1] -= 1
+            return add_token(inout l, TokenKind.r_brace, start)
+        }
+        _ {
+        }
+    }
+    if c < 0x80 {
+        return punctuation(inout l, start)
+    }
+    let (code: u32, len: usize) = decode(l.src, start)
+    l.pos += len
+    return fail(inout l, start, Problem.non_ascii_code.(code: code))
+}
+
+fn is_letter(c: u8) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= '0' && c <= '9'
+}
+
+fn is_word_char(c: u8) -> bool {
+    return is_letter(c) || is_digit(c) || c == '_'
+}
+
+fn is_hex(c: u8) -> bool {
+    return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// The code point of the UTF-8 sequence starting at src[at], and its
+// length. A sequence cut off by the end of the text ends there.
+fn decode(src: []u8, at: usize) -> (code: u32, len: usize) {
+    let first: u32 = u32.(src[at])
+    var len: usize = 1
+    var code: u32 = first
+    if first >= 0xF0 {
+        len = 4
+        code = first & 0x07
+    } else if first >= 0xE0 {
+        len = 3
+        code = first & 0x0F
+    } else if first >= 0xC0 {
+        len = 2
+        code = first & 0x1F
+    }
+    if at + len > src.len {
+        len = src.len - at
+    }
+    for let i: usize in 1..len {
+        code = (code << 6) | (u32.(src[at + i]) & 0x3F)
+    }
+    return (code: code, len: len)
+}
+
+fn skip_word_chars(l: inout Lexer) {
+    for is_word_char(peek(l, 0)) {
+        l.pos += 1
+    }
+}
+
+fn word(l: inout Lexer, start: usize) -> ! OutOfMemory {
+    skip_word_chars(inout l)
+    let text: []u8 = l.src[start..l.pos]
+    if text.len == 1 && text[0] == '_' {
+        return add_token(inout l, TokenKind.underscore, start)
+    }
+    match keyword(text) {
+        some(value as kind: TokenKind) {
+            return add_token(inout l, kind, start)
+        }
+        none {
+            return add_token(inout l, TokenKind.ident, start)
+        }
+    }
+}
+
+// Integers: decimal, 0x, 0b and 0o. Floats: 1.0, 1.5e-3. An _ may only
+// stand between two digits.
+fn number(l: inout Lexer, start: usize) -> ! OutOfMemory {
+    var radix: u32 = 10
+    if peek(l, 0) == '0' {
+        match peek(l, 1) {
+            'x' {
+                radix = 16
+            }
+            'b' {
+                radix = 2
+            }
+            'o' {
+                radix = 8
+            }
+            _ {
+            }
+        }
+    }
+    if radix != 10 {
+        l.pos += 2
+        let digits_start: usize = l.pos
+        skip_word_chars(inout l)
+        try check_digits(inout l, digits_start, radix)
+        return add_token(inout l, TokenKind.int, start)
+    }
+
+    var kind: TokenKind = TokenKind.int
+    try decimal_digits(inout l)
+    if peek(l, 0) == '.' && is_digit(peek(l, 1)) {
+        kind = TokenKind.float
+        l.pos += 1
+        try decimal_digits(inout l)
+        var sign: usize = 0
+        if peek(l, 1) == '+' || peek(l, 1) == '-' {
+            sign = 1
+        }
+        let e: u8 = peek(l, 0)
+        if (e == 'e' || e == 'E') && is_digit(peek(l, 1 + sign)) {
+            l.pos += 1 + sign
+            try decimal_digits(inout l)
+        }
+    }
+    if is_letter(peek(l, 0)) || peek(l, 0) == '_' {
+        let bad: usize = l.pos
+        skip_word_chars(inout l)
+        try fail(inout l, bad, Problem.number_suffix)
+    }
+    return add_token(inout l, kind, start)
+}
+
+// Consumes a run of decimal digits and _, checking the _ placement.
+fn decimal_digits(l: inout Lexer) -> ! OutOfMemory {
+    let start: usize = l.pos
+    for is_digit(peek(l, 0)) || peek(l, 0) == '_' {
+        l.pos += 1
+    }
+    return check_underscores(inout l, start)
+}
+
+fn check_digits(l: inout Lexer, start: usize, radix: u32) -> ! OutOfMemory {
+    let text: []u8 = l.src[start..l.pos]
+    if text.len == 0 {
+        return fail(inout l, start, Problem.digits_missing)
+    }
+    for let c: u8 in text {
+        if c != '_' && digit_value(c) >= radix {
+            return fail(inout l, start, Problem.bad_digit.(digit: c, base: radix))
+        }
+    }
+    return check_underscores(inout l, start)
+}
+
+// The value of a digit in any base up to 36, or 36 for a byte that is
+// not one.
+fn digit_value(c: u8) -> u32 {
+    if is_digit(c) {
+        return u32.(c - '0')
+    }
+    if c >= 'a' && c <= 'z' {
+        return u32.(c - 'a') + 10
+    }
+    if c >= 'A' && c <= 'Z' {
+        return u32.(c - 'A') + 10
+    }
+    return 36
+}
+
+fn check_underscores(l: inout Lexer, start: usize) -> ! OutOfMemory {
+    let text: []u8 = l.src[start..l.pos]
+    var misplaced: bool = text.len > 0 && (text[0] == '_' || text[text.len - 1] == '_')
+    for let i: usize in 1..text.len {
+        if text[i - 1] == '_' && text[i] == '_' {
+            misplaced = true
+        }
+    }
+    if misplaced {
+        return fail(inout l, start, Problem.misplaced_underscore)
+    }
+    return ok
+}
+
+// Lexes string text after `opening`, up to the closing " or the next {,
+// and adds the token for it.
+fn string_text(l: inout Lexer, start: usize, opening: Opening) -> ! OutOfMemory {
+    for {
+        let c: u8 = peek(l, 0)
+        if at_end(l) || c == '\n' {
+            try fail(inout l, start, Problem.string_not_closed)
+            return close_string(inout l, start, opening)
+        }
+        match c {
+            '"' {
+                l.pos += 1
+                return close_string(inout l, start, opening)
+            }
+            '{' {
+                l.pos += 1
+                match opening {
+                    quote {
+                        try open_interpolation(inout l)
+                        return add_token(inout l, TokenKind.str_start, start)
+                    }
+                    brace {
+                        return add_token(inout l, TokenKind.str_mid, start)
+                    }
+                }
+            }
+            '\\' {
+                try escape(inout l)
+            }
+            _ {
+                if c >= 0x20 && c <= 0x7E {
+                    l.pos += 1
+                } else {
+                    try bad_text_char(inout l, Literal.string)
+                }
+            }
+        }
+    }
+}
+
+fn close_string(l: inout Lexer, start: usize, opening: Opening) -> ! OutOfMemory {
+    match opening {
+        quote {
+            return add_token(inout l, TokenKind.str, start)
+        }
+        brace {
+            l.depth -= 1
+            return add_token(inout l, TokenKind.str_end, start)
+        }
+    }
+}
+
+fn open_interpolation(l: inout Lexer) -> ! OutOfMemory {
+    if l.depth == l.open_braces.len {
+        try push(inout l.open_braces, 0)
+    } else {
+        l.open_braces[l.depth] = 0
+    }
+    l.depth += 1
+    return ok
+}
+
+// Escapes: \n \t \r \0 \\ \" \' \{ and \x00 to \x7F.
+fn escape(l: inout Lexer) -> ! OutOfMemory {
+    let start: usize = l.pos
+    match peek(l, 1) {
+        'n', 't', 'r', '0', '\\', '"', '\'', '{' {
+            l.pos += 2
+        }
+        'x' {
+            let high: u8 = peek(l, 2)
+            if high >= '0' && high <= '7' && is_hex(peek(l, 3)) {
+                l.pos += 4
+            } else {
+                l.pos += 2
+                try fail(inout l, start, Problem.bad_hex_escape)
+            }
+        }
+        _ {
+            l.pos += 1
+            try report(inout l, start, start + 2, Problem.unknown_escape)
+        }
+    }
+    return ok
+}
+
+// Reports a character that cannot appear in a literal, and skips it.
+fn bad_text_char(l: inout Lexer, what: Literal) -> ! OutOfMemory {
+    let start: usize = l.pos
+    let (code: u32, len: usize) = decode(l.src, start)
+    l.pos += len
+    if code < 0x80 {
+        return fail(inout l, start, Problem.unprintable.(what: what, code: code))
+    }
+    return fail(inout l, start, Problem.non_ascii_text.(what: what, code: code))
+}
+
+// 'a' or '\n': an integer holding one ASCII code.
+fn char_literal(l: inout Lexer, start: usize) -> ! OutOfMemory {
+    l.pos += 1
+    let c: u8 = peek(l, 0)
+    if c == '\'' {
+        l.pos += 1
+        try fail(inout l, start, Problem.empty_char)
+        return add_token(inout l, TokenKind.char, start)
+    }
+    if c == '\\' {
+        try escape(inout l)
+    } else if c >= 0x20 && c <= 0x7E {
+        l.pos += 1
+    } else if c != '\n' && !at_end(l) {
+        try bad_text_char(inout l, Literal.character)
+    }
+    if peek(l, 0) == '\'' {
+        l.pos += 1
+    } else {
+        // Skip to a closing quote on the same line, so 'ab' is one error.
+        var i: usize = l.pos
+        for i < l.src.len && l.src[i] != '\n' && l.src[i] != '\'' {
+            i += 1
+        }
+        if i < l.src.len && l.src[i] == '\'' {
+            l.pos = i + 1
+        }
+        try fail(inout l, start, Problem.char_not_closed)
+    }
+    return add_token(inout l, TokenKind.char, start)
+}
+
+// Operators and delimiters. The longest one that matches wins.
+fn punctuation(l: inout Lexer, start: usize) -> ! OutOfMemory {
+    let a: u8 = peek(l, 0)
+    let b: u8 = peek(l, 1)
+    match three_bytes(a, b, peek(l, 2)) {
+        some(value as kind: TokenKind) {
+            l.pos += 3
+            return add_token(inout l, kind, start)
+        }
+        none {
+        }
+    }
+    match two_bytes(a, b) {
+        some(value as kind: TokenKind) {
+            l.pos += 2
+            return add_token(inout l, kind, start)
+        }
+        none {
+        }
+    }
+    match one_byte(a) {
+        some(value as kind: TokenKind) {
+            l.pos += 1
+            return add_token(inout l, kind, start)
+        }
+        none {
+        }
+    }
+    l.pos += 1
+    if a > ' ' && a < 0x7F {
+        return fail(inout l, start, Problem.unexpected_char.(c: a))
+    }
+    return fail(inout l, start, Problem.unexpected_control.(c: a))
+}
+
+fn three_bytes(a: u8, b: u8, c: u8) -> ?TokenKind {
+    if a == '.' && b == '.' && c == '.' {
+        return some.(value: TokenKind.dot_dot_dot)
+    }
+    if a == '<' && b == '<' && c == '=' {
+        return some.(value: TokenKind.shl_eq)
+    }
+    if a == '>' && b == '>' && c == '=' {
+        return some.(value: TokenKind.shr_eq)
+    }
+    return none
+}
+
+fn two_bytes(a: u8, b: u8) -> ?TokenKind {
+    match a {
+        '.' {
+            match b {
+                '.' { return some.(value: TokenKind.dot_dot) }
+                '*' { return some.(value: TokenKind.dot_star) }
+                _ { return none }
+            }
+        }
+        '-' {
+            match b {
+                '>' { return some.(value: TokenKind.arrow) }
+                '=' { return some.(value: TokenKind.minus_eq) }
+                _ { return none }
+            }
+        }
+        '<' {
+            match b {
+                '=' { return some.(value: TokenKind.lt_eq) }
+                '<' { return some.(value: TokenKind.shl) }
+                _ { return none }
+            }
+        }
+        '>' {
+            match b {
+                '=' { return some.(value: TokenKind.gt_eq) }
+                '>' { return some.(value: TokenKind.shr) }
+                _ { return none }
+            }
+        }
+        '&' {
+            match b {
+                '&' { return some.(value: TokenKind.amp_amp) }
+                '=' { return some.(value: TokenKind.amp_eq) }
+                _ { return none }
+            }
+        }
+        '|' {
+            match b {
+                '|' { return some.(value: TokenKind.pipe_pipe) }
+                '=' { return some.(value: TokenKind.pipe_eq) }
+                _ { return none }
+            }
+        }
+        _ {
+        }
+    }
+    if b != '=' {
+        return none
+    }
+    match a {
+        '=' { return some.(value: TokenKind.eq_eq) }
+        '!' { return some.(value: TokenKind.bang_eq) }
+        '+' { return some.(value: TokenKind.plus_eq) }
+        '*' { return some.(value: TokenKind.star_eq) }
+        '/' { return some.(value: TokenKind.slash_eq) }
+        '%' { return some.(value: TokenKind.percent_eq) }
+        '^' { return some.(value: TokenKind.caret_eq) }
+        _ { return none }
+    }
+}
+
+fn one_byte(a: u8) -> ?TokenKind {
+    match a {
+        '(' { return some.(value: TokenKind.l_paren) }
+        ')' { return some.(value: TokenKind.r_paren) }
+        '[' { return some.(value: TokenKind.l_bracket) }
+        ']' { return some.(value: TokenKind.r_bracket) }
+        ',' { return some.(value: TokenKind.comma) }
+        ':' { return some.(value: TokenKind.colon) }
+        ';' { return some.(value: TokenKind.semicolon) }
+        '.' { return some.(value: TokenKind.dot) }
+        '?' { return some.(value: TokenKind.question) }
+        '!' { return some.(value: TokenKind.bang) }
+        '~' { return some.(value: TokenKind.tilde) }
+        '+' { return some.(value: TokenKind.plus) }
+        '-' { return some.(value: TokenKind.minus) }
+        '*' { return some.(value: TokenKind.star) }
+        '/' { return some.(value: TokenKind.slash) }
+        '%' { return some.(value: TokenKind.percent) }
+        '&' { return some.(value: TokenKind.amp) }
+        '|' { return some.(value: TokenKind.pipe) }
+        '^' { return some.(value: TokenKind.caret) }
+        '=' { return some.(value: TokenKind.eq) }
+        '<' { return some.(value: TokenKind.lt) }
+        '>' { return some.(value: TokenKind.gt) }
+        _ { return none }
+    }
+}
