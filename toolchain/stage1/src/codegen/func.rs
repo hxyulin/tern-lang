@@ -1094,6 +1094,34 @@ impl<'a> FnGen<'_, 'a> {
         }
     }
 
+    /// Leaves the value of `ty` at `v` empty, as `take` does: every
+    /// `[..]T` in it, directly or in a field, has no buffer, and every
+    /// optional that holds one is `none`.
+    fn empty(&mut self, v: Value, ty: TyId) {
+        let core = self.g.core(ty);
+        match self.g.types.get(core) {
+            Ty::Growable(_) => {
+                self.empty_growable(v);
+                return;
+            }
+            Ty::Optional(_) => {
+                let (none, kind) = self.g.variant(core, "none");
+                if let EnumKind::Tagged { tag, .. } = kind {
+                    let t = self.iconst(tag, none.tag);
+                    self.ins().store(t, v);
+                }
+                return;
+            }
+            _ => {}
+        }
+        for (_, field_ty, offset) in self.g.record_fields(core).unwrap_or_default() {
+            if self.g.holds_growable(field_ty) {
+                let addr = self.offset(v, offset);
+                self.empty(addr, field_ty);
+            }
+        }
+    }
+
     /// Whether a `let` argument can pass the address of its storage: a
     /// local, or a field or element of one held in the local's own memory
     /// or its `[..]T`. A global, or a value reached through a view or a
@@ -2609,7 +2637,7 @@ impl<'a> FnGen<'_, 'a> {
                 let v = self.addr_of(arg(0));
                 let out = self.temp(vty);
                 self.store(V::M(v), vty, out, false);
-                self.empty_growable(v);
+                self.empty(v, vty);
                 V::M(out)
             }
             "fill" => {

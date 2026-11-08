@@ -1212,6 +1212,15 @@ together: rule 1, rule 4, then rules 3 and 2, which need std and ternc
 to store spans and owned text instead of views. Until a rule is built,
 the program it would reject still compiles.
 
+- **Rule 1: built (2026-11-09)** in both checkers, with `take` on
+  records, tuples and optionals in both code generators. Not yet: a
+  deep `free` and `clear` (both still free one level), and `copy`,
+  which no code generator lowers and which rejects owning elements.
+  Bringing ternc under the rule split each pass's read-only input from
+  its state (see [Values and buffers](#values-and-buffers)), and made
+  the code generator's enum shapes and signatures ranges into shared
+  arrays instead of owning their own.
+
 ### Bounds checks, no null, no pointer arithmetic
 
 **Decided.** Safe code gets bounds-checked indexing, no null, and no
@@ -1259,21 +1268,33 @@ type copies byte for byte, as before.
   construction, a literal, `make(alloc)`, `take(inout a)` or
   `try copy(alloc, a)`. Reading a place of owning type into a new home
   is an error that names both.
-- **`take(inout v)`** returns the value and leaves `v` empty: no
-  buffer, length and capacity 0, the same allocator. For a record it
-  empties every owning part. `v` stays valid, so the checker tracks no
-  moved-from state; this is what made the earlier move-only types heavy.
-- **`return` of a local takes it.** `return v` or `return ok.(value:
-  r.items)`, where the place starts at a local of the function, leaves
-  the local empty before any `defer` runs, so `defer free(inout v)`
-  frees nothing. A parameter or a global still needs `take`.
+- **`take(inout v)`** returns the value and leaves `v` empty. An empty
+  `[..]T` has no buffer, length and capacity 0, and the same
+  allocator; an empty optional is `none`; a record or tuple empties
+  each owning part. An enum with an owning payload has no empty value,
+  so it cannot be taken; take it whole through an optional, or match a
+  temporary. `v` stays valid, so the checker tracks no moved-from
+  state; this is what made the earlier move-only types heavy.
+- **`return` takes the function's own locals.** In `return v` or
+  `return ok.(value: Bag.(items: v))`, a place that starts at a `let`
+  or `var` local of the function, not a parameter, is handed over
+  without `take`, since the local ends there. Each place is taken once.
+  If a pending `defer` mentions the local, the `return` must write
+  `take(inout v)`, so the `defer` sees it empty: code generation never
+  empties a local behind the reader's back.
 - **`try copy(alloc, v)`** is a deep copy into a new buffer from
   `alloc`.
-- **Borrowing needs no copy.** A `let` argument, a `for let` element and
-  a `match` payload bound from a place read the value where it lives;
-  they cannot be stored without `take` or `copy`. A `var` payload of
-  owning type needs a scrutinee that is not a place, such as
-  `match take(inout x)` or `match try f()`.
+- **Borrowing needs no copy.** A `let` argument, a `let` local
+  initialized from a place, a `for let` element and a `match` payload
+  bound from a place read the value where it lives; they cannot be
+  stored or returned without `take` or `copy`. A `var` local, and a
+  `var` payload of owning type, need a value of their own: a scrutinee
+  that is not a place, such as `match take(inout x)` or
+  `match try f()`.
+- **Handing a value to a function** takes an `inout` parameter that
+  the callee takes from, as `add_file(inout l, inout parsed.ast)` in
+  ternc's loader. Open: Hylo's `sink` mode, which tern dropped with
+  move-only types, would say this directly.
 - **`free(inout v)` is deep.** It frees every buffer `v` owns, at every
   level, and leaves `v` empty. Freeing an empty value does nothing, so a
   second `free` is harmless. With one owner per buffer this is
@@ -1290,6 +1311,25 @@ nothing moves and every variable is always valid, and adds back one
 owner per buffer, which verification needs. Under the handle design,
 `var all: [..]V = args` followed by `push(inout all, x)` left `args`
 pointing at a freed buffer whenever the push moved the elements.
+
+**Decided (2026-11-09): read-only input is a separate `let`
+parameter.** A record cannot hold a shared copy of owned data, and a
+borrow of a context's data conflicts with passing the context `inout`.
+So a pass such as a checker splits what it reads from what it changes:
+the inputs, such as the program and its name tables, go in one record
+passed as a `let` parameter, and the state it builds is the `inout`
+context. Hylo code is written the same way, and a verifier sees each
+function's inputs and outputs directly. The user chose this over a
+record kind that holds borrows, which would bring back a type that
+spreads a restriction to every type containing it.
+
+```
+fn check_expr(input: Input, c: inout Checker, e: ExprId) -> TyId ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(c.file)].ast
+    ...
+    try report(inout c, span, "...")
+}
+```
 
 Rejected:
 

@@ -461,9 +461,9 @@ fn encode(t: inout Types, ty: Ty, out: inout [..]u32) -> ! OutOfMemory {
 // they are dropped again.
 pub fn intern(t: inout Types, ty: Ty) -> TyId ! OutOfMemory {
     let start: usize = t.words.len
-    var words: [..]u32 = t.words
+    var words: [..]u32 = take(inout t.words)
     try encode(inout t, ty, inout words)
-    t.words = words
+    t.words = take(inout words)
     let key: []u32 = t.words[start..]
     if t.slots.len > 0 {
         let mask: u64 = u64.(t.slots.len) - 1

@@ -7,9 +7,9 @@ import syntax
 
 // Checks e against expected and returns expected, or never if e never
 // finishes.
-fn check_expect(c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: TyId) -> TyId ! OutOfMemory {
-    let actual: TyId = try check_value(inout c, inout fx, e, some.(value: expected))
-    try expect_ty(inout c, fx.file, expr_span(fx, e).start, actual, expected)
+fn check_expect(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: TyId) -> TyId ! OutOfMemory {
+    let actual: TyId = try check_value(input, inout c, inout fx, e, some.(value: expected))
+    try expect_ty(inout c, fx.file, expr_span(input, fx, e).start, actual, expected)
     if is_never(c.types, actual) {
         return ok.(value: actual)
     }
@@ -17,9 +17,9 @@ fn check_expect(c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: TyId
 }
 
 // The type of e, which must be a value.
-fn check_value(c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
-    let start: u32 = expr_span(fx, e).start
-    match try check_expr(inout c, inout fx, e, expected) {
+fn check_value(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
+    let start: u32 = expr_span(input, fx, e).start
+    match try check_expr(input, inout c, inout fx, e, expected) {
         value(ty: TyId) {
             return ok.(value: ty)
         }
@@ -77,8 +77,9 @@ fn builtin_is(res: ?resolve.Res, a: []u8, b: []u8, d: []u8) -> bool {
 
 // Whether e takes its type from context: literals, `none`, `ok`,
 // `some.(...)` and array literals.
-fn needs_context(c: Checker, fx: Fx, e: syntax.ExprId) -> bool {
-    match fx.ast.exprs[usize.(e)].kind {
+fn needs_context(input: Input, c: Checker, fx: Fx, e: syntax.ExprId) -> bool {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    match ast.exprs[usize.(e)].kind {
         int, float, char {
             return true
         }
@@ -86,19 +87,19 @@ fn needs_context(c: Checker, fx: Fx, e: syntax.ExprId) -> bool {
             return true
         }
         paren(inner: syntax.ExprId) {
-            return needs_context(c, fx, inner)
+            return needs_context(input, c, fx, inner)
         }
         unary(op: syntax.UnaryOp, operand: syntax.ExprId) {
             if op == syntax.UnaryOp.neg || op == syntax.UnaryOp.bit_not {
-                return needs_context(c, fx, operand)
+                return needs_context(input, c, fx, operand)
             }
             return false
         }
         name(name: _) {
-            return builtin_is(expr_res(c, fx.file, e), "none", "ok", "ok")
+            return builtin_is(expr_res(input, fx.file, e), "none", "ok", "ok")
         }
         construct(ty as target: syntax.ExprId, value: _) {
-            return builtin_is(expr_res(c, fx.file, target), "some", "ok", "err")
+            return builtin_is(expr_res(input, fx.file, target), "some", "ok", "err")
         }
         _ {
             return false
@@ -106,8 +107,8 @@ fn needs_context(c: Checker, fx: Fx, e: syntax.ExprId) -> bool {
     }
 }
 
-fn check_expr(c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) -> Item ! OutOfMemory {
-    let item: Item = try expr_item(inout c, inout fx, e, expected)
+fn check_expr(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) -> Item ! OutOfMemory {
+    let item: Item = try expr_item(input, inout c, inout fx, e, expected)
     c.files[usize.(fx.file)].exprs[usize.(e)] = some.(value: item)
     return ok.(value: item)
 }
@@ -120,17 +121,18 @@ fn error_item(c: inout Checker) -> Item ! OutOfMemory {
     return ok.(value: Item.value.(ty: try error_ty(inout c.types)))
 }
 
-fn expr_item(c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) -> Item ! OutOfMemory {
-    let span: syntax.Span = expr_span(fx, e)
-    match fx.ast.exprs[usize.(e)].kind {
+fn expr_item(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) -> Item ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    let span: syntax.Span = expr_span(input, fx, e)
+    match ast.exprs[usize.(e)].kind {
         name(name: syntax.Span) {
-            return expr_name(inout c, inout fx, e, name, expected)
+            return expr_name(input, inout c, inout fx, e, name, expected)
         }
         int {
-            return value_item(inout c, try int_literal(inout c, fx, span, false, expected))
+            return value_item(inout c, try int_literal(input, inout c, fx, span, false, expected))
         }
         char {
-            let v: ?Wide = char_value(file_text(c, fx.file, span))
+            let v: ?Wide = char_value(file_text(input, fx.file, span))
             return value_item(inout c, try int_with_value(inout c, fx, span.start, v, expected, "a character literal"))
         }
         float {
@@ -150,36 +152,36 @@ fn expr_item(c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) 
             }
         }
         str(parts: syntax.List) {
-            return value_item(inout c, try string_lit(inout c, inout fx, parts, expected))
+            return value_item(inout c, try string_lit(input, inout c, inout fx, parts, expected))
         }
         paren(inner: syntax.ExprId) {
-            return check_expr(inout c, inout fx, inner, expected)
+            return check_expr(input, inout c, inout fx, inner, expected)
         }
         unsafe_expr(body: syntax.ExprId) {
             let outer: bool = fx.in_unsafe
             fx.in_unsafe = true
-            let ty: TyId = try check_value(inout c, inout fx, body, expected)
+            let ty: TyId = try check_value(input, inout c, inout fx, body, expected)
             fx.in_unsafe = outer
             return value_item(inout c, ty)
         }
         tuple(items: syntax.List) {
-            return value_item(inout c, try tuple_lit(inout c, inout fx, span.start, items, expected))
+            return value_item(inout c, try tuple_lit(input, inout c, inout fx, span.start, items, expected))
         }
         call(callee: syntax.ExprId, args: syntax.List) {
-            return call_expr(inout c, inout fx, span.start, callee, args, expected)
+            return call_expr(input, inout c, inout fx, span.start, callee, args, expected)
         }
         field(value: syntax.ExprId, name: syntax.Span) {
-            return field_access(inout c, inout fx, e, value, name)
+            return field_access(input, inout c, inout fx, e, value, name)
         }
         construct(ty as target: syntax.ExprId, value: syntax.ExprId) {
-            return construct_expr(inout c, inout fx, span.start, target, value, expected)
+            return construct_expr(input, inout c, inout fx, span.start, target, value, expected)
         }
         index(value: syntax.ExprId, index as i: syntax.Index) {
-            return value_item(inout c, try index_expr(inout c, inout fx, value, i))
+            return value_item(inout c, try index_expr(input, inout c, inout fx, value, i))
         }
         deref(inner: syntax.ExprId) {
             try require_unsafe(inout c, fx, span.start, "reading or writing through a pointer with `.*`")
-            let ty: TyId = try check_value(inout c, inout fx, inner, none)
+            let ty: TyId = try check_value(input, inout c, inout fx, inner, none)
             match get(c.types, ty) {
                 pointer(elem: TyId) {
                     return value_item(inout c, elem)
@@ -195,17 +197,17 @@ fn expr_item(c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) 
             }
         }
         unary(op: syntax.UnaryOp, operand: syntax.ExprId) {
-            return value_item(inout c, try unary_expr(inout c, inout fx, span.start, op, operand, expected))
+            return value_item(inout c, try unary_expr(input, inout c, inout fx, span.start, op, operand, expected))
         }
         try_expr(operand: syntax.ExprId) {
-            return try_item(inout c, inout fx, span.start, operand)
+            return try_item(input, inout c, inout fx, span.start, operand)
         }
         binary(op: syntax.BinaryOp, left: syntax.ExprId, right: syntax.ExprId) {
-            return value_item(inout c, try binary_expr(inout c, inout fx, span.start, op, left, right, expected))
+            return value_item(inout c, try binary_expr(input, inout c, inout fx, span.start, op, left, right, expected))
         }
         if_expr(cond: syntax.ExprId, then: syntax.ExprId, otherwise: syntax.IfElse) {
             let b: TyId = try bool_ty(inout c.types)
-            let _: TyId = try check_expect(inout c, inout fx, cond, b)
+            let _: TyId = try check_expect(input, inout c, inout fx, cond, b)
             var other: syntax.ExprId = then
             match otherwise {
                 branch(value as o: syntax.ExprId) {
@@ -216,15 +218,16 @@ fn expr_item(c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) 
                 }
             }
             let bodies: [2]syntax.ExprId = [then, other]
-            return value_item(inout c, try branches(inout c, inout fx, bodies, expected))
+            return value_item(inout c, try branches(input, inout c, inout fx, bodies, expected))
         }
         match_expr(value: syntax.ExprId, arms: syntax.List) {
-            let scrutinee: TyId = try check_value(inout c, inout fx, value, none)
+            let scrutinee: TyId = try check_value(input, inout c, inout fx, value, none)
+            let borrowed: bool = is_place(input, c, fx, value)
             var coverage: Coverage = Coverage.(variants: make(c.alloc), wildcard: false)
             var bodies: [..]syntax.ExprId = make(c.alloc)
-            for let i: u32 in syntax.items(fx.ast.extra, arms) {
-                let arm: syntax.Arm = fx.ast.arms[usize.(i)]
-                try check_patterns(inout c, inout fx, arm.patterns, scrutinee, inout coverage)
+            for let i: u32 in syntax.items(ast.extra, arms) {
+                let arm: syntax.Arm = ast.arms[usize.(i)]
+                try check_patterns(input, inout c, inout fx, arm.patterns, scrutinee, borrowed, inout coverage)
                 match arm.body {
                     branch(value as b: syntax.ExprId) {
                         try push(inout bodies, b)
@@ -233,21 +236,21 @@ fn expr_item(c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: ?TyId) 
                     }
                 }
             }
-            try exhaustive(inout c, fx, expr_span(fx, value).start, scrutinee, coverage)
-            return value_item(inout c, try branches(inout c, inout fx, bodies, expected))
+            try exhaustive(inout c, fx, expr_span(input, fx, value).start, scrutinee, coverage)
+            return value_item(inout c, try branches(input, inout c, inout fx, bodies, expected))
         }
         array(elems: syntax.List) {
-            return value_item(inout c, try array_lit(inout c, inout fx, span.start, elems, expected))
+            return value_item(inout c, try array_lit(input, inout c, inout fx, span.start, elems, expected))
         }
     }
 }
 
 // The common type of `if` or `match` branches.
-fn branches(c: inout Checker, fx: inout Fx, bodies: []syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
+fn branches(input: Input, c: inout Checker, fx: inout Fx, bodies: []syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
     match expected {
         some(value as want: TyId) {
             for let b: syntax.ExprId in bodies {
-                let _: TyId = try check_expect(inout c, inout fx, b, want)
+                let _: TyId = try check_expect(input, inout c, inout fx, b, want)
             }
             return ok.(value: want)
         }
@@ -258,10 +261,10 @@ fn branches(c: inout Checker, fx: inout Fx, bodies: []syntax.ExprId, expected: ?
     for let b: syntax.ExprId in bodies {
         match result {
             some(value as ty: TyId) {
-                let _: TyId = try check_expect(inout c, inout fx, b, ty)
+                let _: TyId = try check_expect(input, inout c, inout fx, b, ty)
             }
             none {
-                let ty: TyId = try check_value(inout c, inout fx, b, none)
+                let ty: TyId = try check_value(input, inout c, inout fx, b, none)
                 if !is_never(c.types, ty) {
                     result = some.(value: ty)
                 }
@@ -278,11 +281,14 @@ fn branches(c: inout Checker, fx: inout Fx, bodies: []syntax.ExprId, expected: ?
     }
 }
 
-fn expr_name(c: inout Checker, fx: inout Fx, e: syntax.ExprId, name: syntax.Span, expected: ?TyId) -> Item ! OutOfMemory {
-    match expr_res(c, fx.file, e) {
+fn expr_name(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, name: syntax.Span, expected: ?TyId) -> Item ! OutOfMemory {
+    match expr_res(input, fx.file, e) {
         some(value as res: resolve.Res) {
             match res {
                 local(id: u32) {
+                    if fx.collecting {
+                        try push(inout fx.mentioned, id)
+                    }
                     match local_info(fx, id) {
                         some(value as info: LocalInfo) {
                             return value_item(inout c, info.ty)
@@ -293,11 +299,11 @@ fn expr_name(c: inout Checker, fx: inout Fx, e: syntax.ExprId, name: syntax.Span
                     }
                 }
                 decl(decl as d: maps.DeclRef) {
-                    try use_decl(inout c, fx, e, d, name)
-                    return decl_item(inout c, d, file_text(c, fx.file, name))
+                    try use_decl(input, inout c, fx, e, d, name)
+                    return decl_item(input, inout c, d, file_text(input, fx.file, name))
                 }
                 builtin(name as b: []u8) {
-                    return builtin_name(inout c, fx, name.start, b, expected)
+                    return builtin_name(input, inout c, fx, name.start, b, expected)
                 }
                 package(id: _) {
                     return error_item(inout c)
@@ -310,9 +316,9 @@ fn expr_name(c: inout Checker, fx: inout Fx, e: syntax.ExprId, name: syntax.Span
     }
 }
 
-fn builtin_name(c: inout Checker, fx: Fx, start: u32, name: []u8, expected: ?TyId) -> Item ! OutOfMemory {
+fn builtin_name(input: Input, c: inout Checker, fx: Fx, start: u32, name: []u8, expected: ?TyId) -> Item ! OutOfMemory {
     if resolve.is_builtin_type(name) {
-        return ok.(value: Item.type_item.(ty: try builtin_type(inout c, name)))
+        return ok.(value: Item.type_item.(ty: try builtin_type(input, inout c, name)))
     }
     match name {
         "true", "false" {
@@ -373,8 +379,8 @@ fn unknown_literal(c: inout Checker, fx: Fx, start: u32, what: []u8) -> ! OutOfM
     return report(inout c, fx.file, start, try program.format_text(c.alloc, "the type of this {what} literal is unknown; convert it, as in `u32.(1)`"))
 }
 
-fn int_literal(c: inout Checker, fx: Fx, span: syntax.Span, negative: bool, expected: ?TyId) -> TyId ! OutOfMemory {
-    var v: ?Wide = parse_int(file_text(c, fx.file, span))
+fn int_literal(input: Input, c: inout Checker, fx: Fx, span: syntax.Span, negative: bool, expected: ?TyId) -> TyId ! OutOfMemory {
+    var v: ?Wide = parse_int(file_text(input, fx.file, span))
     if negative {
         match v {
             some(value as n: Wide) {
@@ -440,17 +446,18 @@ fn int_fits(c: inout Checker, fx: Fx, start: u32, v: ?Wide, ty: TyId) -> ! OutOf
     return ok
 }
 
-fn string_lit(c: inout Checker, fx: inout Fx, parts: syntax.List, expected: ?TyId) -> TyId ! OutOfMemory {
+fn string_lit(input: Input, c: inout Checker, fx: inout Fx, parts: syntax.List, expected: ?TyId) -> TyId ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     var interpolated: bool = false
-    for let i: u32 in syntax.items(fx.ast.extra, parts) {
-        match fx.ast.str_parts[usize.(i)] {
+    for let i: u32 in syntax.items(ast.extra, parts) {
+        match ast.str_parts[usize.(i)] {
             interpolation(value as e: syntax.ExprId) {
                 interpolated = true
-                let ty: TyId = try check_value(inout c, inout fx, e, none)
+                let ty: TyId = try check_value(input, inout c, inout fx, e, none)
                 var part: ?TyId = none
-                match fmt_part(c) {
+                match fmt_part(input) {
                     some(value as p: maps.DeclRef) {
-                        part = some.(value: try named_type(inout c, NamedId.decl.(decl: p)))
+                        part = some.(value: try named_type(input, inout c, NamedId.decl.(decl: p)))
                     }
                     none {
                     }
@@ -482,14 +489,14 @@ fn string_lit(c: inout Checker, fx: inout Fx, parts: syntax.List, expected: ?TyI
                 }
                 if !fine {
                     let shown: []u8 = try show(inout c, ty)
-                    try report(inout c, fx.file, expr_span(fx, e).start, try program.format_text(c.alloc, "`{shown}` cannot be interpolated; `\{}` takes integers, `bool`, `[]u8`, a `Format` and `fmt.Part`"))
+                    try report(inout c, fx.file, expr_span(input, fx, e).start, try program.format_text(c.alloc, "`{shown}` cannot be interpolated; `\{}` takes integers, `bool`, `[]u8`, a `Format` and `fmt.Part`"))
                 }
             }
             text(span: _) {
             }
         }
     }
-    let format: TyId = try named_type(inout c, NamedId.builtin.(which: BuiltinNamed.format))
+    let format: TyId = try named_type(input, inout c, NamedId.builtin.(which: BuiltinNamed.format))
     var wants_format: bool = false
     match expected {
         some(value as want: TyId) {
@@ -504,8 +511,9 @@ fn string_lit(c: inout Checker, fx: inout Fx, parts: syntax.List, expected: ?TyI
     return bytes_ty(inout c.types)
 }
 
-fn tuple_lit(c: inout Checker, fx: inout Fx, start: u32, items: syntax.List, expected: ?TyId) -> TyId ! OutOfMemory {
-    let list: []u32 = syntax.items(fx.ast.extra, items)
+fn tuple_lit(input: Input, c: inout Checker, fx: inout Fx, start: u32, items: syntax.List, expected: ?TyId) -> TyId ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    let list: []u32 = syntax.items(ast.extra, items)
     match expected {
         some(value as want: TyId) {
             match get(c.types, want) {
@@ -514,8 +522,8 @@ fn tuple_lit(c: inout Checker, fx: inout Fx, start: u32, items: syntax.List, exp
                     var same: bool = wanted.len == list.len
                     if same {
                         for let i: usize in 0..list.len {
-                            let item: syntax.TupleItem = fx.ast.tuple_items[usize.(list[i])]
-                            if !program.bytes_equal(file_text(c, fx.file, item.name), wanted[i].name) {
+                            let item: syntax.TupleItem = ast.tuple_items[usize.(list[i])]
+                            if !program.bytes_equal(file_text(input, fx.file, item.name), wanted[i].name) {
                                 same = false
                             }
                         }
@@ -533,8 +541,8 @@ fn tuple_lit(c: inout Checker, fx: inout Fx, start: u32, items: syntax.List, exp
                             if i > 0 {
                                 try append(inout names, ", ")
                             }
-                            let item: syntax.TupleItem = fx.ast.tuple_items[usize.(list[i])]
-                            try append(inout names, file_text(c, fx.file, item.name))
+                            let item: syntax.TupleItem = ast.tuple_items[usize.(list[i])]
+                            try append(inout names, file_text(input, fx.file, item.name))
                         }
                         let a: []u8 = want_names
                         let b: []u8 = names
@@ -542,8 +550,9 @@ fn tuple_lit(c: inout Checker, fx: inout Fx, start: u32, items: syntax.List, exp
                         return error_ty(inout c.types)
                     }
                     for let i: usize in 0..list.len {
-                        let item: syntax.TupleItem = fx.ast.tuple_items[usize.(list[i])]
-                        let _: TyId = try check_expect(inout c, inout fx, item.value, wanted[i].ty)
+                        let item: syntax.TupleItem = ast.tuple_items[usize.(list[i])]
+                        let _: TyId = try check_expect(input, inout c, inout fx, item.value, wanted[i].ty)
+                        try fresh(input, inout c, inout fx, item.value, wanted[i].ty)
                     }
                     return ok.(value: want)
                 }
@@ -556,15 +565,17 @@ fn tuple_lit(c: inout Checker, fx: inout Fx, start: u32, items: syntax.List, exp
     }
     var fields: [..]TupleField = make(c.alloc)
     for let i: u32 in list {
-        let item: syntax.TupleItem = fx.ast.tuple_items[usize.(i)]
-        let ty: TyId = try check_value(inout c, inout fx, item.value, none)
-        try push(inout fields, TupleField.(name: file_text(c, fx.file, item.name), ty: ty))
+        let item: syntax.TupleItem = ast.tuple_items[usize.(i)]
+        let ty: TyId = try check_value(input, inout c, inout fx, item.value, none)
+        try fresh(input, inout c, inout fx, item.value, ty)
+        try push(inout fields, TupleField.(name: file_text(input, fx.file, item.name), ty: ty))
     }
     return tuple_ty(inout c.types, fields)
 }
 
-fn array_lit(c: inout Checker, fx: inout Fx, start: u32, elems: syntax.List, expected: ?TyId) -> TyId ! OutOfMemory {
-    let list: []u32 = syntax.items(fx.ast.extra, elems)
+fn array_lit(input: Input, c: inout Checker, fx: inout Fx, start: u32, elems: syntax.List, expected: ?TyId) -> TyId ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    let list: []u32 = syntax.items(ast.extra, elems)
     match expected {
         none {
             try report(inout c, fx.file, start, "the type of this array literal is unknown")
@@ -574,7 +585,8 @@ fn array_lit(c: inout Checker, fx: inout Fx, start: u32, elems: syntax.List, exp
             match get(c.types, want) {
                 array(len: u64, elem: TyId) {
                     for let e: u32 in list {
-                        let _: TyId = try check_expect(inout c, inout fx, syntax.ExprId.(e), elem)
+                        let _: TyId = try check_expect(input, inout c, inout fx, syntax.ExprId.(e), elem)
+                        try fresh(input, inout c, inout fx, syntax.ExprId.(e), elem)
                     }
                     if u64.(list.len) != len {
                         let found: usize = list.len
@@ -595,14 +607,14 @@ fn array_lit(c: inout Checker, fx: inout Fx, start: u32, elems: syntax.List, exp
     }
 }
 
-fn field_access(c: inout Checker, fx: inout Fx, e: syntax.ExprId, value: syntax.ExprId, name: syntax.Span) -> Item ! OutOfMemory {
-    let text: []u8 = file_text(c, fx.file, name)
-    match expr_res(c, fx.file, e) {
+fn field_access(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, value: syntax.ExprId, name: syntax.Span) -> Item ! OutOfMemory {
+    let text: []u8 = file_text(input, fx.file, name)
+    match expr_res(input, fx.file, e) {
         some(value as res: resolve.Res) {
             match res {
                 decl(decl as d: maps.DeclRef) {
-                    try use_decl(inout c, fx, e, d, expr_span(fx, e))
-                    return decl_item(inout c, d, text)
+                    try use_decl(input, inout c, fx, e, d, expr_span(input, fx, e))
+                    return decl_item(input, inout c, d, text)
                 }
                 _ {
                 }
@@ -612,15 +624,15 @@ fn field_access(c: inout Checker, fx: inout Fx, e: syntax.ExprId, value: syntax.
         }
     }
     var base: TyId = 0
-    match try check_expr(inout c, inout fx, value, none) {
+    match try check_expr(input, inout c, inout fx, value, none) {
         type_item(ty: TyId) {
-            return variant_item(inout c, fx, ty, name)
+            return variant_item(input, inout c, fx, ty, name)
         }
         value(ty: TyId) {
             base = ty
         }
         _ {
-            base = try check_value(inout c, inout fx, value, none)
+            base = try check_value(input, inout c, inout fx, value, none)
         }
     }
     let is_len: bool = program.bytes_equal(text, "len")
@@ -651,7 +663,7 @@ fn field_access(c: inout Checker, fx: inout Fx, e: syntax.ExprId, value: syntax.
         }
     }
     var field: ?RecordField = none
-    match try record_fields(c, base, fx.file) {
+    match try record_fields(input, c, base, fx.file) {
         some(value as fields: []RecordField) {
             field = find_field(fields, text)
         }
@@ -693,8 +705,8 @@ fn field_access(c: inout Checker, fx: inout Fx, e: syntax.ExprId, value: syntax.
 }
 
 // `T.name`: a variant of the enum T.
-fn variant_item(c: inout Checker, fx: Fx, ty: TyId, name: syntax.Span) -> Item ! OutOfMemory {
-    let text: []u8 = file_text(c, fx.file, name)
+fn variant_item(input: Input, c: inout Checker, fx: Fx, ty: TyId, name: syntax.Span) -> Item ! OutOfMemory {
+    let text: []u8 = file_text(input, fx.file, name)
     var is_enum: bool = false
     match info_of(c, ty) {
         some(value as info: NamedInfo) {
@@ -752,9 +764,9 @@ fn variant_payload(c: Checker, ty: TyId, index: u32) -> ?TyId {
 }
 
 // `T.(value)`: construction, wrapping and numeric conversion.
-fn construct_expr(c: inout Checker, fx: inout Fx, start: u32, target: syntax.ExprId, value: syntax.ExprId, expected: ?TyId) -> Item ! OutOfMemory {
+fn construct_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, target: syntax.ExprId, value: syntax.ExprId, expected: ?TyId) -> Item ! OutOfMemory {
     var target_item: Item = Item.nothing
-    let res: ?resolve.Res = expr_res(c, fx.file, target)
+    let res: ?resolve.Res = expr_res(input, fx.file, target)
     if builtin_is(res, "some", "ok", "err") {
         match res_builtin(res) {
             some(value as name: []u8) {
@@ -764,7 +776,7 @@ fn construct_expr(c: inout Checker, fx: inout Fx, start: u32, target: syntax.Exp
             }
         }
     } else {
-        target_item = try check_expr(inout c, inout fx, target, none)
+        target_item = try check_expr(input, inout c, inout fx, target, none)
     }
     var ty: TyId = 0
     match target_item {
@@ -774,7 +786,8 @@ fn construct_expr(c: inout Checker, fx: inout Fx, start: u32, target: syntax.Exp
         variant(ty as t: TyId, index: u32) {
             match variant_payload(c, t, index) {
                 some(value as payload: TyId) {
-                    let _: TyId = try check_expect(inout c, inout fx, value, payload)
+                    let _: TyId = try check_expect(input, inout c, inout fx, value, payload)
+                    try fresh(input, inout c, inout fx, value, payload)
                 }
                 none {
                 }
@@ -784,7 +797,7 @@ fn construct_expr(c: inout Checker, fx: inout Fx, start: u32, target: syntax.Exp
         builtin(name: []u8) {
             match name {
                 "some", "ok", "err" {
-                    return value_item(inout c, try construct_builtin(inout c, inout fx, start, name, value, expected))
+                    return value_item(inout c, try construct_builtin(input, inout c, inout fx, start, name, value, expected))
                 }
                 _ {
                 }
@@ -794,7 +807,7 @@ fn construct_expr(c: inout Checker, fx: inout Fx, start: u32, target: syntax.Exp
         }
         value(ty as t: TyId) {
             if is_error(c.types, t) {
-                let _: TyId = try check_value(inout c, inout fx, value, none)
+                let _: TyId = try check_value(input, inout c, inout fx, value, none)
                 return value_item(inout c, t)
             }
             try report(inout c, fx.file, start, "only a type or a variant is built with `.(...)`")
@@ -807,7 +820,7 @@ fn construct_expr(c: inout Checker, fx: inout Fx, start: u32, target: syntax.Exp
     }
     match get(c.types, ty) {
         int(int: _), float(bits: _) {
-            try convert_number(inout c, inout fx, value, ty)
+            try convert_number(input, inout c, inout fx, value, ty)
             return value_item(inout c, ty)
         }
         named(id: _) {
@@ -837,7 +850,7 @@ fn construct_expr(c: inout Checker, fx: inout Fx, start: u32, target: syntax.Exp
                 }
             }
             if kind == 1 {
-                match try record_fields(c, ty, fx.file) {
+                match try record_fields(input, c, ty, fx.file) {
                     some(value as fields: []RecordField) {
                         for let f: RecordField in fields {
                             if !f.visible {
@@ -850,11 +863,12 @@ fn construct_expr(c: inout Checker, fx: inout Fx, start: u32, target: syntax.Exp
                     none {
                     }
                 }
-                let _: TyId = try check_expect(inout c, inout fx, value, underlying)
+                let _: TyId = try check_expect(input, inout c, inout fx, value, underlying)
+                try fresh(input, inout c, inout fx, value, underlying)
             } else if kind == 2 {
                 // A checked conversion from an integer.
-                let inner: syntax.ExprId = paren_inner(fx, value)
-                let actual: TyId = try check_value(inout c, inout fx, inner, none)
+                let inner: syntax.ExprId = paren_inner(input, fx, value)
+                let actual: TyId = try check_value(input, inout c, inout fx, inner, none)
                 let from_int: bool = match int_core(c, actual) {
                     some(value: _) { true }
                     none { false }
@@ -880,7 +894,7 @@ fn construct_expr(c: inout Checker, fx: inout Fx, start: u32, target: syntax.Exp
     }
 }
 
-fn construct_builtin(c: inout Checker, fx: inout Fx, start: u32, name: []u8, value: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
+fn construct_builtin(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: []u8, value: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
     var field: []u8 = ""
     var payload_ty: TyId = 0
     var fits: bool = false
@@ -912,7 +926,7 @@ fn construct_builtin(c: inout Checker, fx: inout Fx, start: u32, name: []u8, val
                     }
                 }
                 error {
-                    let _: TyId = try check_value(inout c, inout fx, value, none)
+                    let _: TyId = try check_value(input, inout c, inout fx, value, none)
                     return error_ty(inout c.types)
                 }
                 _ {
@@ -935,11 +949,11 @@ fn construct_builtin(c: inout Checker, fx: inout Fx, start: u32, name: []u8, val
             }
         }
         try report(inout c, fx.file, start, message)
-        let _: TyId = try check_value(inout c, inout fx, value, none)
+        let _: TyId = try check_value(input, inout c, inout fx, value, none)
         return error_ty(inout c.types)
     }
     let payload: TyId = try single_field(inout c.types, field, payload_ty)
-    let _: TyId = try check_expect(inout c, inout fx, value, payload)
+    let _: TyId = try check_expect(input, inout c, inout fx, value, payload)
     match expected {
         some(value as want: TyId) {
             return ok.(value: want)
@@ -951,21 +965,22 @@ fn construct_builtin(c: inout Checker, fx: inout Fx, start: u32, name: []u8, val
 }
 
 // The expression inside `.(...)`, for a form that takes one value.
-fn paren_inner(fx: Fx, value: syntax.ExprId) -> syntax.ExprId {
-    return match fx.ast.exprs[usize.(value)].kind {
+fn paren_inner(input: Input, fx: Fx, value: syntax.ExprId) -> syntax.ExprId {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    return match ast.exprs[usize.(value)].kind {
         paren(inner: syntax.ExprId) { inner }
         _ { value }
     }
 }
 
 // `u64.(x)`: a numeric conversion.
-fn convert_number(c: inout Checker, fx: inout Fx, value: syntax.ExprId, target: TyId) -> ! OutOfMemory {
-    let inner: syntax.ExprId = paren_inner(fx, value)
-    if needs_context(c, fx, inner) {
-        let _: TyId = try check_expect(inout c, inout fx, inner, target)
+fn convert_number(input: Input, c: inout Checker, fx: inout Fx, value: syntax.ExprId, target: TyId) -> ! OutOfMemory {
+    let inner: syntax.ExprId = paren_inner(input, fx, value)
+    if needs_context(input, c, fx, inner) {
+        let _: TyId = try check_expect(input, inout c, inout fx, inner, target)
         return ok
     }
-    let actual: TyId = try check_value(inout c, inout fx, inner, none)
+    let actual: TyId = try check_value(input, inout c, inout fx, inner, none)
     var numeric: bool = is_float(c, actual) || is_error(c.types, actual)
     match int_core(c, actual) {
         some(value: _) {
@@ -1001,13 +1016,13 @@ fn convert_number(c: inout Checker, fx: inout Fx, value: syntax.ExprId, target: 
     if !numeric {
         let from: []u8 = try show(inout c, actual)
         let to: []u8 = try show(inout c, target)
-        try report(inout c, fx.file, expr_span(fx, inner).start, try program.format_text(c.alloc, "cannot convert `{from}` to `{to}`"))
+        try report(inout c, fx.file, expr_span(input, fx, inner).start, try program.format_text(c.alloc, "cannot convert `{from}` to `{to}`"))
     }
     return ok
 }
 
-fn index_expr(c: inout Checker, fx: inout Fx, value: syntax.ExprId, index: syntax.Index) -> TyId ! OutOfMemory {
-    let base: TyId = try check_value(inout c, inout fx, value, none)
+fn index_expr(input: Input, c: inout Checker, fx: inout Fx, value: syntax.ExprId, index: syntax.Index) -> TyId ! OutOfMemory {
+    let base: TyId = try check_value(input, inout c, inout fx, value, none)
     var elem: TyId = base
     match get(c.types, base) {
         array(len: _, elem as e: TyId) {
@@ -1023,27 +1038,27 @@ fn index_expr(c: inout Checker, fx: inout Fx, value: syntax.ExprId, index: synta
         }
         _ {
             let shown: []u8 = try show(inout c, base)
-            try report(inout c, fx.file, expr_span(fx, value).start, try program.format_text(c.alloc, "`{shown}` cannot be indexed"))
+            try report(inout c, fx.file, expr_span(input, fx, value).start, try program.format_text(c.alloc, "`{shown}` cannot be indexed"))
             elem = try error_ty(inout c.types)
         }
     }
     let size: TyId = try usize_ty(inout c.types)
     match index {
         value(value as i: syntax.ExprId) {
-            let _: TyId = try check_expect(inout c, inout fx, i, size)
+            let _: TyId = try check_expect(input, inout c, inout fx, i, size)
             return ok.(value: elem)
         }
         slice(start: ?syntax.ExprId, end: ?syntax.ExprId) {
             match start {
                 some(value as s: syntax.ExprId) {
-                    let _: TyId = try check_expect(inout c, inout fx, s, size)
+                    let _: TyId = try check_expect(input, inout c, inout fx, s, size)
                 }
                 none {
                 }
             }
             match end {
                 some(value as s: syntax.ExprId) {
-                    let _: TyId = try check_expect(inout c, inout fx, s, size)
+                    let _: TyId = try check_expect(input, inout c, inout fx, s, size)
                 }
                 none {
                 }
@@ -1054,19 +1069,20 @@ fn index_expr(c: inout Checker, fx: inout Fx, value: syntax.ExprId, index: synta
             return intern(inout c.types, Ty.view.(elem: elem))
         }
         ty(ty as t: syntax.TypeId) {
-            try report(inout c, fx.file, type_span(fx, t).start, "a type argument goes only on a built-in function, as in `truncate[u8](x)`")
+            try report(inout c, fx.file, type_span(input, fx, t).start, "a type argument goes only on a built-in function, as in `truncate[u8](x)`")
             return error_ty(inout c.types)
         }
     }
 }
 
-fn unary_expr(c: inout Checker, fx: inout Fx, start: u32, op: syntax.UnaryOp, operand: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
+fn unary_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, op: syntax.UnaryOp, operand: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     match op {
         neg {
-            match fx.ast.exprs[usize.(operand)].kind {
+            match ast.exprs[usize.(operand)].kind {
                 int {
                     var v: ?Wide = none
-                    match parse_int(file_text(c, fx.file, expr_span(fx, operand))) {
+                    match parse_int(file_text(input, fx.file, expr_span(input, fx, operand))) {
                         some(value as n: Wide) {
                             v = some.(value: wide_neg(n))
                         }
@@ -1078,7 +1094,7 @@ fn unary_expr(c: inout Checker, fx: inout Fx, start: u32, op: syntax.UnaryOp, op
                 _ {
                 }
             }
-            let ty: TyId = try check_value(inout c, inout fx, operand, expected)
+            let ty: TyId = try check_value(input, inout c, inout fx, operand, expected)
             var fine: bool = is_float(c, ty) || is_error(c.types, ty)
             match as_int(c.types, ty) {
                 some(value as int: IntTy) {
@@ -1097,10 +1113,10 @@ fn unary_expr(c: inout Checker, fx: inout Fx, start: u32, op: syntax.UnaryOp, op
         }
         not {
             let b: TyId = try bool_ty(inout c.types)
-            return check_expect(inout c, inout fx, operand, b)
+            return check_expect(input, inout c, inout fx, operand, b)
         }
         bit_not {
-            let ty: TyId = try check_value(inout c, inout fx, operand, expected)
+            let ty: TyId = try check_value(input, inout c, inout fx, operand, expected)
             let is_int: bool = match as_int(c.types, ty) {
                 some(value: _) { true }
                 none { false }
@@ -1126,15 +1142,15 @@ fn unary_expr(c: inout Checker, fx: inout Fx, start: u32, op: syntax.UnaryOp, op
                 none {
                 }
             }
-            let path: []syntax.ExprId = try spine(c.alloc, fx, operand)
+            let path: []syntax.ExprId = try spine(c.alloc, input, fx, operand)
             for let e: syntax.ExprId in path {
                 try mark(inout fx.addressed, u32.(e), 1)
             }
-            let ty: TyId = try check_value(inout c, inout fx, operand, inner_expected)
+            let ty: TyId = try check_value(input, inout c, inout fx, operand, inner_expected)
             for let e: syntax.ExprId in path {
                 try mark(inout fx.addressed, u32.(e), -1)
             }
-            match place(c, fx, operand) {
+            match place(input, c, fx, operand) {
                 none {
                     try report(inout c, fx.file, start, "`&` takes a variable, field or element")
                 }
@@ -1146,8 +1162,8 @@ fn unary_expr(c: inout Checker, fx: inout Fx, start: u32, op: syntax.UnaryOp, op
     }
 }
 
-fn try_item(c: inout Checker, fx: inout Fx, start: u32, operand: syntax.ExprId) -> Item ! OutOfMemory {
-    let ty: TyId = try check_value(inout c, inout fx, operand, none)
+fn try_item(input: Input, c: inout Checker, fx: inout Fx, start: u32, operand: syntax.ExprId) -> Item ! OutOfMemory {
+    let ty: TyId = try check_value(input, inout c, inout fx, operand, none)
     match get(c.types, ty) {
         optional(elem: TyId) {
             var returns_optional: bool = false
@@ -1219,45 +1235,45 @@ fn try_item(c: inout Checker, fx: inout Fx, start: u32, operand: syntax.ExprId) 
 
 // The type of two operands that must match. A literal takes the type of
 // the other side.
-fn operands(c: inout Checker, fx: inout Fx, left: syntax.ExprId, right: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
-    if needs_context(c, fx, left) && !needs_context(c, fx, right) {
-        let ty: TyId = try check_value(inout c, inout fx, right, expected)
-        let _: TyId = try check_expect(inout c, inout fx, left, ty)
+fn operands(input: Input, c: inout Checker, fx: inout Fx, left: syntax.ExprId, right: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
+    if needs_context(input, c, fx, left) && !needs_context(input, c, fx, right) {
+        let ty: TyId = try check_value(input, inout c, inout fx, right, expected)
+        let _: TyId = try check_expect(input, inout c, inout fx, left, ty)
         return ok.(value: ty)
     }
-    let ty: TyId = try check_value(inout c, inout fx, left, expected)
-    let _: TyId = try check_expect(inout c, inout fx, right, ty)
+    let ty: TyId = try check_value(input, inout c, inout fx, left, expected)
+    let _: TyId = try check_expect(input, inout c, inout fx, right, ty)
     return ok.(value: ty)
 }
 
-fn shift_amount(c: inout Checker, fx: inout Fx, amount: syntax.ExprId, shifted: TyId) -> ! OutOfMemory {
-    if needs_context(c, fx, amount) {
-        let _: TyId = try check_expect(inout c, inout fx, amount, shifted)
+fn shift_amount(input: Input, c: inout Checker, fx: inout Fx, amount: syntax.ExprId, shifted: TyId) -> ! OutOfMemory {
+    if needs_context(input, c, fx, amount) {
+        let _: TyId = try check_expect(input, inout c, inout fx, amount, shifted)
         return ok
     }
-    let ty: TyId = try check_value(inout c, inout fx, amount, none)
+    let ty: TyId = try check_value(input, inout c, inout fx, amount, none)
     let is_int: bool = match as_int(c.types, ty) {
         some(value: _) { true }
         none { false }
     }
     if !is_int && !is_error(c.types, ty) {
         let shown: []u8 = try show(inout c, ty)
-        try report(inout c, fx.file, expr_span(fx, amount).start, try program.format_text(c.alloc, "a shift amount is an integer, not `{shown}`"))
+        try report(inout c, fx.file, expr_span(input, fx, amount).start, try program.format_text(c.alloc, "a shift amount is an integer, not `{shown}`"))
     }
     return ok
 }
 
-fn binary_expr(c: inout Checker, fx: inout Fx, start: u32, op: syntax.BinaryOp, left: syntax.ExprId, right: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
+fn binary_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, op: syntax.BinaryOp, left: syntax.ExprId, right: syntax.ExprId, expected: ?TyId) -> TyId ! OutOfMemory {
     let b: TyId = try bool_ty(inout c.types)
     let op_text: []u8 = syntax.op_text(op)
     match syntax.op_group(op) {
         and, or {
-            let _: TyId = try check_expect(inout c, inout fx, left, b)
-            let _: TyId = try check_expect(inout c, inout fx, right, b)
+            let _: TyId = try check_expect(input, inout c, inout fx, left, b)
+            let _: TyId = try check_expect(input, inout c, inout fx, right, b)
             return ok.(value: b)
         }
         comparison {
-            let ty: TyId = try operands(inout c, inout fx, left, right, none)
+            let ty: TyId = try operands(input, inout c, inout fx, left, right, none)
             let equality: bool = op == syntax.BinaryOp.eq || op == syntax.BinaryOp.ne
             var fine: bool = false
             match get(c.types, ty) {
@@ -1303,18 +1319,18 @@ fn binary_expr(c: inout Checker, fx: inout Fx, start: u32, op: syntax.BinaryOp, 
             return ok.(value: b)
         }
         shift {
-            let ty: TyId = try check_value(inout c, inout fx, left, expected)
+            let ty: TyId = try check_value(input, inout c, inout fx, left, expected)
             try require_int(inout c, fx, start, op, ty)
-            try shift_amount(inout c, inout fx, right, ty)
+            try shift_amount(input, inout c, inout fx, right, ty)
             return ok.(value: ty)
         }
         bit_and, bit_or, bit_xor {
-            let ty: TyId = try operands(inout c, inout fx, left, right, expected)
+            let ty: TyId = try operands(input, inout c, inout fx, left, right, expected)
             try require_int(inout c, fx, start, op, ty)
             return ok.(value: ty)
         }
         additive, multiplicative {
-            let ty: TyId = try operands(inout c, inout fx, left, right, expected)
+            let ty: TyId = try operands(input, inout c, inout fx, left, right, expected)
             let fine: bool = match get(c.types, ty) {
                 int(int: _), float(bits: _), error, never { true }
                 _ { false }
@@ -1343,16 +1359,17 @@ fn require_int(c: inout Checker, fx: Fx, start: u32, op: syntax.BinaryOp, ty: Ty
 
 // Calls.
 
-fn call_expr(c: inout Checker, fx: inout Fx, start: u32, callee: syntax.ExprId, args: syntax.List, expected: ?TyId) -> Item ! OutOfMemory {
-    try hidden_local(inout c, fx, callee)
-    let list: []u32 = syntax.items(fx.ast.extra, args)
+fn call_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, callee: syntax.ExprId, args: syntax.List, expected: ?TyId) -> Item ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    try hidden_local(input, inout c, fx, callee)
+    let list: []u32 = syntax.items(ast.extra, args)
     // A built-in with a type argument: truncate[u8](x).
-    match fx.ast.exprs[usize.(callee)].kind {
+    match ast.exprs[usize.(callee)].kind {
         index(value: syntax.ExprId, index as i: syntax.Index) {
-            match res_builtin(expr_res(c, fx.file, value)) {
+            match res_builtin(expr_res(input, fx.file, value)) {
                 some(value as name: []u8) {
                     if !resolve.is_builtin_type(name) {
-                        return builtin_call(inout c, inout fx, start, name, some.(value: i), list, expected)
+                        return builtin_call(input, inout c, inout fx, start, name, some.(value: i), list, expected)
                     }
                 }
                 none {
@@ -1362,10 +1379,10 @@ fn call_expr(c: inout Checker, fx: inout Fx, start: u32, callee: syntax.ExprId, 
         _ {
         }
     }
-    try unsafe_callee(inout c, fx, callee)
-    match try check_expr(inout c, inout fx, callee, none) {
+    try unsafe_callee(input, inout c, fx, callee)
+    match try check_expr(input, inout c, inout fx, callee, none) {
         builtin(name: []u8) {
-            return builtin_call(inout c, inout fx, start, name, none, list, expected)
+            return builtin_call(input, inout c, inout fx, start, name, none, list, expected)
         }
         value(ty: TyId) {
             var target: TyId = ty
@@ -1382,21 +1399,21 @@ fn call_expr(c: inout Checker, fx: inout Fx, start: u32, callee: syntax.ExprId, 
                     var modes: [..]ArgMode = make(c.alloc)
                     for let i: usize in 0..list.len {
                         if i < ps.len {
-                            try push(inout modes, ArgMode.(e: fx.ast.args[usize.(list[i])].value, mode: ps[i].mode))
+                            try push(inout modes, ArgMode.(e: ast.args[usize.(list[i])].value, mode: ps[i].mode))
                         }
                     }
-                    try exclusive(inout c, fx, modes)
+                    try exclusive(input, inout c, fx, modes)
                     if ps.len != list.len {
                         let want: usize = ps.len
                         let got: usize = list.len
                         try report(inout c, fx.file, start, try program.format_text(c.alloc, "expected {want} arguments, found {got}"))
                     }
                     for let i: usize in 0..list.len {
-                        let arg: syntax.Arg = fx.ast.args[usize.(list[i])]
+                        let arg: syntax.Arg = ast.args[usize.(list[i])]
                         if i < ps.len {
-                            try argument(inout c, inout fx, arg, ps[i].mode, ps[i].ty)
+                            try argument(input, inout c, inout fx, arg, ps[i].mode, ps[i].ty)
                         } else {
-                            let _: TyId = try check_value(inout c, inout fx, arg.value, none)
+                            let _: TyId = try check_value(input, inout c, inout fx, arg.value, none)
                         }
                     }
                     match result {
@@ -1410,8 +1427,8 @@ fn call_expr(c: inout Checker, fx: inout Fx, start: u32, callee: syntax.ExprId, 
                 }
                 error {
                     for let i: u32 in list {
-                        let arg_value: syntax.ExprId = fx.ast.args[usize.(i)].value
-            let _: TyId = try check_value(inout c, inout fx, arg_value, none)
+                        let arg_value: syntax.ExprId = ast.args[usize.(i)].value
+            let _: TyId = try check_value(input, inout c, inout fx, arg_value, none)
                     }
                     return value_item(inout c, ty)
                 }
@@ -1436,8 +1453,8 @@ fn call_expr(c: inout Checker, fx: inout Fx, start: u32, callee: syntax.ExprId, 
     }
 }
 
-fn argument(c: inout Checker, fx: inout Fx, arg: syntax.Arg, mode: syntax.Mode, param: TyId) -> ! OutOfMemory {
-    let start: u32 = expr_span(fx, arg.value).start
+fn argument(input: Input, c: inout Checker, fx: inout Fx, arg: syntax.Arg, mode: syntax.Mode, param: TyId) -> ! OutOfMemory {
+    let start: u32 = expr_span(input, fx, arg.value).start
     if arg.mode != mode {
         let message: []u8 = match mode {
             inout_mode { "this parameter is `inout`; write `inout` before the argument" }
@@ -1446,32 +1463,32 @@ fn argument(c: inout Checker, fx: inout Fx, arg: syntax.Arg, mode: syntax.Mode, 
         try report(inout c, fx.file, start, message)
     }
     if mode == syntax.Mode.inout_mode {
-        let ty: TyId = try check_value(inout c, inout fx, arg.value, none)
+        let ty: TyId = try check_value(input, inout c, inout fx, arg.value, none)
         if !is_error(c.types, ty) && !is_error(c.types, param) && !same_ty(ty, param) {
             let want: []u8 = try show(inout c, param)
             let got: []u8 = try show(inout c, ty)
             try report(inout c, fx.file, start, try program.format_text(c.alloc, "expected `{want}`, found `{got}`"))
         }
-        try require_mutable(inout c, fx, arg.value, "pass `inout`")
+        try require_mutable(input, inout c, fx, arg.value, "pass `inout`")
     } else {
-        let _: TyId = try check_expect(inout c, inout fx, arg.value, param)
+        let _: TyId = try check_expect(input, inout c, inout fx, arg.value, param)
     }
     return ok
 }
 
 // A type argument: u8 in `truncate[u8]`, *u32 in `from_address[*u32]`.
-fn type_arg(c: inout Checker, fx: inout Fx, index: syntax.Index) -> TyId ! OutOfMemory {
+fn type_arg(input: Input, c: inout Checker, fx: inout Fx, index: syntax.Index) -> TyId ! OutOfMemory {
     match index {
         ty(ty as t: syntax.TypeId) {
-            return lower(inout c, fx.file, t)
+            return lower(input, inout c, fx.file, t)
         }
         value(value as e: syntax.ExprId) {
-            match try check_expr(inout c, inout fx, e, none) {
+            match try check_expr(input, inout c, inout fx, e, none) {
                 type_item(ty: TyId) {
                     return ok.(value: ty)
                 }
                 _ {
-                    try report(inout c, fx.file, expr_span(fx, e).start, "expected a type argument")
+                    try report(inout c, fx.file, expr_span(input, fx, e).start, "expected a type argument")
                     return error_ty(inout c.types)
                 }
             }
@@ -1484,18 +1501,19 @@ fn type_arg(c: inout Checker, fx: inout Fx, index: syntax.Index) -> TyId ! OutOf
 
 // A call to a built-in function while a local function value has its
 // name: the call means the built-in, which a reader could miss.
-fn hidden_local(c: inout Checker, fx: Fx, callee: syntax.ExprId) -> ! OutOfMemory {
+fn hidden_local(input: Input, c: inout Checker, fx: Fx, callee: syntax.ExprId) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     var name_expr: syntax.ExprId = callee
-    match fx.ast.exprs[usize.(callee)].kind {
+    match ast.exprs[usize.(callee)].kind {
         index(value: syntax.ExprId, index: _) {
             name_expr = value
         }
         _ {
         }
     }
-    match fx.ast.exprs[usize.(name_expr)].kind {
+    match ast.exprs[usize.(name_expr)].kind {
         name(name as n: syntax.Span) {
-            match maps.get_int(c.names.files[usize.(fx.file)].hidden_locals, n.start) {
+            match maps.get_int(input.names.files[usize.(fx.file)].hidden_locals, n.start) {
                 some(value as id: u32) {
                     match local_info(fx, id) {
                         some(value as info: LocalInfo) {
@@ -1515,7 +1533,7 @@ fn hidden_local(c: inout Checker, fx: Fx, callee: syntax.ExprId) -> ! OutOfMemor
                                 }
                             }
                             if is_fn {
-                                let text: []u8 = file_text(c, fx.file, n)
+                                let text: []u8 = file_text(input, fx.file, n)
                                 try report(inout c, fx.file, n.start, try program.format_text(c.alloc, "this calls the built-in `{text}`, not the local function value `{text}`; rename the local"))
                             }
                         }
@@ -1533,10 +1551,11 @@ fn hidden_local(c: inout Checker, fx: Fx, callee: syntax.ExprId) -> ! OutOfMemor
     return ok
 }
 
-fn args_values(c: inout Checker, fx: inout Fx, list: []u32) -> ! OutOfMemory {
+fn args_values(input: Input, c: inout Checker, fx: inout Fx, list: []u32) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     for let i: u32 in list {
-        let arg_value: syntax.ExprId = fx.ast.args[usize.(i)].value
-            let _: TyId = try check_value(inout c, inout fx, arg_value, none)
+        let arg_value: syntax.ExprId = ast.args[usize.(i)].value
+            let _: TyId = try check_value(input, inout c, inout fx, arg_value, none)
     }
     return ok
 }
@@ -1549,7 +1568,8 @@ fn builtin_arity(name: []u8) -> usize {
     }
 }
 
-fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_index: ?syntax.Index, list: []u32, expected: ?TyId) -> Item ! OutOfMemory {
+fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_index: ?syntax.Index, list: []u32, expected: ?TyId) -> Item ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     match name {
         "volatile_load", "volatile_store", "from_pointer" {
             try require_unsafe(inout c, fx, start, try program.format_text(c.alloc, "`{name}`"))
@@ -1571,14 +1591,14 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
         } else {
             try report(inout c, fx.file, start, try program.format_text(c.alloc, "`{name}` takes no type argument"))
         }
-        try args_values(inout c, inout fx, list)
+        try args_values(input, inout c, inout fx, list)
         return error_item(inout c)
     }
     let arity: usize = builtin_arity(name)
     if list.len != arity {
         let found: usize = list.len
         try report(inout c, fx.file, start, try program.format_text(c.alloc, "`{name}` takes {arity} arguments, found {found}"))
-        try args_values(inout c, inout fx, list)
+        try args_values(input, inout c, inout fx, list)
         return error_item(inout c)
     }
     var modes: [2]syntax.Mode = [syntax.Mode.let_mode, syntax.Mode.let_mode]
@@ -1590,32 +1610,32 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
         }
     }
     for let i: usize in 0..list.len {
-        let arg: syntax.Arg = fx.ast.args[usize.(list[i])]
+        let arg: syntax.Arg = ast.args[usize.(list[i])]
         if arg.mode != modes[i] {
             let mode: []u8 = match modes[i] {
                 let_mode { "no mode" }
                 inout_mode { "`inout`" }
             }
-            try report(inout c, fx.file, expr_span(fx, arg.value).start, try program.format_text(c.alloc, "this argument of `{name}` takes {mode}"))
+            try report(inout c, fx.file, expr_span(input, fx, arg.value).start, try program.format_text(c.alloc, "this argument of `{name}` takes {mode}"))
         }
     }
-    let a: syntax.ExprId = fx.ast.args[usize.(list[0])].value
+    let a: syntax.ExprId = ast.args[usize.(list[0])].value
     var second: syntax.ExprId = a
     if list.len > 1 {
-        second = fx.ast.args[usize.(list[1])].value
+        second = ast.args[usize.(list[1])].value
     }
     let size: TyId = try usize_ty(inout c.types)
-    let oom: TyId = try named_type(inout c, NamedId.builtin.(which: BuiltinNamed.out_of_memory))
+    let oom: TyId = try named_type(input, inout c, NamedId.builtin.(which: BuiltinNamed.out_of_memory))
     let oom_result: TyId = try intern(inout c.types, Ty.result.(value: none, error: oom))
     match name {
         "panic" {
-            let format: TyId = try named_type(inout c, NamedId.builtin.(which: BuiltinNamed.format))
-            let _: TyId = try check_expect(inout c, inout fx, a, format)
+            let format: TyId = try named_type(input, inout c, NamedId.builtin.(which: BuiltinNamed.format))
+            let _: TyId = try check_expect(input, inout c, inout fx, a, format)
             return value_item(inout c, try never_ty(inout c.types))
         }
         "make" {
-            let allocator: TyId = try named_type(inout c, NamedId.builtin.(which: BuiltinNamed.allocator))
-            let _: TyId = try check_expect(inout c, inout fx, a, allocator)
+            let allocator: TyId = try named_type(input, inout c, NamedId.builtin.(which: BuiltinNamed.allocator))
+            let _: TyId = try check_expect(input, inout c, inout fx, a, allocator)
             match expected {
                 some(value as want: TyId) {
                     match get(c.types, want) {
@@ -1634,29 +1654,32 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
         }
         "push", "append" {
             let pair: [2]ArgMode = [ArgMode.(e: a, mode: syntax.Mode.inout_mode), ArgMode.(e: second, mode: syntax.Mode.let_mode)]
-            try exclusive(inout c, fx, pair)
-            let v: TyId = try check_value(inout c, inout fx, a, none)
-            try require_mutable(inout c, fx, a, "pass `inout`")
+            try exclusive(input, inout c, fx, pair)
+            let v: TyId = try check_value(input, inout c, inout fx, a, none)
+            try require_mutable(input, inout c, fx, a, "pass `inout`")
             match get(c.types, v) {
                 growable(elem: TyId) {
-                    var item: TyId = elem
-                    if program.bytes_equal(name, "append") {
-                        item = try intern(inout c.types, Ty.view.(elem: elem))
+                    if program.bytes_equal(name, "push") {
+                        let _: TyId = try check_expect(input, inout c, inout fx, second, elem)
+                        try fresh(input, inout c, inout fx, second, elem)
+                    } else {
+                        let view: TyId = try intern(inout c.types, Ty.view.(elem: elem))
+                        let _: TyId = try check_expect(input, inout c, inout fx, second, view)
+                        try no_owning_copy(inout c, fx.file, start, "append", elem)
                     }
-                    let _: TyId = try check_expect(inout c, inout fx, second, item)
                 }
                 error {
                 }
                 _ {
                     let shown: []u8 = try show(inout c, v)
-                    try report(inout c, fx.file, expr_span(fx, a).start, try program.format_text(c.alloc, "`{name}` takes a `[..]T`, not `{shown}`"))
+                    try report(inout c, fx.file, expr_span(input, fx, a).start, try program.format_text(c.alloc, "`{name}` takes a `[..]T`, not `{shown}`"))
                 }
             }
             return value_item(inout c, oom_result)
         }
         "pop", "clear" {
-            let v: TyId = try check_value(inout c, inout fx, a, none)
-            try require_mutable(inout c, fx, a, "pass `inout`")
+            let v: TyId = try check_value(input, inout c, inout fx, a, none)
+            try require_mutable(input, inout c, fx, a, "pass `inout`")
             match get(c.types, v) {
                 growable(elem: TyId) {
                     if program.bytes_equal(name, "pop") {
@@ -1669,14 +1692,14 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
                 }
                 _ {
                     let shown: []u8 = try show(inout c, v)
-                    try report(inout c, fx.file, expr_span(fx, a).start, try program.format_text(c.alloc, "`{name}` takes a `[..]T`, not `{shown}`"))
+                    try report(inout c, fx.file, expr_span(input, fx, a).start, try program.format_text(c.alloc, "`{name}` takes a `[..]T`, not `{shown}`"))
                     return error_item(inout c)
                 }
             }
         }
         "free", "take" {
-            let v: TyId = try check_value(inout c, inout fx, a, none)
-            try require_mutable(inout c, fx, a, "pass `inout`")
+            let v: TyId = try check_value(input, inout c, inout fx, a, none)
+            try require_mutable(input, inout c, fx, a, "pass `inout`")
             let growable: bool = match get(c.types, v) {
                 growable(elem: _), error { true }
                 _ { false }
@@ -1684,21 +1707,29 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
             if program.bytes_equal(name, "free") {
                 if !growable {
                     let shown: []u8 = try show(inout c, v)
-                    try report(inout c, fx.file, expr_span(fx, a).start, try program.format_text(c.alloc, "`free` takes a `[..]T`, not `{shown}`"))
+                    try report(inout c, fx.file, expr_span(input, fx, a).start, try program.format_text(c.alloc, "`free` takes a `[..]T`, not `{shown}`"))
                 }
                 return ok.(value: Item.nothing)
             }
-            if !growable {
+            if is_error(c.types, v) {
+                return value_item(inout c, v)
+            }
+            let astart: u32 = expr_span(input, fx, a).start
+            if !(try owning(inout c, v)) {
                 let shown: []u8 = try show(inout c, v)
-                try report(inout c, fx.file, expr_span(fx, a).start, try program.format_text(c.alloc, "`take` takes a `[..]T`, not `{shown}`"))
+                try report(inout c, fx.file, astart, try program.format_text(c.alloc, "`take` takes a value that owns a buffer, not `{shown}`"))
                 return error_item(inout c)
+            }
+            if !(try emptiable(inout c, v)) {
+                let shown: []u8 = try show(inout c, v)
+                try report(inout c, fx.file, astart, try program.format_text(c.alloc, "`take` cannot leave a `{shown}` empty: only a `[..]T`, an optional, and records and tuples of them have an empty value"))
             }
             return value_item(inout c, v)
         }
         "copy" {
-            let allocator: TyId = try named_type(inout c, NamedId.builtin.(which: BuiltinNamed.allocator))
-            let _: TyId = try check_expect(inout c, inout fx, a, allocator)
-            let v: TyId = try check_value(inout c, inout fx, second, none)
+            let allocator: TyId = try named_type(input, inout c, NamedId.builtin.(which: BuiltinNamed.allocator))
+            let _: TyId = try check_expect(input, inout c, inout fx, a, allocator)
+            let v: TyId = try check_value(input, inout c, inout fx, second, none)
             var elem: ?TyId = none
             match get(c.types, v) {
                 growable(elem as e: TyId) {
@@ -1718,6 +1749,7 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
             }
             match elem {
                 some(value as e: TyId) {
+                    try no_owning_copy(inout c, fx.file, start, "copy", e)
                     let g: TyId = try intern(inout c.types, Ty.growable.(elem: e))
                     return value_item(inout c, try intern(inout c.types, Ty.result.(value: some.(value: g), error: oom)))
                 }
@@ -1751,7 +1783,7 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
             }
             var n: u64 = 0
             var valid: bool = false
-            match const_int(c, fx.file, len, 0) {
+            match const_int(input, c, fx.file, len, 0) {
                 some(value as w: Wide) {
                     if !wide_negative(w) {
                         match wide_u64(w) {
@@ -1768,7 +1800,7 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
                 }
             }
             if !valid {
-                try report(inout c, fx.file, expr_span(fx, len).start, "`fill`'s length is a constant, non-negative integer")
+                try report(inout c, fx.file, expr_span(input, fx, len).start, "`fill`'s length is a constant, non-negative integer")
                 return error_item(inout c)
             }
             var elem: TyId = 0
@@ -1777,7 +1809,7 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
                 some(value as want: TyId) {
                     match get(c.types, want) {
                         array(len as count: u64, elem as e: TyId) {
-                            let _: TyId = try check_expect(inout c, inout fx, a, e)
+                            let _: TyId = try check_expect(input, inout c, inout fx, a, e)
                             if count != n {
                                 try report(inout c, fx.file, start, try program.format_text(c.alloc, "expected {count} elements, found {n}"))
                                 return error_item(inout c)
@@ -1793,7 +1825,7 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
                 }
             }
             if !known {
-                elem = try check_value(inout c, inout fx, a, none)
+                elem = try check_value(input, inout c, inout fx, a, none)
             }
             return value_item(inout c, try intern(inout c.types, Ty.array.(len: n, elem: elem)))
         }
@@ -1801,12 +1833,12 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
             var target: TyId = 0
             match type_index {
                 some(value as i: syntax.Index) {
-                    target = try type_arg(inout c, inout fx, i)
+                    target = try type_arg(input, inout c, inout fx, i)
                 }
                 none {
                 }
             }
-            let _: TyId = try check_expect(inout c, inout fx, a, size)
+            let _: TyId = try check_expect(input, inout c, inout fx, a, size)
             let fine: bool = match get(c.types, target) {
                 pointer(elem: _), error { true }
                 _ { false }
@@ -1821,12 +1853,12 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
             var target: TyId = 0
             match type_index {
                 some(value as i: syntax.Index) {
-                    target = try type_arg(inout c, inout fx, i)
+                    target = try type_arg(input, inout c, inout fx, i)
                 }
                 none {
                 }
             }
-            let v: TyId = try check_value(inout c, inout fx, a, none)
+            let v: TyId = try check_value(input, inout c, inout fx, a, none)
             if program.bytes_equal(name, "truncate") {
                 let target_int: bool = match as_int(c.types, target) {
                     some(value: _) { true }
@@ -1845,8 +1877,8 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
             return value_item(inout c, target)
         }
         "from_pointer", "offset" {
-            let p: TyId = try check_value(inout c, inout fx, a, none)
-            let _: TyId = try check_expect(inout c, inout fx, second, size)
+            let p: TyId = try check_value(input, inout c, inout fx, a, none)
+            let _: TyId = try check_expect(input, inout c, inout fx, second, size)
             match get(c.types, p) {
                 pointer(elem: TyId) {
                     if program.bytes_equal(name, "from_pointer") {
@@ -1859,18 +1891,18 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
                 }
                 _ {
                     let shown: []u8 = try show(inout c, p)
-                    try report(inout c, fx.file, expr_span(fx, a).start, try program.format_text(c.alloc, "`{name}` takes a pointer, not `{shown}`"))
+                    try report(inout c, fx.file, expr_span(input, fx, a).start, try program.format_text(c.alloc, "`{name}` takes a pointer, not `{shown}`"))
                     return error_item(inout c)
                 }
             }
         }
         "c_string" {
             var plain: bool = false
-            match fx.ast.exprs[usize.(a)].kind {
+            match ast.exprs[usize.(a)].kind {
                 str(parts: syntax.List) {
                     plain = true
-                    for let i: u32 in syntax.items(fx.ast.extra, parts) {
-                        match fx.ast.str_parts[usize.(i)] {
+                    for let i: u32 in syntax.items(ast.extra, parts) {
+                        match ast.str_parts[usize.(i)] {
                             interpolation(value: _) {
                                 plain = false
                             }
@@ -1883,13 +1915,13 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
                 }
             }
             if !plain {
-                try report(inout c, fx.file, expr_span(fx, a).start, "`c_string` takes a string literal without interpolation")
+                try report(inout c, fx.file, expr_span(input, fx, a).start, "`c_string` takes a string literal without interpolation")
             }
             let byte_ty: TyId = try int_ty(inout c.types, IntTy.u8)
             return value_item(inout c, try intern(inout c.types, Ty.pointer.(elem: byte_ty)))
         }
         "volatile_load", "volatile_store" {
-            let p: TyId = try check_value(inout c, inout fx, a, none)
+            let p: TyId = try check_value(input, inout c, inout fx, a, none)
             var elem: TyId = p
             match get(c.types, p) {
                 pointer(elem as e: TyId) {
@@ -1899,19 +1931,19 @@ fn builtin_call(c: inout Checker, fx: inout Fx, start: u32, name: []u8, type_ind
                 }
                 _ {
                     let shown: []u8 = try show(inout c, p)
-                    try report(inout c, fx.file, expr_span(fx, a).start, try program.format_text(c.alloc, "`{name}` takes a pointer, not `{shown}`"))
+                    try report(inout c, fx.file, expr_span(input, fx, a).start, try program.format_text(c.alloc, "`{name}` takes a pointer, not `{shown}`"))
                     elem = try error_ty(inout c.types)
                 }
             }
             if program.bytes_equal(name, "volatile_store") {
-                let _: TyId = try check_expect(inout c, inout fx, second, elem)
+                let _: TyId = try check_expect(input, inout c, inout fx, second, elem)
                 return ok.(value: Item.nothing)
             }
             return value_item(inout c, elem)
         }
         _ {
             // wrapping_add and its relatives.
-            let ty: TyId = try operands(inout c, inout fx, a, second, expected)
+            let ty: TyId = try operands(input, inout c, inout fx, a, second, expected)
             let fine: bool = match get(c.types, ty) {
                 int(int: _), error { true }
                 _ { false }

@@ -1,6 +1,6 @@
 // The local rules that need no flow: `unsafe`, `shared` globals,
-// exclusivity of `inout` arguments, the `Format` rule and constant global
-// initializers.
+// exclusivity of `inout` arguments, one owner per buffer, the `Format`
+// rule and constant global initializers.
 
 import maps
 import program
@@ -10,12 +10,13 @@ import syntax
 // The place expressions e is built from: e, then its base, through fields,
 // indexing and parentheses. Assigning to e or taking its address does not
 // read any of them.
-fn spine(alloc: Allocator, fx: Fx, e: syntax.ExprId) -> []syntax.ExprId ! OutOfMemory {
+fn spine(alloc: Allocator, input: Input, fx: Fx, e: syntax.ExprId) -> []syntax.ExprId ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     var out: [..]syntax.ExprId = make(alloc)
     var current: syntax.ExprId = e
     for {
         try push(inout out, current)
-        match fx.ast.exprs[usize.(current)].kind {
+        match ast.exprs[usize.(current)].kind {
             paren(inner: syntax.ExprId) {
                 current = inner
             }
@@ -40,13 +41,13 @@ fn require_unsafe(c: inout Checker, fx: Fx, start: u32, what: []u8) -> ! OutOfMe
 }
 
 // A call to a C function or an `unsafe fn` needs `unsafe`.
-fn unsafe_callee(c: inout Checker, fx: Fx, callee: syntax.ExprId) -> ! OutOfMemory {
-    match expr_res(c, fx.file, callee) {
+fn unsafe_callee(input: Input, c: inout Checker, fx: Fx, callee: syntax.ExprId) -> ! OutOfMemory {
+    match expr_res(input, fx.file, callee) {
         some(value as res: resolve.Res) {
             match res {
                 decl(decl as d: maps.DeclRef) {
                     var what: []u8 = ""
-                    match decl_of(c, d).kind {
+                    match decl_of(input, d).kind {
                         function(is_unsafe: bool, name: _, params: _, result: _, body: _) {
                             if is_unsafe {
                                 what = "the unsafe function"
@@ -59,8 +60,8 @@ fn unsafe_callee(c: inout Checker, fx: Fx, callee: syntax.ExprId) -> ! OutOfMemo
                         }
                     }
                     if what.len > 0 {
-                        let span: syntax.Span = expr_span(fx, callee)
-                        let text: []u8 = file_text(c, fx.file, span)
+                        let span: syntax.Span = expr_span(input, fx, callee)
+                        let text: []u8 = file_text(input, fx.file, span)
                         try require_unsafe(inout c, fx, span.start, try program.format_text(c.alloc, "calling {what} `{text}`"))
                     }
                 }
@@ -77,9 +78,9 @@ fn unsafe_callee(c: inout Checker, fx: Fx, callee: syntax.ExprId) -> ! OutOfMemo
 // A use of a top-level name: a `shared` global needs its `lock`, and a C
 // global needs `unsafe` unless `&` takes its address. span is the name, or
 // the whole `pkg.name`.
-fn use_decl(c: inout Checker, fx: Fx, e: syntax.ExprId, decl: maps.DeclRef, span: syntax.Span) -> ! OutOfMemory {
-    let shown: []u8 = file_text(c, fx.file, span)
-    match decl_of(c, decl).kind {
+fn use_decl(input: Input, c: inout Checker, fx: Fx, e: syntax.ExprId, decl: maps.DeclRef, span: syntax.Span) -> ! OutOfMemory {
+    let shown: []u8 = file_text(input, fx.file, span)
+    match decl_of(input, decl).kind {
         global(is_shared: bool, local: _) {
             if is_shared && !is_locked(fx, decl) {
                 try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "`{shown}` is `shared`: use it inside `lock {shown} \{ ... }`"))
@@ -127,10 +128,10 @@ type Step enum {
 type AccessPath (root: Root, steps: [..]Step)
 
 // Checks that no `inout` argument overlaps another argument.
-fn exclusive(c: inout Checker, fx: Fx, args: []ArgMode) -> ! OutOfMemory {
+fn exclusive(input: Input, c: inout Checker, fx: Fx, args: []ArgMode) -> ! OutOfMemory {
     var paths: [..]?AccessPath = make(c.alloc)
     for let a: ArgMode in args {
-        try push(inout paths, try access_path(c, fx, a.e))
+        try push(inout paths, try access_path(input, c, fx, a.e))
     }
     for let i: usize in 0..args.len {
         if args[i].mode != syntax.Mode.inout_mode {
@@ -150,9 +151,9 @@ fn exclusive(c: inout Checker, fx: Fx, args: []ArgMode) -> ! OutOfMemory {
                         }
                         some(value as path_b: AccessPath) {
                             if overlaps(path_a, path_b) {
-                                let span: syntax.Span = expr_span(fx, args[j].e)
-                                let b_text: []u8 = file_text(c, fx.file, span)
-                                let a_text: []u8 = file_text(c, fx.file, expr_span(fx, args[i].e))
+                                let span: syntax.Span = expr_span(input, fx, args[j].e)
+                                let b_text: []u8 = file_text(input, fx.file, span)
+                                let a_text: []u8 = file_text(input, fx.file, expr_span(input, fx, args[i].e))
                                 try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "`{b_text}` overlaps `{a_text}`, which is passed `inout`; an `inout` argument must not overlap another argument"))
                             }
                         }
@@ -165,8 +166,9 @@ fn exclusive(c: inout Checker, fx: Fx, args: []ArgMode) -> ! OutOfMemory {
 }
 
 // The storage a place expression names, as a root and steps.
-fn access_path(c: Checker, fx: Fx, e: syntax.ExprId) -> ?AccessPath ! OutOfMemory {
-    let res: ?resolve.Res = expr_res(c, fx.file, e)
+fn access_path(input: Input, c: Checker, fx: Fx, e: syntax.ExprId) -> ?AccessPath ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    let res: ?resolve.Res = expr_res(input, fx.file, e)
     var global: ?maps.DeclRef = none
     match res {
         some(value as r: resolve.Res) {
@@ -181,14 +183,14 @@ fn access_path(c: Checker, fx: Fx, e: syntax.ExprId) -> ?AccessPath ! OutOfMemor
         none {
         }
     }
-    match fx.ast.exprs[usize.(e)].kind {
+    match ast.exprs[usize.(e)].kind {
         paren(inner: syntax.ExprId) {
-            return access_path(c, fx, inner)
+            return access_path(input, c, fx, inner)
         }
         name(name: _) {
             match global {
                 some(value as d: maps.DeclRef) {
-                    return ok.(value: global_root(c, d))
+                    return ok.(value: global_root(input, c, d))
                 }
                 none {
                 }
@@ -211,15 +213,14 @@ fn access_path(c: Checker, fx: Fx, e: syntax.ExprId) -> ?AccessPath ! OutOfMemor
         field(value: syntax.ExprId, name: syntax.Span) {
             match global {
                 some(value as d: maps.DeclRef) {
-                    return ok.(value: global_root(c, d))
+                    return ok.(value: global_root(input, c, d))
                 }
                 none {
                 }
             }
-            match try access_path(c, fx, value) {
-                some(value as p: AccessPath) {
-                    var path: AccessPath = p
-                    try push(inout path.steps, Step.field.(name: file_text(c, fx.file, name)))
+            match try access_path(input, c, fx, value) {
+                some(value as var path: AccessPath) {
+                    try push(inout path.steps, Step.field.(name: file_text(input, fx.file, name)))
                     return ok.(value: some.(value: path))
                 }
                 none {
@@ -228,17 +229,16 @@ fn access_path(c: Checker, fx: Fx, e: syntax.ExprId) -> ?AccessPath ! OutOfMemor
             }
         }
         index(value: syntax.ExprId, index as i: syntax.Index) {
-            match try access_path(c, fx, value) {
-                some(value as p: AccessPath) {
+            match try access_path(input, c, fx, value) {
+                some(value as var path: AccessPath) {
                     var at: ?Wide = none
                     match i {
                         value(value as ie: syntax.ExprId) {
-                            at = const_int(c, fx.file, ie, 0)
+                            at = const_int(input, c, fx.file, ie, 0)
                         }
                         _ {
                         }
                     }
-                    var path: AccessPath = p
                     try push(inout path.steps, Step.index.(at: at))
                     return ok.(value: some.(value: path))
                 }
@@ -248,9 +248,8 @@ fn access_path(c: Checker, fx: Fx, e: syntax.ExprId) -> ?AccessPath ! OutOfMemor
             }
         }
         deref(inner: syntax.ExprId) {
-            match try access_path(c, fx, inner) {
-                some(value as p: AccessPath) {
-                    var path: AccessPath = p
+            match try access_path(input, c, fx, inner) {
+                some(value as var path: AccessPath) {
                     try push(inout path.steps, Step.deref)
                     return ok.(value: some.(value: path))
                 }
@@ -265,8 +264,8 @@ fn access_path(c: Checker, fx: Fx, e: syntax.ExprId) -> ?AccessPath ! OutOfMemor
     }
 }
 
-fn global_root(c: Checker, d: maps.DeclRef) -> ?AccessPath {
-    match decl_of(c, d).kind {
+fn global_root(input: Input, c: Checker, d: maps.DeclRef) -> ?AccessPath {
+    match decl_of(input, d).kind {
         global(is_shared: _, local: _), extern_var(mutable: _, name: _, ty: _) {
             return some.(value: AccessPath.(root: Root.global.(decl: d), steps: make(c.alloc)))
         }
@@ -347,12 +346,246 @@ fn overlaps(a: AccessPath, b: AccessPath) -> bool {
     return true
 }
 
+// One owner per buffer.
+
+// Whether ty holds a `[..]T`, so a value of it never copies implicitly.
+fn owning(c: inout Checker, ty: TyId) -> bool ! OutOfMemory {
+    match maps.get_int(c.owning, u32.(ty)) {
+        some(value as known: u32) {
+            return ok.(value: known == 1)
+        }
+        none {
+        }
+    }
+    // A type that holds itself does so through a `[..]T`, which decides
+    // it before the cycle closes.
+    try maps.put_int(inout c.owning, u32.(ty), 0)
+    var parts: [..]TyId = make(c.alloc)
+    match get(c.types, ty) {
+        growable(elem: _) {
+            try maps.put_int(inout c.owning, u32.(ty), 1)
+            return ok.(value: true)
+        }
+        tuple(fields: Range) {
+            for let f: TupleField in tuple_fields(c.types, fields) {
+                try push(inout parts, f.ty)
+            }
+        }
+        array(len: _, elem: TyId) {
+            try push(inout parts, elem)
+        }
+        optional(elem: TyId) {
+            try push(inout parts, elem)
+        }
+        result(value: ?TyId, error: TyId) {
+            match value {
+                some(value as v: TyId) {
+                    try push(inout parts, v)
+                }
+                none {
+                }
+            }
+            try push(inout parts, error)
+        }
+        named(id: _) {
+            match info_of(c, ty) {
+                some(value as info: NamedInfo) {
+                    match info.def {
+                        plain(underlying: TyId, pub_fields: _) {
+                            try push(inout parts, underlying)
+                        }
+                        enum_def(info as e: EnumInfo) {
+                            for let v: Variant in enum_variants(c.types, e) {
+                                match v.payload {
+                                    some(value as p: TyId) {
+                                        try push(inout parts, p)
+                                    }
+                                    none {
+                                    }
+                                }
+                            }
+                        }
+                        union_def(fields: Range) {
+                            for let f: TupleField in tuple_fields(c.types, fields) {
+                                try push(inout parts, f.ty)
+                            }
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        _ {
+        }
+    }
+    var result: bool = false
+    for let t: TyId in parts {
+        if try owning(inout c, t) {
+            result = true
+            break
+        }
+    }
+    try maps.put_int(inout c.owning, u32.(ty), if result { 1 } else { 0 })
+    return ok.(value: result)
+}
+
+// Whether `take` can leave a value of ty empty: each owning part is a
+// `[..]T` or an optional, which becomes `none`, or a record or tuple
+// whose owning parts are.
+fn emptiable(c: inout Checker, ty: TyId) -> bool ! OutOfMemory {
+    if !(try owning(inout c, ty)) {
+        return ok.(value: true)
+    }
+    var fields: [..]TyId = make(c.alloc)
+    match get(c.types, ty) {
+        growable(elem: _), optional(elem: _) {
+            return ok.(value: true)
+        }
+        tuple(fields as r: Range) {
+            for let f: TupleField in tuple_fields(c.types, r) {
+                try push(inout fields, f.ty)
+            }
+        }
+        named(id: _) {
+            match info_of(c, ty) {
+                some(value as info: NamedInfo) {
+                    match info.def {
+                        plain(underlying: TyId, pub_fields: _) {
+                            try push(inout fields, underlying)
+                        }
+                        _ {
+                            return ok.(value: false)
+                        }
+                    }
+                }
+                none {
+                    return ok.(value: false)
+                }
+            }
+        }
+        _ {
+            return ok.(value: false)
+        }
+    }
+    for let t: TyId in fields {
+        if !(try emptiable(inout c, t)) {
+            return ok.(value: false)
+        }
+    }
+    return ok.(value: true)
+}
+
+// e becomes a new home's value of type target. If target is owning, e
+// must not be a place that keeps the buffer too. Inside a `return` value,
+// a place that starts at one of the function's own locals is taken
+// instead, once.
+fn fresh(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, target: TyId) -> ! OutOfMemory {
+    if is_error(c.types, target) || !(try owning(inout c, target)) {
+        return ok
+    }
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    match ast.exprs[usize.(e)].kind {
+        paren(inner: syntax.ExprId) {
+            try fresh(input, inout c, inout fx, inner, target)
+        }
+        unsafe_expr(body: syntax.ExprId) {
+            try fresh(input, inout c, inout fx, body, target)
+        }
+        if_expr(cond: _, then: syntax.ExprId, otherwise: syntax.IfElse) {
+            try fresh(input, inout c, inout fx, then, target)
+            match otherwise {
+                branch(value as v: syntax.ExprId) {
+                    try fresh(input, inout c, inout fx, v, target)
+                }
+                if_expr(value as v: syntax.ExprId) {
+                    try fresh(input, inout c, inout fx, v, target)
+                }
+            }
+        }
+        match_expr(value: _, arms: syntax.List) {
+            for let i: u32 in syntax.items(ast.extra, arms) {
+                match ast.arms[usize.(i)].body {
+                    branch(value as v: syntax.ExprId) {
+                        try fresh(input, inout c, inout fx, v, target)
+                    }
+                    block(body: _) {
+                    }
+                }
+            }
+        }
+        // A raw pointer's target is trusted, as `unsafe` is.
+        deref(inner: _) {
+        }
+        name(name: _), field(value: _, name: _), index(value: _, index: _) {
+            match try access_path(input, c, fx, e) {
+                some(value as var path: AccessPath) {
+                    let span: syntax.Span = expr_span(input, fx, e)
+                    let text: []u8 = file_text(input, fx.file, span)
+                    if fx.returning {
+                        match path.root {
+                            local(id: u32) {
+                                match local_info(fx, id) {
+                                    some(value as info: LocalInfo) {
+                                        if info.owned {
+                                            for let d: [..]u32 in fx.defers {
+                                                for let m: u32 in d {
+                                                    if m == id {
+                                                        let root: []u8 = file_text(input, fx.file, try root_name(input, c, fx, e))
+                                                        try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "a `defer` uses `{root}` after this `return`; hand the value over with `take(inout {text})`"))
+                                                        return ok
+                                                    }
+                                                }
+                                            }
+                                            for let t: AccessPath in fx.taken {
+                                                if overlaps(t, path) {
+                                                    try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "this `return` already takes `{text}` or part of it; a buffer can go to only one place"))
+                                                    return ok
+                                                }
+                                            }
+                                            try push(inout fx.taken, take(inout path))
+                                            return ok
+                                        }
+                                    }
+                                    none {
+                                    }
+                                }
+                            }
+                            global(decl: _) {
+                            }
+                        }
+                    }
+                    try report(inout c, fx.file, span.start, try program.format_text(c.alloc, "this would copy `{text}`, and its buffer would have two owners; hand it over with `take(inout {text})` or make a second one with `try copy(alloc, {text})`"))
+                }
+                none {
+                }
+            }
+        }
+        _ {
+        }
+    }
+    return ok
+}
+
+// The name a place expression starts at.
+fn root_name(input: Input, c: Checker, fx: Fx, e: syntax.ExprId) -> syntax.Span ! OutOfMemory {
+    let s: []syntax.ExprId = try spine(c.alloc, input, fx, e)
+    return ok.(value: expr_span(input, fx, s[s.len - 1]))
+}
+
+// `append` and `copy` copy each element byte for byte, which an owning
+// element cannot be.
+fn no_owning_copy(c: inout Checker, file: u32, start: u32, name: []u8, elem: TyId) -> ! OutOfMemory {
+    if try owning(inout c, elem) {
+        let shown: []u8 = try show(inout c, elem)
+        try report(inout c, file, start, try program.format_text(c.alloc, "`{name}` copies each element, and a `{shown}` cannot be copied: its buffer would have two owners"))
+    }
+    return ok
+}
+
 // The `Format` rule.
 
-// Whether a value of ty holds a `Format`, which points into the frame that
-// made it. A declared type is checked where it is declared, so it never
-// holds one.
-fn holds_format(c: Checker, ty: TyId) -> bool {
+fn holds_format(input: Input, c: Checker, ty: TyId) -> bool {
     match get(c.types, ty) {
         named(id: NamedId) {
             return match id {
@@ -362,43 +595,43 @@ fn holds_format(c: Checker, ty: TyId) -> bool {
         }
         tuple(fields: Range) {
             for let f: TupleField in tuple_fields(c.types, fields) {
-                if holds_format(c, f.ty) {
+                if holds_format(input, c, f.ty) {
                     return true
                 }
             }
             return false
         }
         view(elem: TyId) {
-            return holds_format(c, elem)
+            return holds_format(input, c, elem)
         }
         array(len: _, elem: TyId) {
-            return holds_format(c, elem)
+            return holds_format(input, c, elem)
         }
         growable(elem: TyId) {
-            return holds_format(c, elem)
+            return holds_format(input, c, elem)
         }
         pointer(elem: TyId) {
-            return holds_format(c, elem)
+            return holds_format(input, c, elem)
         }
         optional(elem: TyId) {
-            return holds_format(c, elem)
+            return holds_format(input, c, elem)
         }
         result(value: ?TyId, error: TyId) {
             match value {
                 some(value as v: TyId) {
-                    if holds_format(c, v) {
+                    if holds_format(input, c, v) {
                         return true
                     }
                 }
                 none {
                 }
             }
-            return holds_format(c, error)
+            return holds_format(input, c, error)
         }
         function(params: Range, result: ?TyId) {
             match result {
                 some(value as r: TyId) {
-                    if holds_format(c, r) {
+                    if holds_format(input, c, r) {
                         return true
                     }
                 }
@@ -406,7 +639,7 @@ fn holds_format(c: Checker, ty: TyId) -> bool {
                 }
             }
             for let p: FnParam in fn_params(c.types, params) {
-                if !is_format_param(c, p.ty) && holds_format(c, p.ty) {
+                if !is_format_param(c, p.ty) && holds_format(input, c, p.ty) {
                     return true
                 }
             }
@@ -423,8 +656,8 @@ fn is_format_param(c: Checker, ty: TyId) -> bool {
 }
 
 // ty is written somewhere other than a parameter.
-fn no_format(c: inout Checker, file: u32, start: u32, ty: TyId) -> ! OutOfMemory {
-    if !holds_format(c, ty) {
+fn no_format(input: Input, c: inout Checker, file: u32, start: u32, ty: TyId) -> ! OutOfMemory {
+    if !holds_format(input, c, ty) {
         return ok
     }
     if is_builtin_named(c, ty, BuiltinNamed.format) {
@@ -435,16 +668,16 @@ fn no_format(c: inout Checker, file: u32, start: u32, ty: TyId) -> ! OutOfMemory
 }
 
 // A parameter's type may be `Format` itself, but not hold one.
-fn format_param(c: inout Checker, file: u32, start: u32, ty: TyId) -> ! OutOfMemory {
+fn format_param(input: Input, c: inout Checker, file: u32, start: u32, ty: TyId) -> ! OutOfMemory {
     if !is_format_param(c, ty) {
-        try no_format(inout c, file, start, ty)
+        try no_format(input, inout c, file, start, ty)
     }
     return ok
 }
 
 // The fields, payloads and members of a declared type.
-fn no_format_in_type(c: inout Checker, file: u32, def: syntax.TypeDef, ty: TyId) -> ! OutOfMemory {
-    let ast: syntax.Ast = ast_of(c, file)
+fn no_format_in_type(input: Input, c: inout Checker, file: u32, def: syntax.TypeDef, ty: TyId) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(file)].ast
     var info_def: ?NamedDef = none
     match info_of(c, ty) {
         some(value as info: NamedInfo) {
@@ -477,7 +710,7 @@ fn no_format_in_type(c: inout Checker, file: u32, def: syntax.TypeDef, ty: TyId)
                                     for let i: usize in 0..written.len {
                                         if i < lowered.len {
                                             let ft: syntax.TypeId = ast.fields[usize.(written[i])].ty
-                                            try no_format(inout c, file, ast.types[usize.(ft)].span.start, lowered[i].ty)
+                                            try no_format(input, inout c, file, ast.types[usize.(ft)].span.start, lowered[i].ty)
                                         }
                                     }
                                     done = true
@@ -490,7 +723,7 @@ fn no_format_in_type(c: inout Checker, file: u32, def: syntax.TypeDef, ty: TyId)
                         }
                     }
                     if !done {
-                        try no_format(inout c, file, ast.types[usize.(t)].span.start, underlying)
+                        try no_format(input, inout c, file, ast.types[usize.(t)].span.start, underlying)
                     }
                 }
                 _ {
@@ -510,7 +743,7 @@ fn no_format_in_type(c: inout Checker, file: u32, def: syntax.TypeDef, ty: TyId)
                                         some(value as p: syntax.TypeId) {
                                             match lowered[k].payload {
                                                 some(value as pt: TyId) {
-                                                    try no_format(inout c, file, ast.types[usize.(p)].span.start, pt)
+                                                    try no_format(input, inout c, file, ast.types[usize.(p)].span.start, pt)
                                                 }
                                                 none {
                                                 }
@@ -539,7 +772,7 @@ fn no_format_in_type(c: inout Checker, file: u32, def: syntax.TypeDef, ty: TyId)
                     for let i: usize in 0..written.len {
                         if i < lowered.len {
                             let ft: syntax.TypeId = ast.fields[usize.(written[i])].ty
-                            try no_format(inout c, file, ast.types[usize.(ft)].span.start, lowered[i].ty)
+                            try no_format(input, inout c, file, ast.types[usize.(ft)].span.start, lowered[i].ty)
                         }
                     }
                 }
@@ -555,8 +788,8 @@ fn no_format_in_type(c: inout Checker, file: u32, def: syntax.TypeDef, ty: TyId)
 
 // A global's initializer is computed before the program runs, so it must
 // be a constant.
-fn constant(c: inout Checker, file: u32, e: syntax.ExprId) -> ! OutOfMemory {
-    match non_constant(c, file, e) {
+fn constant(input: Input, c: inout Checker, file: u32, e: syntax.ExprId) -> ! OutOfMemory {
+    match non_constant(input, c, file, e) {
         some(value as start: u32) {
             try report(inout c, file, start, "a global's value is computed before the program runs, so this must be a constant")
         }
@@ -566,9 +799,9 @@ fn constant(c: inout Checker, file: u32, e: syntax.ExprId) -> ! OutOfMemory {
     return ok
 }
 
-fn first_non_constant(c: Checker, file: u32, es: []u32) -> ?u32 {
+fn first_non_constant(input: Input, c: Checker, file: u32, es: []u32) -> ?u32 {
     for let e: u32 in es {
-        match non_constant(c, file, syntax.ExprId.(e)) {
+        match non_constant(input, c, file, syntax.ExprId.(e)) {
             some(value as s: u32) {
                 return some.(value: s)
             }
@@ -580,8 +813,8 @@ fn first_non_constant(c: Checker, file: u32, es: []u32) -> ?u32 {
 }
 
 // Where the first part of e that is not a constant starts.
-fn non_constant(c: Checker, file: u32, e: syntax.ExprId) -> ?u32 {
-    let ast: syntax.Ast = ast_of(c, file)
+fn non_constant(input: Input, c: Checker, file: u32, e: syntax.ExprId) -> ?u32 {
+    let ast: syntax.Ast = input.program.files[usize.(file)].ast
     let x: syntax.Expr = ast.exprs[usize.(e)]
     match x.kind {
         int, float, char {
@@ -600,27 +833,27 @@ fn non_constant(c: Checker, file: u32, e: syntax.ExprId) -> ?u32 {
             return none
         }
         paren(inner: syntax.ExprId) {
-            return non_constant(c, file, inner)
+            return non_constant(input, c, file, inner)
         }
         unary(op: syntax.UnaryOp, operand: syntax.ExprId) {
             if op == syntax.UnaryOp.address_of {
                 return some.(value: x.span.start)
             }
-            return non_constant(c, file, operand)
+            return non_constant(input, c, file, operand)
         }
         binary(op: _, left: syntax.ExprId, right: syntax.ExprId) {
-            match non_constant(c, file, left) {
+            match non_constant(input, c, file, left) {
                 some(value as s: u32) {
                     return some.(value: s)
                 }
                 none {
-                    return non_constant(c, file, right)
+                    return non_constant(input, c, file, right)
                 }
             }
         }
         tuple(items: syntax.List) {
             for let i: u32 in syntax.items(ast.extra, items) {
-                match non_constant(c, file, ast.tuple_items[usize.(i)].value) {
+                match non_constant(input, c, file, ast.tuple_items[usize.(i)].value) {
                     some(value as s: u32) {
                         return some.(value: s)
                     }
@@ -631,20 +864,20 @@ fn non_constant(c: Checker, file: u32, e: syntax.ExprId) -> ?u32 {
             return none
         }
         array(elems: syntax.List) {
-            return first_non_constant(c, file, syntax.items(ast.extra, elems))
+            return first_non_constant(input, c, file, syntax.items(ast.extra, elems))
         }
         construct(ty: _, value: syntax.ExprId) {
-            return non_constant(c, file, value)
+            return non_constant(input, c, file, value)
         }
         name(name: _) {
-            return variable_use(c, file, e, x.span.start)
+            return variable_use(input, file, e, x.span.start)
         }
         field(value: syntax.ExprId, name: syntax.Span) {
-            match expr_res(c, file, e) {
+            match expr_res(input, file, e) {
                 some(value as res: resolve.Res) {
                     match res {
                         decl(decl: _) {
-                            return variable_use(c, file, e, x.span.start)
+                            return variable_use(input, file, e, x.span.start)
                         }
                         _ {
                         }
@@ -654,11 +887,11 @@ fn non_constant(c: Checker, file: u32, e: syntax.ExprId) -> ?u32 {
                 }
             }
             // A variant, as in `Color.red`.
-            if is_type_expr(c, file, value) {
+            if is_type_expr(input, file, value) {
                 return none
             }
-            if program.bytes_equal(file_text(c, file, name), "len") {
-                return non_constant(c, file, value)
+            if program.bytes_equal(file_text(input, file, name), "len") {
+                return non_constant(input, c, file, value)
             }
             return some.(value: x.span.start)
         }
@@ -671,12 +904,12 @@ fn non_constant(c: Checker, file: u32, e: syntax.ExprId) -> ?u32 {
                 _ {
                 }
             }
-            match res_builtin(expr_res(c, file, target)) {
+            match res_builtin(expr_res(input, file, target)) {
                 some(value as name: []u8) {
                     match name {
                         "from_address", "fill", "c_string", "truncate" {
                             for let i: u32 in syntax.items(ast.extra, args) {
-                                match non_constant(c, file, ast.args[usize.(i)].value) {
+                                match non_constant(input, c, file, ast.args[usize.(i)].value) {
                                     some(value as s: u32) {
                                         return some.(value: s)
                                     }
@@ -702,12 +935,12 @@ fn non_constant(c: Checker, file: u32, e: syntax.ExprId) -> ?u32 {
 }
 
 // A name that refers to a `var` global or a C global is not a constant.
-fn variable_use(c: Checker, file: u32, e: syntax.ExprId, start: u32) -> ?u32 {
-    match expr_res(c, file, e) {
+fn variable_use(input: Input, file: u32, e: syntax.ExprId, start: u32) -> ?u32 {
+    match expr_res(input, file, e) {
         some(value as res: resolve.Res) {
             match res {
                 decl(decl as d: maps.DeclRef) {
-                    if variable_decl(c, d) {
+                    if variable_decl(input, d) {
                         return some.(value: start)
                     }
                 }
@@ -723,23 +956,23 @@ fn variable_use(c: Checker, file: u32, e: syntax.ExprId, start: u32) -> ?u32 {
 
 // Whether a top-level name is not a constant: `var` globals and C globals.
 // Functions are constants: their addresses are fixed.
-fn variable_decl(c: Checker, decl: maps.DeclRef) -> bool {
-    return match decl_of(c, decl).kind {
+fn variable_decl(input: Input, decl: maps.DeclRef) -> bool {
+    return match decl_of(input, decl).kind {
         global(is_shared: _, local: syntax.Local) { local.mutable }
         extern_var(mutable: _, name: _, ty: _) { true }
         _ { false }
     }
 }
 
-fn is_type_expr(c: Checker, file: u32, e: syntax.ExprId) -> bool {
-    match expr_res(c, file, e) {
+fn is_type_expr(input: Input, file: u32, e: syntax.ExprId) -> bool {
+    match expr_res(input, file, e) {
         some(value as res: resolve.Res) {
             match res {
                 builtin(name: []u8) {
                     return resolve.is_builtin_type(name)
                 }
                 decl(decl as d: maps.DeclRef) {
-                    return match decl_of(c, d).kind {
+                    return match decl_of(input, d).kind {
                         type_decl(name: _, def: _) { true }
                         _ { false }
                     }

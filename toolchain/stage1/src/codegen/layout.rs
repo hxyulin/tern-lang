@@ -274,6 +274,27 @@ impl Gen<'_> {
         )
     }
 
+    /// Whether a value of `ty` holds a `[..]T` that `take` empties:
+    /// directly, in an optional, or in a field of a record or tuple.
+    pub fn holds_growable(&mut self, ty: TyId) -> bool {
+        let core = self.core(ty);
+        match self.types.get(core).clone() {
+            Ty::Growable(_) => true,
+            Ty::Optional(inner) => self.holds_growable(inner),
+            Ty::Tuple(fields) => fields.iter().any(|(_, t)| self.holds_growable(*t)),
+            Ty::Named(id) => match &self.types.named.get(&id).map(|i| &i.def) {
+                Some(NamedDef::Plain { underlying, .. }) => {
+                    match self.types.get(*underlying).clone() {
+                        Ty::Tuple(fields) => fields.iter().any(|(_, t)| self.holds_growable(*t)),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     pub fn field(&mut self, ty: TyId, name: &str) -> (TyId, u64) {
         let fields = self.record_fields(ty).expect("the checker found a record");
         let (_, t, o) = fields

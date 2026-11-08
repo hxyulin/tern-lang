@@ -66,10 +66,10 @@ type Item fn(inout Parser) -> u32 ! Stop
 // Lexes and parses one file. Everything it returns lives in alloc, which
 // is meant to be an arena: freeing the arena frees the tree.
 pub fn parse(alloc: Allocator, text: []u8) -> Parsed ! OutOfMemory {
-    let lexed: Lexed = try lex(alloc, text)
+    var lexed: Lexed = try lex(alloc, text)
     var p: Parser = Parser.(
         text: text,
-        tokens: lexed.tokens,
+        tokens: take(inout lexed.tokens),
         pos: 0,
         ast: new_ast(alloc),
         scratch: make(alloc),
@@ -77,12 +77,11 @@ pub fn parse(alloc: Allocator, text: []u8) -> Parsed ! OutOfMemory {
     )
     match file(inout p) {
         ok {
-            let parsed: Parsed = Parsed.(
+            return ok.(value: Parsed.(
                 ast: p.ast,
                 lex_diagnostics: lexed.diagnostics,
                 diagnostics: p.diagnostics,
-            )
-            return ok.(value: parsed)
+            ))
         }
         err(error: _) {
             return err.(error: OutOfMemory.out_of_memory)

@@ -1,0 +1,67 @@
+// One owner per buffer: `take` on records, tuples and optionals leaves
+// them empty, and `return` takes a local.
+
+import std.heap
+import std.io
+
+type Bag (items: [..]u32, label: u32, spare: ?[..]u8)
+
+fn new_bag(alloc: Allocator, n: u32) -> Bag ! OutOfMemory {
+    var items: [..]u32 = make(alloc)
+    for let i: u32 in 0..n {
+        try push(inout items, i)
+    }
+    var spare: [..]u8 = make(alloc)
+    try push(inout spare, 7)
+    return ok.(value: Bag.(items: items, label: n, spare: some.(value: spare)))
+}
+
+fn spare_len(b: Bag) -> usize {
+    return match b.spare {
+        some(value as s: [..]u8) { s.len }
+        none { 0 }
+    }
+}
+
+fn run() -> ! OutOfMemory {
+    var a: Bag = try new_bag(heap.c_allocator, 3)
+    io.print("a: {a.items.len} items, label {a.label}, spare {spare_len(a)}\n")
+    var b: Bag = take(inout a)
+    io.print("after take, a: {a.items.len} items, label {a.label}, spare {spare_len(a)}\n")
+    io.print("b: {b.items.len} items, label {b.label}, spare {spare_len(b)}\n")
+    var spare: ?[..]u8 = take(inout b.spare)
+    io.print("b spare after take: {spare_len(b)}\n")
+    match take(inout spare) {
+        some(value as var s: [..]u8) {
+            io.print("took a spare of {s.len}\n")
+            free(inout s)
+        }
+        none {
+        }
+    }
+    // A second take finds nothing.
+    match take(inout spare) {
+        some(value: _) {
+            io.print("unexpected\n")
+        }
+        none {
+            io.print("spare is empty\n")
+        }
+    }
+    try push(inout a.items, 42)
+    io.print("a grows again: {a.items.len} item, {a.items[0]}\n")
+    free(inout a.items)
+    free(inout b.items)
+    return ok
+}
+
+fn main() -> u8 {
+    match run() {
+        ok {
+            return 0
+        }
+        err(error: _) {
+            return 1
+        }
+    }
+}

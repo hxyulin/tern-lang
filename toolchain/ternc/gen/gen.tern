@@ -25,16 +25,25 @@ import program
 import resolve
 import syntax
 
-pub type Gen (
-    alloc: Allocator,
+// What code generation reads: the checked program.
+type Input (
     program: program.Program,
     names: resolve.Resolution,
-    types: check.Types,
     files: [..]check.FileTypes,
     fn_tys: [..]?check.TyId,
+)
+
+// What code generation builds. It interns new types as it goes.
+pub type Gen (
+    alloc: Allocator,
+    types: check.Types,
     // The root package's directory name, which prefixes its symbols.
     root_name: []u8,
     m: keel.Module,
+    // The variants of every EnumShape, and the parameters of every FnAbi.
+    variant_shapes: [..]VariantShape,
+    abi_params: [..]keel.AbiValue,
+    abi_passes: [..]Pass,
     // Per type, by id, once worked out.
     layouts: [..]?TyLayout,
     fields_cache: [..]FieldsSlot,
@@ -83,9 +92,14 @@ type Pass enum {
 // A function's signature and how its parameters and result cross.
 type FnAbi (
     sig: keel.Signature,
-    // The keel parameters, in order.
-    params: [..]keel.AbiValue,
-    passes: [..]Pass,
+    // The keel parameters, in order: param_count of Gen's abi_params
+    // from first_param.
+    first_param: u32,
+    param_count: u32,
+    // How each tern parameter crosses: pass_count of Gen's abi_passes
+    // from first_pass.
+    first_pass: u32,
+    pass_count: u32,
     // The result goes through memory the caller passes first.
     sret: bool,
     // The function returns a keel value.
@@ -95,17 +109,22 @@ type FnAbi (
 )
 
 // Lowers a program that checked without errors. root_name is the root
-// directory's name.
-pub fn generate(alloc: Allocator, p: program.Program, names: resolve.Resolution, checked: check.Checked, root_name: []u8) -> Generated ! OutOfMemory {
+// directory's name. It takes p, names and checked, and leaves them empty.
+pub fn generate(alloc: Allocator, p: inout program.Program, names: inout resolve.Resolution, checked: inout check.Checked, root_name: []u8) -> Generated ! OutOfMemory {
+    let input: Input = Input.(
+        program: take(inout p),
+        names: take(inout names),
+        files: take(inout checked.files),
+        fn_tys: take(inout checked.fn_tys),
+    )
     var g: Gen = Gen.(
         alloc: alloc,
-        program: p,
-        names: names,
-        types: checked.types,
-        files: checked.files,
-        fn_tys: checked.fn_tys,
+        types: take(inout checked.types),
         root_name: root_name,
         m: keel.create(),
+        variant_shapes: make(alloc),
+        abi_params: make(alloc),
+        abi_passes: make(alloc),
         layouts: make(alloc),
         fields_cache: make(alloc),
         shapes: make(alloc),
@@ -127,20 +146,20 @@ pub fn generate(alloc: Allocator, p: program.Program, names: resolve.Resolution,
         try push(inout g.decl_symbols, none)
         try push(inout g.decl_abis, none)
     }
-    g.handler = find_panic_handler(g)
-    for let i: usize in 0..p.files.len {
-        let decls: [..]syntax.Decl = p.files[i].ast.decls
+    g.handler = find_panic_handler(input)
+    for let i: usize in 0..input.program.files.len {
+        let decls: [..]syntax.Decl = input.program.files[i].ast.decls
         for let index: usize in 0..decls.len {
             let decl: maps.DeclRef = maps.DeclRef.(file: u32.(i), index: u32.(index))
             match decls[index].kind {
                 function(is_unsafe: _, name: _, params: _, result: _, body: _) {
-                    try gen_function(inout g, decl)
+                    try gen_function(input, inout g, decl)
                 }
                 global(is_shared: _, local: _) {
-                    try gen_global(inout g, decl)
+                    try gen_global(input, inout g, decl)
                 }
                 extern_var(mutable: _, name: _, ty: _) {
-                    let name: []u8 = try symbol(inout g, decl)
+                    let name: []u8 = try symbol(input, inout g, decl)
                     let _: keel.Symbol = try data_symbol(inout g, name)
                 }
                 extern_fn(name: _, params: _, variadic: _, result: _) {
@@ -159,34 +178,34 @@ pub fn generate(alloc: Allocator, p: program.Program, names: resolve.Resolution,
 
 // Declarations.
 
-fn decl_of(g: Gen, decl: maps.DeclRef) -> syntax.Decl {
-    return g.program.files[usize.(decl.file)].ast.decls[usize.(decl.index)]
+fn decl_of(input: Input, decl: maps.DeclRef) -> syntax.Decl {
+    return input.program.files[usize.(decl.file)].ast.decls[usize.(decl.index)]
 }
 
-fn file_text(g: Gen, file: u32, s: syntax.Span) -> []u8 {
-    return program.slice(g.program.files[usize.(file)], s.start, s.end)
+fn file_text(input: Input, file: u32, s: syntax.Span) -> []u8 {
+    return program.slice(input.program.files[usize.(file)], s.start, s.end)
 }
 
-fn decl_name(g: Gen, decl: maps.DeclRef) -> []u8 {
-    match decl_of(g, decl).kind {
+fn decl_name(input: Input, decl: maps.DeclRef) -> []u8 {
+    match decl_of(input, decl).kind {
         function(is_unsafe: _, name: syntax.Span, params: _, result: _, body: _) {
-            return file_text(g, decl.file, name)
+            return file_text(input, decl.file, name)
         }
         extern_fn(name: syntax.Span, params: _, variadic: _, result: _) {
-            return file_text(g, decl.file, name)
+            return file_text(input, decl.file, name)
         }
         extern_var(mutable: _, name: syntax.Span, ty: _) {
-            return file_text(g, decl.file, name)
+            return file_text(input, decl.file, name)
         }
         type_decl(name: syntax.Span, def: _) {
-            return file_text(g, decl.file, name)
+            return file_text(input, decl.file, name)
         }
         global(is_shared: _, local: syntax.Local) {
             match local.binding {
                 single(name: ?syntax.Span, ty: _) {
                     match name {
                         some(value as n: syntax.Span) {
-                            return file_text(g, decl.file, n)
+                            return file_text(input, decl.file, n)
                         }
                         none {
                         }
@@ -200,19 +219,19 @@ fn decl_name(g: Gen, decl: maps.DeclRef) -> []u8 {
     }
 }
 
-fn is_extern_fn(g: Gen, decl: maps.DeclRef) -> bool {
-    return match decl_of(g, decl).kind {
+fn is_extern_fn(input: Input, decl: maps.DeclRef) -> bool {
+    return match decl_of(input, decl).kind {
         extern_fn(name: _, params: _, variadic: _, result: _) { true }
         _ { false }
     }
 }
 
 // The attribute `@name` on a declaration.
-fn attribute(g: Gen, decl: maps.DeclRef, name: []u8) -> ?syntax.Attribute {
-    let ast: syntax.Ast = g.program.files[usize.(decl.file)].ast
-    for let i: u32 in syntax.items(ast.extra, decl_of(g, decl).attributes) {
+fn attribute(input: Input, decl: maps.DeclRef, name: []u8) -> ?syntax.Attribute {
+    let ast: syntax.Ast = input.program.files[usize.(decl.file)].ast
+    for let i: u32 in syntax.items(ast.extra, decl_of(input, decl).attributes) {
         let a: syntax.Attribute = ast.attributes[usize.(i)]
-        var text: []u8 = file_text(g, decl.file, a.name)
+        var text: []u8 = file_text(input, decl.file, a.name)
         if text.len > 0 && text[0] == '@' {
             text = text[1..]
         }
@@ -223,8 +242,8 @@ fn attribute(g: Gen, decl: maps.DeclRef, name: []u8) -> ?syntax.Attribute {
     return none
 }
 
-fn has_attribute(g: Gen, decl: maps.DeclRef, name: []u8) -> bool {
-    return match attribute(g, decl, name) {
+fn has_attribute(input: Input, decl: maps.DeclRef, name: []u8) -> bool {
+    return match attribute(input, decl, name) {
         some(value: _) { true }
         none { false }
     }
@@ -232,8 +251,8 @@ fn has_attribute(g: Gen, decl: maps.DeclRef, name: []u8) -> bool {
 
 // A package's prefix for symbols: `std.io`, or the root's directory name
 // and then the package's path.
-fn package_prefix(g: Gen, package: u32) -> []u8 ! OutOfMemory {
-    let path: []u8 = g.program.packages[usize.(package)].path
+fn package_prefix(input: Input, g: Gen, package: u32) -> []u8 ! OutOfMemory {
+    let path: []u8 = input.program.packages[usize.(package)].path
     if path.len == 0 {
         return ok.(value: g.root_name)
     }
@@ -244,7 +263,7 @@ fn package_prefix(g: Gen, package: u32) -> []u8 ! OutOfMemory {
 }
 
 // The linker symbol of a function or global.
-fn symbol(g: inout Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
+fn symbol(input: Input, g: inout Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
     let number: usize = usize.(check.decl_number(g.types, decl))
     match g.decl_symbols[number] {
         some(value as known: []u8) {
@@ -253,15 +272,15 @@ fn symbol(g: inout Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
         none {
         }
     }
-    let made: []u8 = try make_symbol(g, decl)
+    let made: []u8 = try make_symbol(input, g, decl)
     g.decl_symbols[number] = some.(value: made)
     return ok.(value: made)
 }
 
-fn make_symbol(g: Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
-    let name: []u8 = decl_name(g, decl)
-    let package: u32 = g.program.files[usize.(decl.file)].package
-    match decl_of(g, decl).kind {
+fn make_symbol(input: Input, g: Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
+    let name: []u8 = decl_name(input, decl)
+    let package: u32 = input.program.files[usize.(decl.file)].package
+    match decl_of(input, decl).kind {
         extern_fn(name: _, params: _, variadic: _, result: _) {
             return ok.(value: name)
         }
@@ -269,14 +288,14 @@ fn make_symbol(g: Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
             return ok.(value: name)
         }
         function(is_unsafe: _, name: _, params: _, result: _, body: _) {
-            match attribute(g, decl, "export") {
+            match attribute(input, decl, "export") {
                 some(value as export: syntax.Attribute) {
-                    let ast: syntax.Ast = g.program.files[usize.(decl.file)].ast
+                    let ast: syntax.Ast = input.program.files[usize.(decl.file)].ast
                     let args: []u32 = syntax.items(ast.extra, export.args)
                     if args.len == 0 {
                         return ok.(value: name)
                     }
-                    var text: []u8 = file_text(g, decl.file, ast.exprs[usize.(args[0])].span)
+                    var text: []u8 = file_text(input, decl.file, ast.exprs[usize.(args[0])].span)
                     for text.len > 0 && text[0] == '"' {
                         text = text[1..]
                     }
@@ -288,19 +307,19 @@ fn make_symbol(g: Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
                 none {
                 }
             }
-            if g.program.packages[usize.(package)].path.len == 0 && same_text(name, "main") {
+            if input.program.packages[usize.(package)].path.len == 0 && same_text(name, "main") {
                 return ok.(value: "tern_main")
             }
         }
         _ {
         }
     }
-    let prefix: []u8 = try package_prefix(g, package)
+    let prefix: []u8 = try package_prefix(input, g, package)
     return program.format_text(g.alloc, "{prefix}.{name}")
 }
 
-fn fn_ty_of(g: Gen, decl: maps.DeclRef) -> check.TyId {
-    match g.fn_tys[usize.(check.decl_number(g.types, decl))] {
+fn fn_ty_of(input: Input, g: Gen, decl: maps.DeclRef) -> check.TyId {
+    match input.fn_tys[usize.(check.decl_number(g.types, decl))] {
         some(value as ty: check.TyId) {
             return ty
         }
@@ -312,8 +331,8 @@ fn fn_ty_of(g: Gen, decl: maps.DeclRef) -> check.TyId {
 
 // Signatures.
 
-fn abi_param(g: inout Gen, ty: check.TyId) -> keel.AbiValue ! OutOfMemory {
-    let t: keel.Type = try scalar_of(inout g, ty)
+fn abi_param(input: Input, g: inout Gen, ty: check.TyId) -> keel.AbiValue ! OutOfMemory {
+    let t: keel.Type = try scalar_of(input, inout g, ty)
     var ext: keel.Extension = keel.Extension.plain
     match t {
         int8, int16 {
@@ -335,7 +354,7 @@ fn abi_param(g: inout Gen, ty: check.TyId) -> keel.AbiValue ! OutOfMemory {
 
 // The ABI of a function type. c_records is set for an `extern` function,
 // which takes records by value as C does.
-fn fn_abi(g: inout Gen, fn_ty: check.TyId, variadic: bool, c_records: bool) -> FnAbi ! OutOfMemory {
+fn fn_abi(input: Input, g: inout Gen, fn_ty: check.TyId, variadic: bool, c_records: bool) -> FnAbi ! OutOfMemory {
     var params_r: check.Range = check.Range.(start: 0, len: 0)
     var result: ?check.TyId = none
     match check.get(g.types, core_ty(g, fn_ty)) {
@@ -353,13 +372,13 @@ fn fn_abi(g: inout Gen, fn_ty: check.TyId, variadic: bool, c_records: bool) -> F
     var sret: bool = false
     match result {
         some(value as r: check.TyId) {
-            match try ty_repr(inout g, r) {
+            match try ty_repr(input, inout g, r) {
                 scalar(ty: _) {
-                    try push(inout returns, try abi_param(inout g, r))
+                    try push(inout returns, try abi_param(input, inout g, r))
                 }
                 memory {
                     sret = true
-                    let layout: keel.Layout = try abi_layout(inout g, r)
+                    let layout: keel.Layout = try abi_layout(input, inout g, r)
                     try push(inout params, keel.abi_memory(keel.Purpose.sret, layout))
                 }
                 unit {
@@ -371,7 +390,7 @@ fn fn_abi(g: inout Gen, fn_ty: check.TyId, variadic: bool, c_records: bool) -> F
     }
     let fn_params: []check.FnParam = check.fn_params(g.types, params_r)
     for let p: check.FnParam in fn_params {
-        let repr: Repr = try ty_repr(inout g, p.ty)
+        let repr: Repr = try ty_repr(input, inout g, p.ty)
         var pass: Pass = Pass.skip
         match p.mode {
             inout_mode {
@@ -389,13 +408,13 @@ fn fn_abi(g: inout Gen, fn_ty: check.TyId, variadic: bool, c_records: bool) -> F
         }
         match pass {
             scalar_arg {
-                try push(inout params, try abi_param(inout g, p.ty))
+                try push(inout params, try abi_param(input, inout g, p.ty))
             }
             place, borrow {
                 try push(inout params, keel.abi(keel.Type.ptr, keel.Extension.plain))
             }
             byval {
-                let layout: keel.Layout = try abi_layout(inout g, p.ty)
+                let layout: keel.Layout = try abi_layout(input, inout g, p.ty)
                 try push(inout params, keel.abi_memory(keel.Purpose.byval, layout))
             }
             skip {
@@ -404,10 +423,34 @@ fn fn_abi(g: inout Gen, fn_ty: check.TyId, variadic: bool, c_records: bool) -> F
         try push(inout passes, pass)
     }
     let sig: keel.Signature = keel.signature(g.m, params, returns, variadic)
-    return ok.(value: FnAbi.(sig: sig, params: params, passes: passes, sret: sret, returns: returns.len > 0, result: result, fn_ty: fn_ty))
+    let first_param: u32 = u32.(g.abi_params.len)
+    try append(inout g.abi_params, params)
+    let first_pass: u32 = u32.(g.abi_passes.len)
+    try append(inout g.abi_passes, passes)
+    return ok.(value: FnAbi.(
+        sig: sig,
+        first_param: first_param,
+        param_count: u32.(params.len),
+        first_pass: first_pass,
+        pass_count: u32.(passes.len),
+        sret: sret,
+        returns: returns.len > 0,
+        result: result,
+        fn_ty: fn_ty,
+    ))
 }
 
-fn decl_abi(g: inout Gen, decl: maps.DeclRef) -> FnAbi ! OutOfMemory {
+// Keel parameter i of abi.
+fn abi_value(g: Gen, abi: FnAbi, i: usize) -> keel.AbiValue {
+    return g.abi_params[usize.(abi.first_param) + i]
+}
+
+// How tern parameter i of abi crosses.
+fn abi_pass(g: Gen, abi: FnAbi, i: usize) -> Pass {
+    return g.abi_passes[usize.(abi.first_pass) + i]
+}
+
+fn decl_abi(input: Input, g: inout Gen, decl: maps.DeclRef) -> FnAbi ! OutOfMemory {
     let number: usize = usize.(check.decl_number(g.types, decl))
     match g.decl_abis[number] {
         some(value as known: FnAbi) {
@@ -418,7 +461,7 @@ fn decl_abi(g: inout Gen, decl: maps.DeclRef) -> FnAbi ! OutOfMemory {
     }
     var variadic: bool = false
     var c_records: bool = false
-    match decl_of(g, decl).kind {
+    match decl_of(input, decl).kind {
         extern_fn(name: _, params: _, variadic as v: bool, result: _) {
             variadic = v
             c_records = true
@@ -426,7 +469,7 @@ fn decl_abi(g: inout Gen, decl: maps.DeclRef) -> FnAbi ! OutOfMemory {
         _ {
         }
     }
-    let made: FnAbi = try fn_abi(inout g, fn_ty_of(g, decl), variadic, c_records)
+    let made: FnAbi = try fn_abi(input, inout g, fn_ty_of(input, g, decl), variadic, c_records)
     g.decl_abis[number] = some.(value: made)
     return ok.(value: made)
 }
@@ -643,7 +686,7 @@ fn item_size(item: keel.Item) -> u64 {
 
 // A constant `PanicInfo` for a panic at line and column of path in
 // function, with an empty message the helper fills in.
-fn panic_site(g: inout Gen, path: []u8, function: []u8, line: u32, column: u32) -> keel.Symbol ! OutOfMemory {
+fn panic_site(input: Input, g: inout Gen, path: []u8, function: []u8, line: u32, column: u32) -> keel.Symbol ! OutOfMemory {
     let info_ty: check.TyId = try check.named_ty(inout g.types, check.NamedId.builtin.(which: check.BuiltinNamed.panic_info))
     var fields: [..]SiteField = make(g.alloc)
     let texts: [2][]u8 = [path, function]
@@ -651,31 +694,31 @@ fn panic_site(g: inout Gen, path: []u8, function: []u8, line: u32, column: u32) 
     for let i: usize in 0..2 {
         let text: []u8 = texts[i]
         let s: keel.Symbol = try string_symbol(inout g, text)
-        let f: FieldInfo = try field_of(inout g, info_ty, text_fields[i])
+        let f: FieldInfo = try field_of(input, inout g, info_ty, text_fields[i])
         var items: [..]keel.Item = make(g.alloc)
         try push(inout items, keel.Item.pointer.(symbol: s))
         try push(inout items, keel.Item.integer.(ty: keel.Type.int64, value: i64.(text.len)))
-        try push(inout fields, SiteField.(offset: f.offset, items: items))
+        try push(inout fields, SiteField.(offset: f.offset, items: take(inout items)))
     }
     let numbers: [2]u32 = [line, column]
     let number_fields: [2][]u8 = ["line", "column"]
     for let i: usize in 0..2 {
-        let f: FieldInfo = try field_of(inout g, info_ty, number_fields[i])
+        let f: FieldInfo = try field_of(input, inout g, info_ty, number_fields[i])
         var items: [..]keel.Item = make(g.alloc)
         try push(inout items, keel.Item.integer.(ty: keel.Type.int32, value: i64.(numbers[i])))
-        try push(inout fields, SiteField.(offset: f.offset, items: items))
+        try push(inout fields, SiteField.(offset: f.offset, items: take(inout items)))
     }
     // By offset; insertion keeps equal offsets in order, as a stable sort.
     for let i: usize in 1..fields.len {
         var j: usize = i
         for j > 0 && fields[j - 1].offset > fields[j].offset {
-            let held: SiteField = fields[j]
-            fields[j] = fields[j - 1]
-            fields[j - 1] = held
+            var held: SiteField = take(inout fields[j])
+            fields[j] = take(inout fields[j - 1])
+            fields[j - 1] = take(inout held)
             j -= 1
         }
     }
-    let layout: TyLayout = try ty_layout(inout g, info_ty)
+    let layout: TyLayout = try ty_layout(input, inout g, info_ty)
     var items: [..]keel.Item = make(g.alloc)
     var at: u64 = 0
     for let field: SiteField in fields {
@@ -697,10 +740,10 @@ fn panic_site(g: inout Gen, path: []u8, function: []u8, line: u32, column: u32) 
 }
 
 // `std.fmt.Part`, if the program uses std.fmt.
-fn fmt_part(g: inout Gen) -> ?check.TyId ! OutOfMemory {
-    match program.find_package(g.program, "std.fmt") {
+fn fmt_part(input: Input, g: inout Gen) -> ?check.TyId ! OutOfMemory {
+    match program.find_package(input.program, "std.fmt") {
         some(value as index: u32) {
-            match maps.get_name(g.names.scopes[usize.(index)], "Part") {
+            match maps.get_name(input.names.scopes[usize.(index)], "Part") {
                 some(value as decl: maps.DeclRef) {
                     let id: check.NamedId = check.NamedId.decl.(decl: decl)
                     match check.named_info(g.types, id) {
@@ -722,16 +765,16 @@ fn fmt_part(g: inout Gen) -> ?check.TyId ! OutOfMemory {
 }
 
 // The `@panic_handler` function: the program's own, or std.rt's.
-fn find_panic_handler(g: Gen) -> ?maps.DeclRef {
+fn find_panic_handler(input: Input) -> ?maps.DeclRef {
     var found: ?maps.DeclRef = none
-    for let i: usize in 0..g.program.files.len {
-        let f: program.File = g.program.files[i]
+    for let i: usize in 0..input.program.files.len {
+        let f: program.File = input.program.files[i]
         for let index: usize in 0..f.ast.decls.len {
             let decl: maps.DeclRef = maps.DeclRef.(file: u32.(i), index: u32.(index))
             match f.ast.decls[index].kind {
                 function(is_unsafe: _, name: _, params: _, result: _, body: _) {
-                    if has_attribute(g, decl, "panic_handler") {
-                        let path: []u8 = g.program.packages[usize.(f.package)].path
+                    if has_attribute(input, decl, "panic_handler") {
+                        let path: []u8 = input.program.packages[usize.(f.package)].path
                         let in_std: bool = path.len >= 3 && same_text(path[..3], "std")
                         let none_yet: bool = match found {
                             none { true }

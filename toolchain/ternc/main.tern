@@ -82,17 +82,17 @@ fn check_command(root: []u8, std_dir: []u8) -> u8 {
 }
 
 fn check_program(alloc: Allocator, root: []u8, std_dir: []u8) -> u8 ! OutOfMemory {
-    let p: program.Program = try program.load(alloc, root, std_dir)
+    var p: program.Program = try program.load(alloc, root, std_dir)
     if program.has_errors(p) {
         render_program(p)
         return ok.(value: 1)
     }
-    let names: resolve.Resolution = try resolve.resolve(alloc, p)
+    var names: resolve.Resolution = try resolve.resolve(alloc, inout p)
     if names.diagnostics.len > 0 {
         render_diagnostics(p, names.diagnostics)
         return ok.(value: 1)
     }
-    let checked: check.Checked = try check.check(alloc, p, names)
+    var checked: check.Checked = try check.check(alloc, inout p, inout names)
     if checked.diagnostics.len > 0 {
         render_diagnostics(p, checked.diagnostics)
         return ok.(value: 1)
@@ -229,17 +229,17 @@ fn base_name(path: []u8) -> []u8 {
 }
 
 fn build_program(alloc: Allocator, o: BuildOptions) -> u8 ! OutOfMemory {
-    let p: program.Program = try program.load_hosted(alloc, o.root, o.std_dir)
+    var p: program.Program = try program.load_hosted(alloc, o.root, o.std_dir)
     if program.has_errors(p) {
         render_program(p)
         return ok.(value: 1)
     }
-    let names: resolve.Resolution = try resolve.resolve(alloc, p)
+    var names: resolve.Resolution = try resolve.resolve(alloc, inout p)
     if names.diagnostics.len > 0 {
         render_diagnostics(p, names.diagnostics)
         return ok.(value: 1)
     }
-    let checked: check.Checked = try check.check(alloc, p, names)
+    var checked: check.Checked = try check.check(alloc, inout p, inout names)
     if checked.diagnostics.len > 0 {
         render_diagnostics(p, checked.diagnostics)
         return ok.(value: 1)
@@ -278,7 +278,7 @@ fn build_program(alloc: Allocator, o: BuildOptions) -> u8 ! OutOfMemory {
         none {
         }
     }
-    match try gen.generate(alloc, p, names, checked, symbol_prefix) {
+    match try gen.generate(alloc, inout p, inout names, inout checked, symbol_prefix) {
         unsupported(message: []u8) {
             io.eprint("{message}\n")
             return ok.(value: 1)
@@ -394,8 +394,8 @@ fn link(alloc: Allocator, object: []u8, o: BuildOptions, out: []u8) -> u8 ! OutO
         let path: []u8 = try program.format_text(alloc, "{sdk}/usr/lib/lib{name}.tbd")
         var real: ?[..]u8 = none
         match fs.real_path(alloc, path) {
-            ok(value as found: ?[..]u8) {
-                real = found
+            ok(value as var found: ?[..]u8) {
+                real = take(inout found)
             }
             err(error: _) {
             }

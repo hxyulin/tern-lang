@@ -496,6 +496,85 @@ fn handler(info: PanicInfo, callback: fn(Format)) {
 }
 
 #[test]
+fn buffers_have_one_owner() {
+    let source = "type Bag (items: [..]u32, n: u32)
+
+type Pair (a: [..]u8, b: [..]u8)
+
+type Shape enum {
+    list(items: [..]u32)
+    empty
+}
+
+fn new_bag(alloc: Allocator) -> Bag {
+    var items: [..]u32 = make(alloc)
+    return Bag.(items: items, n: 0)
+}
+
+fn twice(alloc: Allocator) -> Pair {
+    var x: [..]u8 = make(alloc)
+    return Pair.(a: x, b: x)
+}
+
+fn deferred(alloc: Allocator) -> [..]u8 {
+    var x: [..]u8 = make(alloc)
+    defer free(inout x)
+    return x
+}
+
+fn from_param(b: Bag) -> [..]u32 {
+    return b.items
+}
+
+fn f(alloc: Allocator, b: inout Bag, s: Shape, opt: inout ?[..]u8) -> ! OutOfMemory {
+    let seen: Bag = b
+    var second: Bag = b
+    var moved: Bag = take(inout b)
+    var lines: [..][..]u8 = make(alloc)
+    var line: [..]u8 = make(alloc)
+    try push(inout lines, line)
+    try push(inout lines, take(inout line))
+    try append(inout lines, lines)
+    let _: [..][..]u8 = try copy(alloc, lines)
+    for var l: [..]u8 in lines {
+        let _: usize = l.len
+    }
+    match s {
+        list(items as var mine: [..]u32) {
+            let _: usize = mine.len
+        }
+        empty {
+        }
+    }
+    var shape: Shape = Shape.empty
+    let _: Shape = take(inout shape)
+    var n: u32 = 0
+    let _: u32 = take(inout n)
+    let _: ?[..]u8 = take(inout opt)
+    let _: u32 = seen.n + second.n + moved.n
+    return ok
+}
+";
+    assert_eq!(
+        one("one_owner", source),
+        [
+            "this `return` already takes `x` or part of it; a buffer can go to only one place",
+            "a `defer` uses `x` after this `return`; hand the value over with `take(inout x)`",
+            "this would copy `b.items`, and its buffer would have two owners; hand it over with `take(inout b.items)` or make a second one with `try copy(alloc, b.items)`",
+            "this would copy `b`, and its buffer would have two owners; hand it over with `take(inout b)` or make a second one with `try copy(alloc, b)`",
+            "this would copy `line`, and its buffer would have two owners; hand it over with `take(inout line)` or make a second one with `try copy(alloc, line)`",
+            "`append` copies each element, and a `[..]u8` cannot be copied: its buffer would have two owners",
+            "`lines` overlaps `lines`, which is passed `inout`; an `inout` argument must not overlap another argument",
+            "`copy` copies each element, and a `[..]u8` cannot be copied: its buffer would have two owners",
+            "`for var` would copy each element, and its buffer would have two owners; use `for let`",
+            "`mine` would be a second owner of a buffer in a place that keeps it; bind it without `var`, or take the value first, as in `match take(inout x)`",
+            "`take` cannot leave a `Shape` empty: only a `[..]T`, an optional, and records and tuples of them have an empty value",
+            "`take` takes a value that owns a buffer, not `u32`",
+        ]
+    );
+}
+
+#[test]
 fn globals_are_constant() {
     let source = "type Color enum {
     red
@@ -604,7 +683,7 @@ fn f(alloc: Allocator, given: [..]u8, edit: inout [..]u8) -> [..]u8 {
             "cannot pass `inout` `b`: it is not a `var` or an `inout` parameter",
             "cannot pass `inout` `given`: it is not a `var` or an `inout` parameter",
             "cannot pass `inout` `n`: it is not a `var` or an `inout` parameter",
-            "`take` takes a `[..]T`, not `u32`",
+            "`take` takes a value that owns a buffer, not `u32`",
         ]
     );
 }
@@ -613,8 +692,8 @@ fn f(alloc: Allocator, given: [..]u8, edit: inout [..]u8) -> [..]u8 {
 fn var_in_patterns() {
     let source = "type Pair (a: u32, b: u32)
 
-fn f(maybe: ?[..]u8, pair: Pair) {
-    match maybe {
+fn f(maybe: inout ?[..]u8, pair: Pair) {
+    match take(inout maybe) {
         some(value as var bytes: [..]u8) {
             free(inout bytes)
         }

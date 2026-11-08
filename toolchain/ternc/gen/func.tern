@@ -33,10 +33,7 @@ type Fx (
     m: keel.Module,
     f: keel.Function,
     file: u32,
-    ast: syntax.Ast,
     src: []u8,
-    file_names: resolve.FileNames,
-    file_types: check.FileTypes,
     fn_name: []u8,
     block: keel.Block,
     // Whether code emitted now can run.
@@ -58,17 +55,14 @@ type Fx (
 )
 
 // The function's state, at its entry block.
-fn new_fx(g: Gen, file: u32, f: keel.Function, fn_name: []u8, result: ?check.TyId) -> Fx ! OutOfMemory {
-    let pf: program.File = g.program.files[usize.(file)]
+fn new_fx(input: Input, g: Gen, file: u32, f: keel.Function, fn_name: []u8, result: ?check.TyId) -> Fx ! OutOfMemory {
+    let pf: program.File = input.program.files[usize.(file)]
     let entry: keel.Block = keel.create_block(g.m, f)
     var fx: Fx = Fx.(
         m: g.m,
         f: f,
         file: file,
-        ast: pf.ast,
         src: pf.text,
-        file_names: g.names.files[usize.(file)],
-        file_types: g.files[usize.(file)],
         fn_name: fn_name,
         block: entry,
         reachable: true,
@@ -89,10 +83,10 @@ fn new_fx(g: Gen, file: u32, f: keel.Function, fn_name: []u8, result: ?check.TyI
     return ok.(value: fx)
 }
 
-fn gen_function(g: inout Gen, decl: maps.DeclRef) -> ! OutOfMemory {
-    match decl_of(g, decl).kind {
+fn gen_function(input: Input, g: inout Gen, decl: maps.DeclRef) -> ! OutOfMemory {
+    match decl_of(input, decl).kind {
         function(is_unsafe: _, name: syntax.Span, params: syntax.List, result: _, body: syntax.Block) {
-            return function_body(inout g, decl, name, params, body)
+            return function_body(input, inout g, decl, name, params, body)
         }
         _ {
             return ok
@@ -100,30 +94,30 @@ fn gen_function(g: inout Gen, decl: maps.DeclRef) -> ! OutOfMemory {
     }
 }
 
-fn function_body(g: inout Gen, decl: maps.DeclRef, name: syntax.Span, params: syntax.List, body: syntax.Block) -> ! OutOfMemory {
-    let abi: FnAbi = try decl_abi(inout g, decl)
-    let sym_name: []u8 = try symbol(inout g, decl)
+fn function_body(input: Input, g: inout Gen, decl: maps.DeclRef, name: syntax.Span, params: syntax.List, body: syntax.Block) -> ! OutOfMemory {
+    let abi: FnAbi = try decl_abi(input, inout g, decl)
+    let sym_name: []u8 = try symbol(input, inout g, decl)
     let f: keel.Function = try define(inout g, sym_name, abi.sig)
     // The module is the whole program, so everything not exported is
     // local to it, which lets keel inline it.
-    if !has_attribute(g, decl, "export") {
+    if !has_attribute(input, decl, "export") {
         keel.set_local(g.m, f)
     }
-    var fx: Fx = try new_fx(g, decl.file, f, file_text(g, decl.file, name), abi.result)
+    var fx: Fx = try new_fx(input, g, decl.file, f, file_text(input, decl.file, name), abi.result)
     let entry: keel.Block = fx.block
     var values: [..]keel.Value = make(g.alloc)
-    for let p: keel.AbiValue in abi.params {
-        try push(inout values, keel.block_param(fx.m, entry, p.ty))
+    for let i: usize in 0..usize.(abi.param_count) {
+        try push(inout values, keel.block_param(fx.m, entry, abi_value(g, abi, i).ty))
     }
     if abi.sret {
         fx.sret = some.(value: values[0])
     }
     var next: usize = if abi.sret { 1 } else { 0 }
-    let ast: syntax.Ast = fx.ast
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     let param_ids: []u32 = syntax.items(ast.extra, params)
     for let i: usize in 0..param_ids.len {
         let param: syntax.Param = ast.params[usize.(param_ids[i])]
-        let pass: Pass = abi.passes[i]
+        let pass: Pass = abi_pass(g, abi, i)
         var value: ?keel.Value = none
         match pass {
             skip {
@@ -143,7 +137,7 @@ fn function_body(g: inout Gen, decl: maps.DeclRef, name: syntax.Span, params: sy
             }
         }
         var id: u32 = 0
-        match binding_of(fx, name_span) {
+        match binding_of(input, fx, name_span) {
             some(value as local: u32) {
                 id = local
             }
@@ -155,8 +149,8 @@ fn function_body(g: inout Gen, decl: maps.DeclRef, name: syntax.Span, params: sy
             some(value as v: keel.Value) {
                 match pass {
                     scalar_arg {
-                        let ty: check.TyId = local_ty(fx, id)
-                        let s: keel.Slot = try new_slot(inout g, fx, ty)
+                        let ty: check.TyId = local_ty(input, fx, id)
+                        let s: keel.Slot = try new_slot(input, inout g, fx, ty)
                         let addr: keel.Value = keel.stack_addr(fx.m, fx.block, s)
                         keel.store(fx.m, fx.block, v, addr)
                         try set_local(inout fx, id, Addr.slot.(slot: s))
@@ -172,7 +166,7 @@ fn function_body(g: inout Gen, decl: maps.DeclRef, name: syntax.Span, params: sy
             }
         }
     }
-    try block_stmts(inout g, inout fx, body)
+    try block_stmts(input, inout g, inout fx, body)
     if fx.reachable {
         match abi.result {
             none {
@@ -284,8 +278,8 @@ fn convert_to(fx: Fx, op: keel.ConvertOp, ty: keel.Type, v: keel.Value) -> keel.
     return keel.convert(fx.m, fx.block, op, ty, v)
 }
 
-fn new_slot(g: inout Gen, fx: Fx, ty: check.TyId) -> keel.Slot ! OutOfMemory {
-    let l: TyLayout = try ty_layout(inout g, ty)
+fn new_slot(input: Input, g: inout Gen, fx: Fx, ty: check.TyId) -> keel.Slot ! OutOfMemory {
+    let l: TyLayout = try ty_layout(input, inout g, ty)
     var size: u64 = l.size
     if size < 1 {
         size = 1
@@ -300,8 +294,8 @@ fn new_slot(g: inout Gen, fx: Fx, ty: check.TyId) -> keel.Slot ! OutOfMemory {
     return ok.(value: keel.stack_slot(fx.m, fx.f, u32.(size), u32.(align)))
 }
 
-fn temp(g: inout Gen, fx: Fx, ty: check.TyId) -> keel.Value ! OutOfMemory {
-    let s: keel.Slot = try new_slot(inout g, fx, ty)
+fn temp(input: Input, g: inout Gen, fx: Fx, ty: check.TyId) -> keel.Value ! OutOfMemory {
+    let s: keel.Slot = try new_slot(input, inout g, fx, ty)
     return ok.(value: keel.stack_addr(fx.m, fx.block, s))
 }
 
@@ -340,32 +334,32 @@ fn span_text(fx: Fx, s: syntax.Span) -> []u8 {
     return fx.src[usize.(s.start)..usize.(s.end)]
 }
 
-fn binding_of(fx: Fx, s: syntax.Span) -> ?u32 {
-    return maps.get_int(fx.file_names.bindings, s.start)
+fn binding_of(input: Input, fx: Fx, s: syntax.Span) -> ?u32 {
+    return maps.get_int(input.names.files[usize.(fx.file)].bindings, s.start)
 }
 
-fn res_of(fx: Fx, e: syntax.ExprId) -> ?resolve.Res {
-    return fx.file_names.exprs[usize.(e)]
+fn res_of(input: Input, fx: Fx, e: syntax.ExprId) -> ?resolve.Res {
+    return input.names.files[usize.(fx.file)].exprs[usize.(e)]
 }
 
-fn item_of(fx: Fx, e: syntax.ExprId) -> check.Item {
-    return match fx.file_types.exprs[usize.(e)] {
+fn item_of(input: Input, fx: Fx, e: syntax.ExprId) -> check.Item {
+    return match input.files[usize.(fx.file)].exprs[usize.(e)] {
         some(value as i: check.Item) { i }
         none { check.Item.nothing }
     }
 }
 
 // The type of a value expression.
-fn expr_ty(g: inout Gen, fx: Fx, e: syntax.ExprId) -> check.TyId ! OutOfMemory {
-    return match item_of(fx, e) {
+fn expr_ty(input: Input, g: inout Gen, fx: Fx, e: syntax.ExprId) -> check.TyId ! OutOfMemory {
+    return match item_of(input, fx, e) {
         value(ty: check.TyId) { ok.(value: ty) }
         variant(ty: check.TyId, index: _) { ok.(value: ty) }
         _ { check.error_ty(inout g.types) }
     }
 }
 
-fn written_ty(fx: Fx, id: syntax.TypeId) -> check.TyId {
-    match fx.file_types.types[usize.(id)] {
+fn written_ty(input: Input, fx: Fx, id: syntax.TypeId) -> check.TyId {
+    match input.files[usize.(fx.file)].types[usize.(id)] {
         some(value as ty: check.TyId) {
             return ty
         }
@@ -375,8 +369,8 @@ fn written_ty(fx: Fx, id: syntax.TypeId) -> check.TyId {
     }
 }
 
-fn local_ty(fx: Fx, id: u32) -> check.TyId {
-    match maps.get_int(fx.file_types.locals, id) {
+fn local_ty(input: Input, fx: Fx, id: u32) -> check.TyId {
+    match maps.get_int(input.files[usize.(fx.file)].locals, id) {
         some(value as ty: u32) {
             return check.TyId.(ty)
         }
@@ -397,8 +391,9 @@ fn is_signed(g: Gen, ty: check.TyId) -> bool {
     }
 }
 
-fn expr_at(fx: Fx, e: syntax.ExprId) -> syntax.Expr {
-    return fx.ast.exprs[usize.(e)]
+fn expr_at(input: Input, fx: Fx, e: syntax.ExprId) -> syntax.Expr {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    return ast.exprs[usize.(e)]
 }
 
 // Storage.
@@ -424,9 +419,9 @@ fn local_addr(fx: Fx, id: u32) -> keel.Value {
 }
 
 // A new local with its own slot.
-fn bind(g: inout Gen, fx: inout Fx, name: syntax.Span, ty: check.TyId, value: V) -> ! OutOfMemory {
+fn bind(input: Input, g: inout Gen, fx: inout Fx, name: syntax.Span, ty: check.TyId, value: V) -> ! OutOfMemory {
     var id: u32 = 0
-    match binding_of(fx, name) {
+    match binding_of(input, fx, name) {
         some(value as local: u32) {
             id = local
         }
@@ -434,27 +429,27 @@ fn bind(g: inout Gen, fx: inout Fx, name: syntax.Span, ty: check.TyId, value: V)
             return ok
         }
     }
-    let s: keel.Slot = try new_slot(inout g, fx, ty)
+    let s: keel.Slot = try new_slot(input, inout g, fx, ty)
     let addr: keel.Value = keel.stack_addr(fx.m, fx.block, s)
-    try store_v(inout g, fx, value, ty, addr, false)
+    try store_v(input, inout g, fx, value, ty, addr, false)
     return set_local(inout fx, id, Addr.slot.(slot: s))
 }
 
-fn load_v(g: inout Gen, fx: Fx, addr: keel.Value, ty: check.TyId) -> V ! OutOfMemory {
-    return match try ty_repr(inout g, ty) {
+fn load_v(input: Input, g: inout Gen, fx: Fx, addr: keel.Value, ty: check.TyId) -> V ! OutOfMemory {
+    return match try ty_repr(input, inout g, ty) {
         scalar(ty as t: keel.Type) { ok.(value: V.scalar.(value: load_scalar(fx, t, addr))) }
         memory { ok.(value: V.memory.(addr: addr)) }
         unit { ok.(value: V.unit) }
     }
 }
 
-fn store_v(g: inout Gen, fx: Fx, value: V, ty: check.TyId, addr: keel.Value, overlap: bool) -> ! OutOfMemory {
+fn store_v(input: Input, g: inout Gen, fx: Fx, value: V, ty: check.TyId, addr: keel.Value, overlap: bool) -> ! OutOfMemory {
     match value {
         scalar(value as v: keel.Value) {
             store_scalar(fx, v, addr)
         }
         memory(addr as src: keel.Value) {
-            let l: TyLayout = try ty_layout(inout g, ty)
+            let l: TyLayout = try ty_layout(input, inout g, ty)
             copy_bytes(fx, addr, src, l.size, overlap)
         }
         unit {
@@ -472,8 +467,8 @@ fn scalar_v(fx: Fx, v: V) -> keel.Value {
 }
 
 // A value of ty for code that cannot run.
-fn dummy(g: inout Gen, fx: Fx, ty: check.TyId) -> V ! OutOfMemory {
-    match try ty_repr(inout g, ty) {
+fn dummy(input: Input, g: inout Gen, fx: Fx, ty: check.TyId) -> V ! OutOfMemory {
+    match try ty_repr(input, inout g, ty) {
         scalar(ty as t: keel.Type) {
             return match t {
                 ptr { ok.(value: V.scalar.(value: null_ptr(fx))) }
@@ -482,7 +477,7 @@ fn dummy(g: inout Gen, fx: Fx, ty: check.TyId) -> V ! OutOfMemory {
             }
         }
         memory {
-            return ok.(value: V.memory.(addr: try temp(inout g, fx, ty)))
+            return ok.(value: V.memory.(addr: try temp(input, inout g, fx, ty)))
         }
         unit {
             return ok.(value: V.unit)
@@ -491,14 +486,14 @@ fn dummy(g: inout Gen, fx: Fx, ty: check.TyId) -> V ! OutOfMemory {
 }
 
 // The address of a value held in memory, spilling a scalar.
-fn spill(g: inout Gen, fx: Fx, v: V, ty: check.TyId) -> keel.Value ! OutOfMemory {
+fn spill(input: Input, g: inout Gen, fx: Fx, v: V, ty: check.TyId) -> keel.Value ! OutOfMemory {
     match v {
         memory(addr as a: keel.Value) {
             return ok.(value: a)
         }
         _ {
-            let addr: keel.Value = try temp(inout g, fx, ty)
-            try store_v(inout g, fx, v, ty, addr, false)
+            let addr: keel.Value = try temp(input, inout g, fx, ty)
+            try store_v(input, inout g, fx, v, ty, addr, false)
             return ok.(value: addr)
         }
     }
@@ -506,19 +501,19 @@ fn spill(g: inout Gen, fx: Fx, v: V, ty: check.TyId) -> keel.Value ! OutOfMemory
 
 // Statements.
 
-fn block_stmts(g: inout Gen, fx: inout Fx, b: syntax.Block) -> ! OutOfMemory {
+fn block_stmts(input: Input, g: inout Gen, fx: inout Fx, b: syntax.Block) -> ! OutOfMemory {
     try push(inout fx.defers, make(g.alloc))
-    let ast: syntax.Ast = fx.ast
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     for let s: u32 in syntax.items(ast.extra, b.stmts) {
         if !fx.reachable {
             break
         }
-        try stmt(inout g, inout fx, syntax.StmtId.(s))
+        try stmt(input, inout g, inout fx, syntax.StmtId.(s))
     }
     var scope: [..]syntax.ExprId = make(g.alloc)
     match pop(inout fx.defers) {
-        some(value as top: [..]syntax.ExprId) {
-            scope = top
+        some(value as var top: [..]syntax.ExprId) {
+            scope = take(inout top)
         }
         none {
         }
@@ -527,14 +522,14 @@ fn block_stmts(g: inout Gen, fx: inout Fx, b: syntax.Block) -> ! OutOfMemory {
         var i: usize = scope.len
         for i > 0 {
             i -= 1
-            let _: V = try expr(inout g, inout fx, scope[i])
+            let _: V = try expr(input, inout g, inout fx, scope[i])
         }
     }
     return ok
 }
 
 // Runs the `defer`s of scopes from `from` outward, for a jump out.
-fn run_defers(g: inout Gen, fx: inout Fx, from: usize) -> ! OutOfMemory {
+fn run_defers(input: Input, g: inout Gen, fx: inout Fx, from: usize) -> ! OutOfMemory {
     var pending: [..]syntax.ExprId = make(g.alloc)
     var s: usize = fx.defers.len
     for s > from {
@@ -547,60 +542,60 @@ fn run_defers(g: inout Gen, fx: inout Fx, from: usize) -> ! OutOfMemory {
         }
     }
     for let deferred: syntax.ExprId in pending {
-        let _: V = try expr(inout g, inout fx, deferred)
+        let _: V = try expr(input, inout g, inout fx, deferred)
     }
     return ok
 }
 
-fn stmt(g: inout Gen, fx: inout Fx, id: syntax.StmtId) -> ! OutOfMemory {
-    let ast: syntax.Ast = fx.ast
+fn stmt(input: Input, g: inout Gen, fx: inout Fx, id: syntax.StmtId) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     match ast.stmts[usize.(id)].kind {
         local(local: syntax.Local) {
             match local.binding {
                 single(name: ?syntax.Span, ty as written: syntax.TypeId) {
-                    let ty: check.TyId = written_ty(fx, written)
-                    let value: V = try value_as(inout g, inout fx, local.value, ty)
+                    let ty: check.TyId = written_ty(input, fx, written)
+                    let value: V = try value_as(input, inout g, inout fx, local.value, ty)
                     match name {
                         some(value as n: syntax.Span) {
-                            try bind(inout g, inout fx, n, ty, value)
+                            try bind(input, inout g, inout fx, n, ty, value)
                         }
                         none {
                         }
                     }
                 }
                 destructure(fields: syntax.List) {
-                    let ty: check.TyId = try expr_ty(inout g, fx, local.value)
-                    let value: V = try expr(inout g, inout fx, local.value)
-                    let addr: keel.Value = try spill(inout g, fx, value, ty)
-                    try destructure(inout g, inout fx, fields, ty, addr)
+                    let ty: check.TyId = try expr_ty(input, inout g, fx, local.value)
+                    let value: V = try expr(input, inout g, inout fx, local.value)
+                    let addr: keel.Value = try spill(input, inout g, fx, value, ty)
+                    try destructure(input, inout g, inout fx, fields, ty, addr)
                 }
             }
         }
         return_stmt(value: ?syntax.ExprId) {
-            try return_value(inout g, inout fx, value)
+            try return_value(input, inout g, inout fx, value)
         }
         if_stmt(cond: syntax.ExprId, then: syntax.Block, otherwise: ?syntax.Else) {
             let after: keel.Block = try new_block(inout fx)
-            try if_chain(inout g, inout fx, cond, then, otherwise, after)
+            try if_chain(input, inout g, inout fx, cond, then, otherwise, after)
             try continue_at(inout fx, after)
         }
         match_stmt(value: syntax.ExprId, arms: syntax.List) {
             let after: keel.Block = try new_block(inout fx)
-            let sty: check.TyId = try expr_ty(inout g, fx, value)
-            let scrutinee: V = try expr(inout g, inout fx, value)
+            let sty: check.TyId = try expr_ty(input, inout g, fx, value)
+            let scrutinee: V = try expr(input, inout g, inout fx, value)
             for let a: u32 in syntax.items(ast.extra, arms) {
                 let arm: syntax.Arm = ast.arms[usize.(a)]
-                let body: ?keel.Block = try arm_test(inout g, inout fx, scrutinee, sty, arm.patterns)
+                let body: ?keel.Block = try arm_test(input, inout g, inout fx, scrutinee, sty, arm.patterns)
                 let next: keel.Block = take_pending(inout fx)
                 match body {
                     some(value as start: keel.Block) {
                         switch_to(inout fx, start, true)
                         match arm.body {
                             block(body as b: syntax.Block) {
-                                try block_stmts(inout g, inout fx, b)
+                                try block_stmts(input, inout g, inout fx, b)
                             }
                             branch(value as x: syntax.ExprId) {
-                                let _: V = try expr(inout g, inout fx, x)
+                                let _: V = try expr(input, inout g, inout fx, x)
                             }
                         }
                         try jump_join(inout fx, after)
@@ -615,12 +610,12 @@ fn stmt(g: inout Gen, fx: inout Fx, id: syntax.StmtId) -> ! OutOfMemory {
             try continue_at(inout fx, after)
         }
         for_stmt(kind: syntax.ForKind, body: syntax.Block) {
-            try for_loop(inout g, inout fx, kind, body)
+            try for_loop(input, inout g, inout fx, kind, body)
         }
         break_stmt {
             match last_loop(fx) {
                 some(value as l: Loop) {
-                    try run_defers(inout g, inout fx, l.scopes)
+                    try run_defers(input, inout g, inout fx, l.scopes)
                     try jump_join(inout fx, l.brk)
                 }
                 none {
@@ -630,7 +625,7 @@ fn stmt(g: inout Gen, fx: inout Fx, id: syntax.StmtId) -> ! OutOfMemory {
         continue_stmt {
             match last_loop(fx) {
                 some(value as l: Loop) {
-                    try run_defers(inout g, inout fx, l.scopes)
+                    try run_defers(input, inout g, inout fx, l.scopes)
                     try jump(inout fx, l.cont)
                 }
                 none {
@@ -642,16 +637,16 @@ fn stmt(g: inout Gen, fx: inout Fx, id: syntax.StmtId) -> ! OutOfMemory {
             try push(inout fx.defers[top], call)
         }
         unsafe_stmt(body: syntax.Block) {
-            try block_stmts(inout g, inout fx, body)
+            try block_stmts(input, inout g, inout fx, body)
         }
         lock_stmt(globals: _, body: syntax.Block) {
-            try block_stmts(inout g, inout fx, body)
+            try block_stmts(input, inout g, inout fx, body)
         }
         assign(left: syntax.ExprId, op: syntax.AssignOp, right: syntax.ExprId) {
-            try assign_stmt(inout g, inout fx, left, op, right)
+            try assign_stmt(input, inout g, inout fx, left, op, right)
         }
         expr(value: syntax.ExprId) {
-            let _: V = try expr(inout g, inout fx, value)
+            let _: V = try expr(input, inout g, inout fx, value)
         }
     }
     return ok
@@ -684,26 +679,27 @@ fn continue_at(fx: inout Fx, b: keel.Block) -> ! OutOfMemory {
     return ok
 }
 
-fn if_chain(g: inout Gen, fx: inout Fx, cond: syntax.ExprId, then: syntax.Block, otherwise: ?syntax.Else, after: keel.Block) -> ! OutOfMemory {
-    let c: V = try expr(inout g, inout fx, cond)
+fn if_chain(input: Input, g: inout Gen, fx: inout Fx, cond: syntax.ExprId, then: syntax.Block, otherwise: ?syntax.Else, after: keel.Block) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    let c: V = try expr(input, inout g, inout fx, cond)
     let cv: keel.Value = scalar_v(fx, c)
     let then_block: keel.Block = try new_block(inout fx)
     let else_block: keel.Block = try new_block(inout fx)
     try brif(inout fx, cv, then_block, else_block)
     switch_to(inout fx, then_block, true)
-    try block_stmts(inout g, inout fx, then)
+    try block_stmts(input, inout g, inout fx, then)
     try jump_join(inout fx, after)
     switch_to(inout fx, else_block, true)
     match otherwise {
         some(value as e: syntax.Else) {
             match e {
                 block(body: syntax.Block) {
-                    try block_stmts(inout g, inout fx, body)
+                    try block_stmts(input, inout g, inout fx, body)
                 }
                 if_stmt(stmt as inner: syntax.StmtId) {
-                    match fx.ast.stmts[usize.(inner)].kind {
+                    match ast.stmts[usize.(inner)].kind {
                         if_stmt(cond as c2: syntax.ExprId, then as t2: syntax.Block, otherwise as o2: ?syntax.Else) {
-                            try if_chain(inout g, inout fx, c2, t2, o2, after)
+                            try if_chain(input, inout g, inout fx, c2, t2, o2, after)
                         }
                         _ {
                         }
@@ -726,19 +722,19 @@ fn jump_join(fx: inout Fx, to: keel.Block) -> ! OutOfMemory {
     return ok
 }
 
-fn return_value(g: inout Gen, fx: inout Fx, value: ?syntax.ExprId) -> ! OutOfMemory {
+fn return_value(input: Input, g: inout Gen, fx: inout Fx, value: ?syntax.ExprId) -> ! OutOfMemory {
     var results: [..]keel.Value = make(g.alloc)
     match value {
         some(value as e: syntax.ExprId) {
             match fx.result {
                 some(value as ty: check.TyId) {
-                    let v: V = try value_as(inout g, inout fx, e, ty)
+                    let v: V = try value_as(input, inout g, inout fx, e, ty)
                     if !fx.reachable {
                         return ok
                     }
                     match fx.sret {
                         some(value as out: keel.Value) {
-                            try store_v(inout g, fx, v, ty, out, true)
+                            try store_v(input, inout g, fx, v, ty, out, true)
                         }
                         none {
                             match v {
@@ -758,21 +754,21 @@ fn return_value(g: inout Gen, fx: inout Fx, value: ?syntax.ExprId) -> ! OutOfMem
         none {
         }
     }
-    try run_defers(inout g, inout fx, 0)
+    try run_defers(input, inout g, inout fx, 0)
     if fx.reachable {
         try ret_here(inout fx, results)
     }
     return ok
 }
 
-fn assign_stmt(g: inout Gen, fx: inout Fx, left: syntax.ExprId, op: syntax.AssignOp, right: syntax.ExprId) -> ! OutOfMemory {
-    let ty: check.TyId = try expr_ty(inout g, fx, left)
-    let addr: keel.Value = try addr_of(inout g, inout fx, left)
+fn assign_stmt(input: Input, g: inout Gen, fx: inout Fx, left: syntax.ExprId, op: syntax.AssignOp, right: syntax.ExprId) -> ! OutOfMemory {
+    let ty: check.TyId = try expr_ty(input, inout g, fx, left)
+    let addr: keel.Value = try addr_of(input, inout g, inout fx, left)
     var bop: syntax.BinaryOp = syntax.BinaryOp.add
     match op {
         set {
-            let v: V = try value_as(inout g, inout fx, right, ty)
-            return store_v(inout g, fx, v, ty, addr, true)
+            let v: V = try value_as(input, inout g, inout fx, right, ty)
+            return store_v(input, inout g, fx, v, ty, addr, true)
         }
         add {
             bop = syntax.BinaryOp.add
@@ -805,18 +801,18 @@ fn assign_stmt(g: inout Gen, fx: inout Fx, left: syntax.ExprId, op: syntax.Assig
             bop = syntax.BinaryOp.shr
         }
     }
-    let current_v: V = try load_v(inout g, fx, addr, ty)
+    let current_v: V = try load_v(input, inout g, fx, addr, ty)
     let current: keel.Value = scalar_v(fx, current_v)
-    let operand_v: V = try value_as(inout g, inout fx, right, ty)
+    let operand_v: V = try value_as(input, inout g, inout fx, right, ty)
     let operand: keel.Value = scalar_v(fx, operand_v)
-    let span: syntax.Span = expr_at(fx, left).span
-    let result: keel.Value = try arith(inout g, inout fx, bop, current, operand, ty, span)
+    let span: syntax.Span = expr_at(input, fx, left).span
+    let result: keel.Value = try arith(input, inout g, inout fx, bop, current, operand, ty, span)
     store_scalar(fx, result, addr)
     return ok
 }
 
-fn destructure(g: inout Gen, fx: inout Fx, fields: syntax.List, ty: check.TyId, addr: keel.Value) -> ! OutOfMemory {
-    let ast: syntax.Ast = fx.ast
+fn destructure(input: Input, g: inout Gen, fx: inout Fx, fields: syntax.List, ty: check.TyId, addr: keel.Value) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     for let i: u32 in syntax.items(ast.extra, fields) {
         let d: syntax.DestructField = ast.destructs[usize.(i)]
         match d.ty {
@@ -826,21 +822,21 @@ fn destructure(g: inout Gen, fx: inout Fx, fields: syntax.List, ty: check.TyId, 
             some(value: _) {
             }
         }
-        let f: FieldInfo = try field_of(inout g, ty, span_text(fx, d.field))
+        let f: FieldInfo = try field_of(input, inout g, ty, span_text(fx, d.field))
         let at: keel.Value = offset_by(fx, addr, f.offset)
-        let v: V = try load_v(inout g, fx, at, f.ty)
+        let v: V = try load_v(input, inout g, fx, at, f.ty)
         let name: syntax.Span = match d.rename {
             some(value as r: syntax.Span) { r }
             none { d.field }
         }
-        try bind(inout g, inout fx, name, f.ty, v)
+        try bind(input, inout g, inout fx, name, f.ty, v)
     }
     return ok
 }
 
 // Loops.
 
-fn for_loop(g: inout Gen, fx: inout Fx, kind: syntax.ForKind, body: syntax.Block) -> ! OutOfMemory {
+fn for_loop(input: Input, g: inout Gen, fx: inout Fx, kind: syntax.ForKind, body: syntax.Block) -> ! OutOfMemory {
     let header: keel.Block = try new_block(inout fx)
     let body_block: keel.Block = try new_block(inout fx)
     let cont: keel.Block = try new_block(inout fx)
@@ -851,23 +847,23 @@ fn for_loop(g: inout Gen, fx: inout Fx, kind: syntax.ForKind, body: syntax.Block
             try jump(inout fx, header)
             switch_to(inout fx, header, true)
             try jump(inout fx, body_block)
-            try loop_body(inout g, inout fx, body, blocks)
+            try loop_body(input, inout g, inout fx, body, blocks)
             switch_to(inout fx, cont, true)
             try jump(inout fx, header)
         }
         while_loop(cond: syntax.ExprId) {
             try jump(inout fx, header)
             switch_to(inout fx, header, true)
-            let c: V = try expr(inout g, inout fx, cond)
+            let c: V = try expr(input, inout g, inout fx, cond)
             let cv: keel.Value = scalar_v(fx, c)
             fx.joined[usize.(exit.index)] = true
             try brif(inout fx, cv, body_block, exit)
-            try loop_body(inout g, inout fx, body, blocks)
+            try loop_body(input, inout g, inout fx, body, blocks)
             switch_to(inout fx, cont, true)
             try jump(inout fx, header)
         }
         for_in(mutable: _, binding: syntax.Binding, iterable: syntax.Iterable) {
-            try for_in(inout g, inout fx, body, binding, iterable, blocks)
+            try for_in(input, inout g, inout fx, body, binding, iterable, blocks)
         }
     }
     return continue_at(inout fx, exit)
@@ -875,10 +871,10 @@ fn for_loop(g: inout Gen, fx: inout Fx, kind: syntax.ForKind, body: syntax.Block
 
 type LoopBlocks (header: keel.Block, body: keel.Block, cont: keel.Block, exit: keel.Block)
 
-fn loop_body(g: inout Gen, fx: inout Fx, body: syntax.Block, blocks: LoopBlocks) -> ! OutOfMemory {
+fn loop_body(input: Input, g: inout Gen, fx: inout Fx, body: syntax.Block, blocks: LoopBlocks) -> ! OutOfMemory {
     switch_to(inout fx, blocks.body, true)
     try push(inout fx.loops, Loop.(brk: blocks.exit, cont: blocks.cont, scopes: fx.defers.len))
-    try block_stmts(inout g, inout fx, body)
+    try block_stmts(input, inout g, inout fx, body)
     let _: ?Loop = pop(inout fx.loops)
     if fx.reachable {
         try jump(inout fx, blocks.cont)
@@ -895,7 +891,7 @@ fn count_up(fx: inout Fx, t: keel.Type, counter: keel.Value, header: keel.Block)
     return jump(inout fx, header)
 }
 
-fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Binding, iterable: syntax.Iterable, blocks: LoopBlocks) -> ! OutOfMemory {
+fn for_in(input: Input, g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Binding, iterable: syntax.Iterable, blocks: LoopBlocks) -> ! OutOfMemory {
     match iterable {
         range(start: syntax.ExprId, end: syntax.ExprId) {
             var name: ?syntax.Span = none
@@ -909,17 +905,17 @@ fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Bindin
                     return ok
                 }
             }
-            let ty: check.TyId = written_ty(fx, written)
+            let ty: check.TyId = written_ty(input, fx, written)
             let signed: bool = is_signed(g, ty)
-            let start_v: V = try value_as(inout g, inout fx, start, ty)
+            let start_v: V = try value_as(input, inout g, inout fx, start, ty)
             let start_x: keel.Value = scalar_v(fx, start_v)
-            let end_v: V = try value_as(inout g, inout fx, end, ty)
+            let end_v: V = try value_as(input, inout g, inout fx, end, ty)
             let end_x: keel.Value = scalar_v(fx, end_v)
-            let counter: keel.Value = try temp(inout g, fx, ty)
+            let counter: keel.Value = try temp(input, inout g, fx, ty)
             store_scalar(fx, start_x, counter)
             try jump(inout fx, blocks.header)
             switch_to(inout fx, blocks.header, true)
-            let t: keel.Type = try scalar_of(inout g, ty)
+            let t: keel.Type = try scalar_of(input, inout g, ty)
             let i: keel.Value = load_scalar(fx, t, counter)
             let cc: keel.IntCC = if signed { keel.IntCC.slt } else { keel.IntCC.ult }
             let more: keel.Value = compare_ints(fx, cc, i, end_x)
@@ -929,19 +925,19 @@ fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Bindin
             switch_to(inout fx, bind_block, true)
             match name {
                 some(value as n: syntax.Span) {
-                    try bind(inout g, inout fx, n, ty, V.scalar.(value: i))
+                    try bind(input, inout g, inout fx, n, ty, V.scalar.(value: i))
                 }
                 none {
                 }
             }
             try jump(inout fx, blocks.body)
-            try loop_body(inout g, inout fx, body, blocks)
+            try loop_body(input, inout g, inout fx, body, blocks)
             switch_to(inout fx, blocks.cont, true)
-            let t2: keel.Type = try scalar_of(inout g, ty)
+            let t2: keel.Type = try scalar_of(input, inout g, ty)
             return count_up(inout fx, t2, counter, blocks.header)
         }
         value(value as e: syntax.ExprId) {
-            let ty: check.TyId = try expr_ty(inout g, fx, e)
+            let ty: check.TyId = try expr_ty(input, inout g, fx, e)
             let core: check.TyId = core_ty(g, ty)
             var elem: ?check.TyId = none
             match check.get(g.types, core) {
@@ -959,9 +955,9 @@ fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Bindin
             }
             match elem {
                 some(value as el: check.TyId) {
-                    let pl: PtrLen = try ptr_len(inout g, inout fx, e, core)
+                    let pl: PtrLen = try ptr_len(input, inout g, inout fx, e, core)
                     let usize_ty: check.TyId = try check.usize_ty(inout g.types)
-                    let counter: keel.Value = try temp(inout g, fx, usize_ty)
+                    let counter: keel.Value = try temp(input, inout g, fx, usize_ty)
                     let zero: keel.Value = iconst(fx, keel.Type.int64, 0)
                     store_scalar(fx, zero, counter)
                     try jump(inout fx, blocks.header)
@@ -972,14 +968,14 @@ fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Bindin
                     fx.joined[usize.(blocks.exit.index)] = true
                     try brif(inout fx, more, bind_block, blocks.exit)
                     switch_to(inout fx, bind_block, true)
-                    let l: TyLayout = try ty_layout(inout g, el)
+                    let l: TyLayout = try ty_layout(input, inout g, el)
                     let size: keel.Value = usize_const(fx, l.size)
                     let off: keel.Value = binop(fx, keel.BinaryOp.imul, i, size)
                     let at: keel.Value = keel.ptradd(fx.m, fx.block, pl.ptr, off)
-                    let v: V = try load_v(inout g, fx, at, el)
-                    try bind_loop(inout g, inout fx, binding, el, v)
+                    let v: V = try load_v(input, inout g, fx, at, el)
+                    try bind_loop(input, inout g, inout fx, binding, el, v)
                     try jump(inout fx, blocks.body)
-                    try loop_body(inout g, inout fx, body, blocks)
+                    try loop_body(input, inout g, inout fx, body, blocks)
                     switch_to(inout fx, blocks.cont, true)
                     return count_up(inout fx, keel.Type.int64, counter, blocks.header)
                 }
@@ -988,7 +984,7 @@ fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Bindin
             }
             // An iterator: call `next(inout it)` until `none`.
             var next: maps.DeclRef = maps.DeclRef.(file: 0, index: 0)
-            match next_fn(g, core) {
+            match next_fn(input, g, core) {
                 some(value as d: maps.DeclRef) {
                     next = d
                 }
@@ -996,12 +992,12 @@ fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Bindin
                     return ok
                 }
             }
-            let v: V = try expr(inout g, inout fx, e)
-            let it: keel.Value = try temp(inout g, fx, ty)
-            try store_v(inout g, fx, v, ty, it, false)
+            let v: V = try expr(input, inout g, inout fx, e)
+            let it: keel.Value = try temp(input, inout g, fx, ty)
+            try store_v(input, inout g, fx, v, ty, it, false)
             try jump(inout fx, blocks.header)
             switch_to(inout fx, blocks.header, true)
-            let abi: FnAbi = try decl_abi(inout g, next)
+            let abi: FnAbi = try decl_abi(input, inout g, next)
             var option_ty: check.TyId = check.TyId.(0)
             match abi.result {
                 some(value as r: check.TyId) {
@@ -1011,17 +1007,17 @@ fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Bindin
                     panic("internal error: next returns nothing")
                 }
             }
-            let next_name: []u8 = try symbol(inout g, next)
+            let next_name: []u8 = try symbol(input, inout g, next)
             var args: [..]CallArg = make(g.alloc)
             try push(inout args, CallArg.addr.(value: it))
-            let item: V = try direct_call(inout g, inout fx, next_name, abi, args)
+            let item: V = try direct_call(input, inout g, inout fx, next_name, abi, args)
             fx.joined[usize.(blocks.exit.index)] = true
-            let found: Branch = try option_some(inout g, inout fx, item, option_ty, blocks.exit)
+            let found: Branch = try option_some(input, inout g, inout fx, item, option_ty, blocks.exit)
             switch_to(inout fx, found.block, true)
             var payload_ty: check.TyId = check.TyId.(0)
-            match try shape_of(inout g, option_ty) {
+            match try shape_of(input, inout g, option_ty) {
                 some(value as shape: EnumShape) {
-                    match shape.variants[1].payload {
+                    match shape_variant(g, shape, 1).payload {
                         some(value as p: check.TyId) {
                             payload_ty = p
                         }
@@ -1032,37 +1028,37 @@ fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Bindin
                 none {
                 }
             }
-            let f: FieldInfo = try field_of(inout g, payload_ty, "value")
+            let f: FieldInfo = try field_of(input, inout g, payload_ty, "value")
             let elem_v: V = match found.value {
                 scalar(value as x: keel.Value) { V.scalar.(value: x) }
-                memory(addr as a: keel.Value) { try load_v(inout g, fx, a, f.ty) }
+                memory(addr as a: keel.Value) { try load_v(input, inout g, fx, a, f.ty) }
                 unit { V.unit }
             }
-            try bind_loop(inout g, inout fx, binding, f.ty, elem_v)
+            try bind_loop(input, inout g, inout fx, binding, f.ty, elem_v)
             try jump(inout fx, blocks.body)
-            try loop_body(inout g, inout fx, body, blocks)
+            try loop_body(input, inout g, inout fx, body, blocks)
             switch_to(inout fx, blocks.cont, true)
             return jump(inout fx, blocks.header)
         }
     }
 }
 
-fn bind_loop(g: inout Gen, fx: inout Fx, binding: syntax.Binding, elem: check.TyId, v: V) -> ! OutOfMemory {
+fn bind_loop(input: Input, g: inout Gen, fx: inout Fx, binding: syntax.Binding, elem: check.TyId, v: V) -> ! OutOfMemory {
     match binding {
         single(name: ?syntax.Span, ty as written: syntax.TypeId) {
-            let declared: check.TyId = written_ty(fx, written)
-            let cv: V = try coerce(inout g, inout fx, v, elem, declared)
+            let declared: check.TyId = written_ty(input, fx, written)
+            let cv: V = try coerce(input, inout g, inout fx, v, elem, declared)
             match name {
                 some(value as n: syntax.Span) {
-                    try bind(inout g, inout fx, n, declared, cv)
+                    try bind(input, inout g, inout fx, n, declared, cv)
                 }
                 none {
                 }
             }
         }
         destructure(fields: syntax.List) {
-            let addr: keel.Value = try spill(inout g, fx, v, elem)
-            try destructure(inout g, inout fx, fields, elem, addr)
+            let addr: keel.Value = try spill(input, inout g, fx, v, elem)
+            try destructure(input, inout g, inout fx, fields, elem, addr)
         }
     }
     return ok
@@ -1074,9 +1070,9 @@ type Branch (block: keel.Block, value: V)
 // Branches on an optional: to the returned block when it is `some`, with
 // the address or value of its payload record, and to none_block
 // otherwise.
-fn option_some(g: inout Gen, fx: inout Fx, v: V, ty: check.TyId, none_block: keel.Block) -> Branch ! OutOfMemory {
+fn option_some(input: Input, g: inout Gen, fx: inout Fx, v: V, ty: check.TyId, none_block: keel.Block) -> Branch ! OutOfMemory {
     var kind: EnumKind = EnumKind.nullable_pointer
-    match try shape_of(inout g, ty) {
+    match try shape_of(input, inout g, ty) {
         some(value as shape: EnumShape) {
             kind = shape.kind
         }
@@ -1093,7 +1089,7 @@ fn option_some(g: inout Gen, fx: inout Fx, v: V, ty: check.TyId, none_block: kee
             return ok.(value: Branch.(block: some_block, value: V.scalar.(value: p)))
         }
         tagged(tag: keel.Type, payload_offset: u64) {
-            let addr: keel.Value = try spill(inout g, fx, v, ty)
+            let addr: keel.Value = try spill(input, inout g, fx, v, ty)
             let t: keel.Value = load_scalar(fx, tag, addr)
             let one: keel.Value = iconst(fx, tag, 1)
             let is_some: keel.Value = compare_ints(fx, keel.IntCC.eq, t, one)
@@ -1109,13 +1105,13 @@ fn option_some(g: inout Gen, fx: inout Fx, v: V, ty: check.TyId, none_block: kee
     }
 }
 
-fn next_fn(g: Gen, ty: check.TyId) -> ?maps.DeclRef {
+fn next_fn(input: Input, g: Gen, ty: check.TyId) -> ?maps.DeclRef {
     match check.get(g.types, ty) {
         named(id: check.NamedId) {
             match id {
                 decl(decl: maps.DeclRef) {
-                    let package: u32 = g.program.files[usize.(decl.file)].package
-                    return maps.get_name(g.names.scopes[usize.(package)], "next")
+                    let package: u32 = input.program.files[usize.(decl.file)].package
+                    return maps.get_name(input.names.scopes[usize.(package)], "next")
                 }
                 builtin(which: _) {
                     return none
@@ -1136,7 +1132,7 @@ type PayloadBinding (fields: syntax.List, name: []u8)
 // Tests one arm's patterns. Returns the block the arm's body starts in,
 // with its payload bound, and leaves the block for the next arm in
 // pending_next.
-fn arm_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, pats: syntax.List) -> ?keel.Block ! OutOfMemory {
+fn arm_test(input: Input, g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, pats: syntax.List) -> ?keel.Block ! OutOfMemory {
     let body: keel.Block = try new_block(inout fx)
     let next: keel.Block = try new_block(inout fx)
     if !fx.reachable {
@@ -1144,7 +1140,7 @@ fn arm_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, pats: syn
         return ok.(value: none)
     }
     var bindings: ?PayloadBinding = none
-    let ast: syntax.Ast = fx.ast
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     let pat_ids: []u32 = syntax.items(ast.extra, pats)
     for let i: usize in 0..pat_ids.len {
         let last: bool = i + 1 == pat_ids.len
@@ -1158,7 +1154,7 @@ fn arm_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, pats: syn
             }
             variant(name: syntax.Span, payload: ?syntax.List) {
                 let name_text: []u8 = span_text(fx, name)
-                let cond: keel.Value = try variant_test(inout g, fx, scrutinee, sty, name_text)
+                let cond: keel.Value = try variant_test(input, inout g, fx, scrutinee, sty, name_text)
                 try brif(inout fx, cond, body, fail)
                 match payload {
                     some(value as fields: syntax.List) {
@@ -1169,11 +1165,11 @@ fn arm_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, pats: syn
                 }
             }
             literal(value as e: syntax.ExprId) {
-                let cond: keel.Value = try literal_test(inout g, inout fx, scrutinee, sty, e, false)
+                let cond: keel.Value = try literal_test(input, inout g, inout fx, scrutinee, sty, e, false)
                 try brif(inout fx, cond, body, fail)
             }
             negative(value as e: syntax.ExprId) {
-                let cond: keel.Value = try literal_test(inout g, inout fx, scrutinee, sty, e, true)
+                let cond: keel.Value = try literal_test(input, inout g, inout fx, scrutinee, sty, e, true)
                 try brif(inout fx, cond, body, fail)
             }
         }
@@ -1185,19 +1181,19 @@ fn arm_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, pats: syn
     switch_to(inout fx, body, true)
     match bindings {
         some(value as pb: PayloadBinding) {
-            let vo: VariantOf = try variant_of(inout g, sty, pb.name)
+            let vo: VariantOf = try variant_of(input, inout g, sty, pb.name)
             match vo.variant.payload {
                 some(value as payload_ty: check.TyId) {
                     match vo.kind {
                         nullable_pointer {
                             let p: keel.Value = scalar_v(fx, scrutinee)
-                            let addr: keel.Value = try spill(inout g, fx, V.scalar.(value: p), payload_ty)
-                            try destructure(inout g, inout fx, pb.fields, payload_ty, addr)
+                            let addr: keel.Value = try spill(input, inout g, fx, V.scalar.(value: p), payload_ty)
+                            try destructure(input, inout g, inout fx, pb.fields, payload_ty, addr)
                         }
                         tagged(tag: _, payload_offset: u64) {
-                            let base: keel.Value = try spill(inout g, fx, scrutinee, sty)
+                            let base: keel.Value = try spill(input, inout g, fx, scrutinee, sty)
                             let addr: keel.Value = offset_by(fx, base, payload_offset)
-                            try destructure(inout g, inout fx, pb.fields, payload_ty, addr)
+                            try destructure(input, inout g, inout fx, pb.fields, payload_ty, addr)
                         }
                         scalar_tag(tag: _) {
                         }
@@ -1215,8 +1211,8 @@ fn arm_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, pats: syn
     return ok.(value: some.(value: start))
 }
 
-fn variant_test(g: inout Gen, fx: Fx, scrutinee: V, sty: check.TyId, name: []u8) -> keel.Value ! OutOfMemory {
-    let vo: VariantOf = try variant_of(inout g, sty, name)
+fn variant_test(input: Input, g: inout Gen, fx: Fx, scrutinee: V, sty: check.TyId, name: []u8) -> keel.Value ! OutOfMemory {
+    let vo: VariantOf = try variant_of(input, inout g, sty, name)
     match vo.kind {
         scalar_tag(tag: keel.Type) {
             let v: keel.Value = scalar_v(fx, scrutinee)
@@ -1230,7 +1226,7 @@ fn variant_test(g: inout Gen, fx: Fx, scrutinee: V, sty: check.TyId, name: []u8)
             return ok.(value: compare_ints(fx, cc, p, null))
         }
         tagged(tag: keel.Type, payload_offset: _) {
-            let addr: keel.Value = try spill(inout g, fx, scrutinee, sty)
+            let addr: keel.Value = try spill(input, inout g, fx, scrutinee, sty)
             let v: keel.Value = load_scalar(fx, tag, addr)
             let t: keel.Value = iconst(fx, tag, vo.variant.tag)
             return ok.(value: compare_ints(fx, keel.IntCC.eq, v, t))
@@ -1238,20 +1234,20 @@ fn variant_test(g: inout Gen, fx: Fx, scrutinee: V, sty: check.TyId, name: []u8)
     }
 }
 
-fn literal_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, e: syntax.ExprId, negative: bool) -> keel.Value ! OutOfMemory {
-    match expr_at(fx, e).kind {
+fn literal_test(input: Input, g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, e: syntax.ExprId, negative: bool) -> keel.Value ! OutOfMemory {
+    match expr_at(input, fx, e).kind {
         str(parts: syntax.List) {
-            let bytes: [..]u8 = try string_bytes(g, fx.file, parts)
-            let view: keel.Value = try spill(inout g, fx, scrutinee, sty)
-            return bytes_equal(inout g, inout fx, view, bytes)
+            let bytes: [..]u8 = try string_bytes(input, g, fx.file, parts)
+            let view: keel.Value = try spill(input, inout g, fx, scrutinee, sty)
+            return bytes_equal(input, inout g, inout fx, view, bytes)
         }
         _ {
         }
     }
     let v: keel.Value = scalar_v(fx, scrutinee)
-    let t: keel.Type = try scalar_of(inout g, sty)
+    let t: keel.Type = try scalar_of(input, inout g, sty)
     var n: check.Wide = check.wide(0)
-    match try const_int(inout g, fx.file, e, 0) {
+    match try const_int(input, inout g, fx.file, e, 0) {
         some(value as x: check.Wide) {
             n = x
         }
@@ -1266,7 +1262,7 @@ fn literal_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, e: sy
 }
 
 // Whether the view at view holds exactly bytes.
-fn bytes_equal(g: inout Gen, fx: inout Fx, view: keel.Value, bytes: []u8) -> keel.Value ! OutOfMemory {
+fn bytes_equal(input: Input, g: inout Gen, fx: inout Fx, view: keel.Value, bytes: []u8) -> keel.Value ! OutOfMemory {
     let len_addr: keel.Value = offset_by(fx, view, 8)
     let len: keel.Value = load_scalar(fx, keel.Type.int64, len_addr)
     let want: keel.Value = usize_const(fx, u64.(bytes.len))
@@ -1274,7 +1270,7 @@ fn bytes_equal(g: inout Gen, fx: inout Fx, view: keel.Value, bytes: []u8) -> kee
     let compare_block: keel.Block = try new_block(inout fx)
     let done: keel.Block = try new_block(inout fx)
     let bool_ty: check.TyId = try check.bool_ty(inout g.types)
-    let result: keel.Value = try temp(inout g, fx, bool_ty)
+    let result: keel.Value = try temp(input, inout g, fx, bool_ty)
     let zero: keel.Value = iconst(fx, keel.Type.int8, 0)
     store_scalar(fx, zero, result)
     try brif(inout fx, same_len, compare_block, done)

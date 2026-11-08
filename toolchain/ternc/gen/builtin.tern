@@ -6,8 +6,8 @@ import keel
 import program
 import syntax
 
-fn arg_value(fx: Fx, args: syntax.List, i: usize) -> syntax.ExprId {
-    let ast: syntax.Ast = fx.ast
+fn arg_value(input: Input, fx: Fx, args: syntax.List, i: usize) -> syntax.ExprId {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     return ast.args[usize.(syntax.items(ast.extra, args)[i])].value
 }
 
@@ -18,18 +18,18 @@ fn growable_elem(g: Gen, ty: check.TyId) -> ?check.TyId {
     }
 }
 
-fn builtin_call(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: check.TyId, span: syntax.Span) -> V ! OutOfMemory {
+fn builtin_call(input: Input, g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: check.TyId, span: syntax.Span) -> V ! OutOfMemory {
     match name {
         "panic" {
             let format_ty: check.TyId = try check.named_ty(inout g.types, check.NamedId.builtin.(which: check.BuiltinNamed.format))
-            let message: V = try value_as(inout g, inout fx, arg_value(fx, args, 0), format_ty)
-            try panic_value(inout g, inout fx, message, span)
+            let message: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 0), format_ty)
+            try panic_value(input, inout g, inout fx, message, span)
             return ok.(value: V.unit)
         }
         "make" {
             let alloc_ty: check.TyId = try check.named_ty(inout g.types, check.NamedId.builtin.(which: check.BuiltinNamed.allocator))
-            let a: V = try value_as(inout g, inout fx, arg_value(fx, args, 0), alloc_ty)
-            let addr: keel.Value = try temp(inout g, fx, ty)
+            let a: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 0), alloc_ty)
+            let addr: keel.Value = try temp(input, inout g, fx, ty)
             let zero: keel.Value = iconst(fx, keel.Type.int64, 0)
             let null: keel.Value = null_ptr(fx)
             store_scalar(fx, null, addr)
@@ -39,50 +39,50 @@ fn builtin_call(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: c
                 store_scalar(fx, zero, at)
             }
             let at: keel.Value = offset_by(fx, addr, 24)
-            try store_v(inout g, fx, a, alloc_ty, at, false)
+            try store_v(input, inout g, fx, a, alloc_ty, at, false)
             return ok.(value: V.memory.(addr: addr))
         }
         "push", "append" {
-            return push_items(inout g, inout fx, name, args, ty)
+            return push_items(input, inout g, inout fx, name, args, ty)
         }
         "pop" {
-            return pop_item(inout g, inout fx, args, ty)
+            return pop_item(input, inout g, inout fx, args, ty)
         }
         "clear" {
-            let v: keel.Value = try addr_of(inout g, inout fx, arg_value(fx, args, 0))
+            let v: keel.Value = try addr_of(input, inout g, inout fx, arg_value(input, fx, args, 0))
             let zero: keel.Value = iconst(fx, keel.Type.int64, 0)
             let len_addr: keel.Value = offset_by(fx, v, 8)
             store_scalar(fx, zero, len_addr)
             return ok.(value: V.unit)
         }
         "free" {
-            return free_items(inout g, inout fx, args)
+            return free_items(input, inout g, inout fx, args)
         }
         "take" {
-            let first: syntax.ExprId = arg_value(fx, args, 0)
-            let vty: check.TyId = try expr_ty(inout g, fx, first)
-            let v: keel.Value = try addr_of(inout g, inout fx, first)
-            let out: keel.Value = try temp(inout g, fx, vty)
-            try store_v(inout g, fx, V.memory.(addr: v), vty, out, false)
-            empty_growable(fx, v)
+            let first: syntax.ExprId = arg_value(input, fx, args, 0)
+            let vty: check.TyId = try expr_ty(input, inout g, fx, first)
+            let v: keel.Value = try addr_of(input, inout g, inout fx, first)
+            let out: keel.Value = try temp(input, inout g, fx, vty)
+            try store_v(input, inout g, fx, V.memory.(addr: v), vty, out, false)
+            try empty_value(input, inout g, fx, v, vty)
             return ok.(value: V.memory.(addr: out))
         }
         "fill" {
-            return fill_array(inout g, inout fx, args, ty)
+            return fill_array(input, inout g, inout fx, args, ty)
         }
         "from_address" {
             let usize_ty: check.TyId = try check.usize_ty(inout g.types)
-            let v: V = try value_as(inout g, inout fx, arg_value(fx, args, 0), usize_ty)
+            let v: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 0), usize_ty)
             let x: keel.Value = scalar_v(fx, v)
             return ok.(value: V.scalar.(value: convert_to(fx, keel.ConvertOp.int_to_ptr, keel.Type.ptr, x)))
         }
         "cast" {
-            let first: syntax.ExprId = arg_value(fx, args, 0)
-            let from: check.TyId = try expr_ty(inout g, fx, first)
-            let v: V = try expr(inout g, inout fx, first)
+            let first: syntax.ExprId = arg_value(input, fx, args, 0)
+            let from: check.TyId = try expr_ty(input, inout g, fx, first)
+            let v: V = try expr(input, inout g, inout fx, first)
             let x: keel.Value = scalar_v(fx, v)
-            let ft: keel.Type = try scalar_of(inout g, from)
-            let tt: keel.Type = try scalar_of(inout g, ty)
+            let ft: keel.Type = try scalar_of(input, inout g, from)
+            let tt: keel.Type = try scalar_of(input, inout g, ty)
             if ft == keel.Type.ptr && tt == keel.Type.ptr {
                 return ok.(value: V.scalar.(value: x))
             }
@@ -103,9 +103,9 @@ fn builtin_call(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: c
             return ok.(value: V.scalar.(value: x))
         }
         "truncate" {
-            let first: syntax.ExprId = arg_value(fx, args, 0)
-            let from: check.TyId = try expr_ty(inout g, fx, first)
-            let v: V = try expr(inout g, inout fx, first)
+            let first: syntax.ExprId = arg_value(input, fx, args, 0)
+            let from: check.TyId = try expr_ty(input, inout g, fx, first)
+            let v: V = try expr(input, inout g, inout fx, first)
             let x: keel.Value = scalar_v(fx, v)
             match int_of(g, from) {
                 some(value as a: check.IntTy) {
@@ -135,23 +135,23 @@ fn builtin_call(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: c
             return ok.(value: V.scalar.(value: x))
         }
         "from_pointer" {
-            let pv: V = try expr(inout g, inout fx, arg_value(fx, args, 0))
+            let pv: V = try expr(input, inout g, inout fx, arg_value(input, fx, args, 0))
             let p: keel.Value = scalar_v(fx, pv)
             let usize_ty: check.TyId = try check.usize_ty(inout g.types)
-            let nv: V = try value_as(inout g, inout fx, arg_value(fx, args, 1), usize_ty)
+            let nv: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 1), usize_ty)
             let n: keel.Value = scalar_v(fx, nv)
-            return make_view(inout g, fx, ty, p, n)
+            return make_view(input, inout g, fx, ty, p, n)
         }
         "offset" {
-            let pv: V = try expr(inout g, inout fx, arg_value(fx, args, 0))
+            let pv: V = try expr(input, inout g, inout fx, arg_value(input, fx, args, 0))
             let p: keel.Value = scalar_v(fx, pv)
             let usize_ty: check.TyId = try check.usize_ty(inout g.types)
-            let nv: V = try value_as(inout g, inout fx, arg_value(fx, args, 1), usize_ty)
+            let nv: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 1), usize_ty)
             let n: keel.Value = scalar_v(fx, nv)
             var size: u64 = 1
             match check.get(g.types, core_ty(g, ty)) {
                 pointer(elem: check.TyId) {
-                    let l: TyLayout = try ty_layout(inout g, elem)
+                    let l: TyLayout = try ty_layout(input, inout g, elem)
                     size = l.size
                 }
                 _ {
@@ -163,9 +163,9 @@ fn builtin_call(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: c
         }
         "c_string" {
             var bytes: [..]u8 = make(g.alloc)
-            match expr_at(fx, arg_value(fx, args, 0)).kind {
+            match expr_at(input, fx, arg_value(input, fx, args, 0)).kind {
                 str(parts: syntax.List) {
-                    bytes = try string_bytes(g, fx.file, parts)
+                    bytes = try string_bytes(input, g, fx.file, parts)
                 }
                 _ {
                 }
@@ -174,19 +174,19 @@ fn builtin_call(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: c
             return ok.(value: V.scalar.(value: data_addr(fx, s)))
         }
         "volatile_load" {
-            let pv: V = try expr(inout g, inout fx, arg_value(fx, args, 0))
+            let pv: V = try expr(input, inout g, inout fx, arg_value(input, fx, args, 0))
             let p: keel.Value = scalar_v(fx, pv)
-            return load_v(inout g, fx, p, ty)
+            return load_v(input, inout g, fx, p, ty)
         }
         "volatile_store" {
-            let first: syntax.ExprId = arg_value(fx, args, 0)
-            let pty: check.TyId = try expr_ty(inout g, fx, first)
-            let pv: V = try expr(inout g, inout fx, first)
+            let first: syntax.ExprId = arg_value(input, fx, args, 0)
+            let pty: check.TyId = try expr_ty(input, inout g, fx, first)
+            let pv: V = try expr(input, inout g, inout fx, first)
             let p: keel.Value = scalar_v(fx, pv)
             match check.get(g.types, core_ty(g, pty)) {
                 pointer(elem: check.TyId) {
-                    let v: V = try value_as(inout g, inout fx, arg_value(fx, args, 1), elem)
-                    try store_v(inout g, fx, v, elem, p, false)
+                    let v: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 1), elem)
+                    try store_v(input, inout g, fx, v, elem, p, false)
                 }
                 _ {
                 }
@@ -194,9 +194,9 @@ fn builtin_call(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: c
             return ok.(value: V.unit)
         }
         "wrapping_add", "wrapping_sub", "wrapping_mul", "unchecked_add", "unchecked_sub", "unchecked_mul" {
-            let av: V = try value_as(inout g, inout fx, arg_value(fx, args, 0), ty)
+            let av: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 0), ty)
             let a: keel.Value = scalar_v(fx, av)
-            let bv: V = try value_as(inout g, inout fx, arg_value(fx, args, 1), ty)
+            let bv: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 1), ty)
             let b: keel.Value = scalar_v(fx, bv)
             let op: keel.BinaryOp = match name[name.len - 3..] {
                 "add" { keel.BinaryOp.iadd }
@@ -206,11 +206,11 @@ fn builtin_call(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: c
             return ok.(value: V.scalar.(value: binop(fx, op, a, b)))
         }
         "saturating_add", "saturating_sub", "saturating_mul" {
-            return saturating(inout g, inout fx, name, args, ty)
+            return saturating(input, inout g, inout fx, name, args, ty)
         }
         _ {
             try unsupported(inout g, try program.format_text(g.alloc, "code generation does not support `{name}` yet"))
-            return dummy(inout g, fx, ty)
+            return dummy(input, inout g, fx, ty)
         }
     }
 }
@@ -221,32 +221,32 @@ type PushItem enum {
     many(ptr: keel.Value, len: keel.Value)
 }
 
-fn push_items(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: check.TyId) -> V ! OutOfMemory {
-    let first: syntax.ExprId = arg_value(fx, args, 0)
-    let vty: check.TyId = try expr_ty(inout g, fx, first)
+fn push_items(input: Input, g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: check.TyId) -> V ! OutOfMemory {
+    let first: syntax.ExprId = arg_value(input, fx, args, 0)
+    let vty: check.TyId = try expr_ty(input, inout g, fx, first)
     var elem: check.TyId = check.TyId.(0)
     match growable_elem(g, vty) {
         some(value as e: check.TyId) {
             elem = e
         }
         none {
-            return dummy(inout g, fx, ty)
+            return dummy(input, inout g, fx, ty)
         }
     }
     var item: PushItem = PushItem.one.(v: V.unit)
     if same_text(name, "push") {
-        item = PushItem.one.(v: try value_as(inout g, inout fx, arg_value(fx, args, 1), elem))
+        item = PushItem.one.(v: try value_as(input, inout g, inout fx, arg_value(input, fx, args, 1), elem))
     } else {
         let view_ty: check.TyId = try check.intern(inout g.types, check.Ty.view.(elem: elem))
-        let v: V = try value_as(inout g, inout fx, arg_value(fx, args, 1), view_ty)
-        let addr: keel.Value = try spill(inout g, fx, v, view_ty)
+        let v: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 1), view_ty)
+        let addr: keel.Value = try spill(input, inout g, fx, v, view_ty)
         let p: keel.Value = load_scalar(fx, keel.Type.ptr, addr)
         let len_addr: keel.Value = offset_by(fx, addr, 8)
         let n: keel.Value = load_scalar(fx, keel.Type.int64, len_addr)
         item = PushItem.many.(ptr: p, len: n)
     }
-    let v: keel.Value = try addr_of(inout g, inout fx, first)
-    let l: TyLayout = try ty_layout(inout g, elem)
+    let v: keel.Value = try addr_of(input, inout g, inout fx, first)
+    let l: TyLayout = try ty_layout(input, inout g, elem)
     let len_addr: keel.Value = offset_by(fx, v, 8)
     let len: keel.Value = load_scalar(fx, keel.Type.int64, len_addr)
     let extra: keel.Value = match item {
@@ -255,16 +255,16 @@ fn push_items(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: che
     }
     let needed: keel.Value = binop(fx, keel.BinaryOp.iadd, len, extra)
     let size: keel.Value = usize_const(fx, l.size)
-    let out: keel.Value = try temp(inout g, fx, ty)
-    let ok_v: VariantOf = try variant_of(inout g, ty, "ok")
-    let err_v: VariantOf = try variant_of(inout g, ty, "err")
+    let out: keel.Value = try temp(input, inout g, fx, ty)
+    let ok_v: VariantOf = try variant_of(input, inout g, ty, "ok")
+    let err_v: VariantOf = try variant_of(input, inout g, ty, "err")
     var tag: keel.Type = keel.Type.int8
     match ok_v.kind {
         tagged(tag as t: keel.Type, payload_offset: _) {
             tag = t
         }
         _ {
-            return dummy(inout g, fx, ty)
+            return dummy(input, inout g, fx, ty)
         }
     }
     let stored: keel.Block = try new_block(inout fx)
@@ -288,7 +288,7 @@ fn push_items(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: che
     let at: keel.Value = keel.ptradd(fx.m, fx.block, p, off)
     match item {
         one(v as x: V) {
-            try store_v(inout g, fx, x, elem, at, false)
+            try store_v(input, inout g, fx, x, elem, at, false)
         }
         many(ptr as src: keel.Value, len as n: keel.Value) {
             let bytes: keel.Value = binop(fx, keel.BinaryOp.imul, n, size)
@@ -304,7 +304,7 @@ fn push_items(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: che
     // err.(error: OutOfMemory.out_of_memory): a zero payload.
     let te: keel.Value = iconst(fx, tag, err_v.variant.tag)
     store_scalar(fx, te, out)
-    let all: TyLayout = try ty_layout(inout g, ty)
+    let all: TyLayout = try ty_layout(input, inout g, ty)
     if all.size > type_size(tag) {
         let zero: keel.Value = iconst(fx, keel.Type.int8, 0)
         let last: keel.Value = offset_by(fx, out, all.size - 1)
@@ -315,29 +315,29 @@ fn push_items(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: che
     return ok.(value: V.memory.(addr: out))
 }
 
-fn pop_item(g: inout Gen, fx: inout Fx, args: syntax.List, ty: check.TyId) -> V ! OutOfMemory {
-    let first: syntax.ExprId = arg_value(fx, args, 0)
-    let vty: check.TyId = try expr_ty(inout g, fx, first)
+fn pop_item(input: Input, g: inout Gen, fx: inout Fx, args: syntax.List, ty: check.TyId) -> V ! OutOfMemory {
+    let first: syntax.ExprId = arg_value(input, fx, args, 0)
+    let vty: check.TyId = try expr_ty(input, inout g, fx, first)
     var elem: check.TyId = check.TyId.(0)
     match growable_elem(g, vty) {
         some(value as e: check.TyId) {
             elem = e
         }
         none {
-            return dummy(inout g, fx, ty)
+            return dummy(input, inout g, fx, ty)
         }
     }
-    let el: TyLayout = try ty_layout(inout g, elem)
-    let v: keel.Value = try addr_of(inout g, inout fx, first)
+    let el: TyLayout = try ty_layout(input, inout g, elem)
+    let v: keel.Value = try addr_of(input, inout g, inout fx, first)
     let len_addr: keel.Value = offset_by(fx, v, 8)
     let len: keel.Value = load_scalar(fx, keel.Type.int64, len_addr)
     let zero: keel.Value = iconst(fx, keel.Type.int64, 0)
     let has: keel.Value = compare_ints(fx, keel.IntCC.ne, len, zero)
     // The result is built in a slot, which also serves a `?*T` that is a
     // single pointer.
-    let out: keel.Value = try temp(inout g, fx, ty)
-    let some_v: VariantOf = try variant_of(inout g, ty, "some")
-    let none_v: VariantOf = try variant_of(inout g, ty, "none")
+    let out: keel.Value = try temp(input, inout g, fx, ty)
+    let some_v: VariantOf = try variant_of(input, inout g, ty, "some")
+    let none_v: VariantOf = try variant_of(input, inout g, ty, "none")
     let take: keel.Block = try new_block(inout fx)
     let empty: keel.Block = try new_block(inout fx)
     let after: keel.Block = try new_block(inout fx)
@@ -357,15 +357,15 @@ fn pop_item(g: inout Gen, fx: inout Fx, args: syntax.List, ty: check.TyId) -> V 
             var field_off: u64 = 0
             match some_v.variant.payload {
                 some(value as payload: check.TyId) {
-                    let f: FieldInfo = try field_of(inout g, payload, "value")
+                    let f: FieldInfo = try field_of(input, inout g, payload, "value")
                     field_off = f.offset
                 }
                 none {
                 }
             }
             let dst: keel.Value = offset_by(fx, out, payload_offset + field_off)
-            let x: V = try load_v(inout g, fx, at, elem)
-            try store_v(inout g, fx, x, elem, dst, false)
+            let x: V = try load_v(input, inout g, fx, at, elem)
+            try store_v(input, inout g, fx, x, elem, dst, false)
         }
         _ {
             let q: keel.Value = load_scalar(fx, keel.Type.ptr, at)
@@ -386,12 +386,12 @@ fn pop_item(g: inout Gen, fx: inout Fx, args: syntax.List, ty: check.TyId) -> V 
     }
     try jump(inout fx, after)
     switch_to(inout fx, after, true)
-    return load_v(inout g, fx, out, ty)
+    return load_v(input, inout g, fx, out, ty)
 }
 
-fn free_items(g: inout Gen, fx: inout Fx, args: syntax.List) -> V ! OutOfMemory {
-    let first: syntax.ExprId = arg_value(fx, args, 0)
-    let vty: check.TyId = try expr_ty(inout g, fx, first)
+fn free_items(input: Input, g: inout Gen, fx: inout Fx, args: syntax.List) -> V ! OutOfMemory {
+    let first: syntax.ExprId = arg_value(input, fx, args, 0)
+    let vty: check.TyId = try expr_ty(input, inout g, fx, first)
     var elem: check.TyId = check.TyId.(0)
     match growable_elem(g, vty) {
         some(value as e: check.TyId) {
@@ -401,8 +401,8 @@ fn free_items(g: inout Gen, fx: inout Fx, args: syntax.List) -> V ! OutOfMemory 
             return ok.(value: V.unit)
         }
     }
-    let l: TyLayout = try ty_layout(inout g, elem)
-    let v: keel.Value = try addr_of(inout g, inout fx, first)
+    let l: TyLayout = try ty_layout(input, inout g, elem)
+    let v: keel.Value = try addr_of(input, inout g, inout fx, first)
     let p: keel.Value = load_scalar(fx, keel.Type.ptr, v)
     let null: keel.Value = null_ptr(fx)
     let has: keel.Value = compare_ints(fx, keel.IntCC.ne, p, null)
@@ -430,7 +430,7 @@ fn free_items(g: inout Gen, fx: inout Fx, args: syntax.List) -> V ! OutOfMemory 
     return ok.(value: V.unit)
 }
 
-fn fill_array(g: inout Gen, fx: inout Fx, args: syntax.List, ty: check.TyId) -> V ! OutOfMemory {
+fn fill_array(input: Input, g: inout Gen, fx: inout Fx, args: syntax.List, ty: check.TyId) -> V ! OutOfMemory {
     var n: u64 = 0
     var elem: check.TyId = check.TyId.(0)
     match check.get(g.types, core_ty(g, ty)) {
@@ -439,15 +439,15 @@ fn fill_array(g: inout Gen, fx: inout Fx, args: syntax.List, ty: check.TyId) -> 
             elem = e
         }
         _ {
-            return dummy(inout g, fx, ty)
+            return dummy(input, inout g, fx, ty)
         }
     }
-    let v: V = try value_as(inout g, inout fx, arg_value(fx, args, 0), elem)
-    let addr: keel.Value = try temp(inout g, fx, ty)
-    let el: TyLayout = try ty_layout(inout g, elem)
+    let v: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 0), elem)
+    let addr: keel.Value = try temp(input, inout g, fx, ty)
+    let el: TyLayout = try ty_layout(input, inout g, elem)
     // A loop over the elements.
     let usize_ty: check.TyId = try check.usize_ty(inout g.types)
-    let counter: keel.Value = try temp(inout g, fx, usize_ty)
+    let counter: keel.Value = try temp(input, inout g, fx, usize_ty)
     let zero: keel.Value = iconst(fx, keel.Type.int64, 0)
     store_scalar(fx, zero, counter)
     let header: keel.Block = try new_block(inout fx)
@@ -463,7 +463,7 @@ fn fill_array(g: inout Gen, fx: inout Fx, args: syntax.List, ty: check.TyId) -> 
     let size_v: keel.Value = usize_const(fx, el.size)
     let off: keel.Value = binop(fx, keel.BinaryOp.imul, i, size_v)
     let at: keel.Value = keel.ptradd(fx.m, fx.block, addr, off)
-    try store_v(inout g, fx, v, elem, at, false)
+    try store_v(input, inout g, fx, v, elem, at, false)
     let one: keel.Value = iconst(fx, keel.Type.int64, 1)
     let next: keel.Value = binop(fx, keel.BinaryOp.iadd, i, one)
     store_scalar(fx, next, counter)
@@ -472,10 +472,10 @@ fn fill_array(g: inout Gen, fx: inout Fx, args: syntax.List, ty: check.TyId) -> 
     return ok.(value: V.memory.(addr: addr))
 }
 
-fn saturating(g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: check.TyId) -> V ! OutOfMemory {
-    let av: V = try value_as(inout g, inout fx, arg_value(fx, args, 0), ty)
+fn saturating(input: Input, g: inout Gen, fx: inout Fx, name: []u8, args: syntax.List, ty: check.TyId) -> V ! OutOfMemory {
+    let av: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 0), ty)
     let a: keel.Value = scalar_v(fx, av)
-    let bv: V = try value_as(inout g, inout fx, arg_value(fx, args, 1), ty)
+    let bv: V = try value_as(input, inout g, inout fx, arg_value(input, fx, args, 1), ty)
     let b: keel.Value = scalar_v(fx, bv)
     let int: check.IntTy = match int_of(g, ty) {
         some(value as i: check.IntTy) { i }

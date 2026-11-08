@@ -226,13 +226,12 @@ fn read_package(l: inout Loader, path: []u8, dir: []u8) -> Read ! OutOfMemory {
         }
     }
     let id: u32 = u32.(l.program.packages.len)
-    let package: Package = Package.(
+    try push(inout l.program.packages, Package.(
         path: path,
         dir: dir,
         files: make(l.alloc),
         imports: make(l.alloc),
-    )
-    try push(inout l.program.packages, package)
+    ))
     try push(inout l.loading, path)
     for let name: []u8 in names {
         let file_path: []u8 = try join(l.alloc, dir, name)
@@ -272,18 +271,18 @@ fn parse_file(l: inout Loader, path: []u8, package: u32) -> u32 ! OutOfMemory {
             message: "the file is not UTF-8 from here on; source files are UTF-8",
         )
         try push(inout l.program.diagnostics, Diagnostic.(file: id, message: message))
-        let empty: syntax.Parsed = try syntax.parse(l.alloc, "")
-        try add_file(inout l, path, text, empty.ast, package)
+        var empty: syntax.Parsed = try syntax.parse(l.alloc, "")
+        try add_file(inout l, path, text, inout empty.ast, package)
         return ok.(value: id)
     }
-    let parsed: syntax.Parsed = try syntax.parse(l.alloc, text)
+    var parsed: syntax.Parsed = try syntax.parse(l.alloc, text)
     for let d: syntax.Diagnostic in parsed.lex_diagnostics {
         try push(inout l.program.diagnostics, Diagnostic.(file: id, message: Message.lex.(d: d)))
     }
     for let d: syntax.ParseDiagnostic in parsed.diagnostics {
         try push(inout l.program.diagnostics, Diagnostic.(file: id, message: Message.parse.(d: d)))
     }
-    try add_file(inout l, path, text, parsed.ast, package)
+    try add_file(inout l, path, text, inout parsed.ast, package)
     return ok.(value: id)
 }
 
@@ -293,10 +292,15 @@ fn read_error(l: inout Loader, path: []u8, error: io.Error) -> ! OutOfMemory {
     return ok
 }
 
-fn add_file(l: inout Loader, path: []u8, text: []u8, ast: syntax.Ast, package: u32) -> ! OutOfMemory {
-    let starts: [..]u32 = try syntax.line_starts(l.alloc, text)
-    let f: File = File.(path: path, text: text, starts: starts, ast: ast, package: package)
-    try push(inout l.program.files, f)
+// Adds a file, taking its tree from ast.
+fn add_file(l: inout Loader, path: []u8, text: []u8, ast: inout syntax.Ast, package: u32) -> ! OutOfMemory {
+    try push(inout l.program.files, File.(
+        path: path,
+        text: text,
+        starts: try syntax.line_starts(l.alloc, text),
+        ast: take(inout ast),
+        package: package,
+    ))
     return ok
 }
 

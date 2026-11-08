@@ -1,0 +1,7 @@
+a: 3 items, label 3, spare 1
+after take, a: 0 items, label 3, spare 0
+b: 3 items, label 3, spare 1
+b spare after take: 0
+took a spare of 1
+spare is empty
+a grows again: 1 item, 42

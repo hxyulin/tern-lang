@@ -52,6 +52,7 @@ pub fn check(program: &Program, names: &Resolution) -> Checked {
         names,
         types: Types::new(),
         fn_tys: HashMap::new(),
+        owning: HashMap::new(),
         diagnostics: Vec::new(),
         files: program
             .files
@@ -102,6 +103,10 @@ pub enum Item {
 struct LocalInfo {
     ty: TyId,
     mutable: bool,
+    /// Whether the local holds its own value, so a `return` can take
+    /// it: a `let` or `var` local, not a parameter or a borrow of a
+    /// place.
+    owned: bool,
 }
 
 /// The function being checked.
@@ -120,6 +125,13 @@ struct Fx<'a> {
     /// union member or C global here is not read.
     written: HashSet<ExprId>,
     addressed: HashSet<ExprId>,
+    /// While checking a `return` value: the locals it takes so far, so a
+    /// place inside a construction is taken too, and only once.
+    returning: Option<Vec<(rules::Root, Vec<rules::Step>)>>,
+    /// The locals each pending `defer` mentions, innermost last.
+    defers: Vec<Vec<LocalId>>,
+    /// While checking a `defer`'s call: the locals it mentions.
+    mentioned: Option<Vec<LocalId>>,
 }
 
 impl<'a> Fx<'a> {
@@ -134,6 +146,9 @@ impl<'a> Fx<'a> {
             locked: Vec::new(),
             written: HashSet::new(),
             addressed: HashSet::new(),
+            returning: None,
+            defers: Vec::new(),
+            mentioned: None,
         }
     }
 }
@@ -154,6 +169,8 @@ struct Checker<'a> {
     names: &'a Resolution,
     types: Types,
     fn_tys: HashMap<DeclRef, TyId>,
+    /// Which types hold a `[..]T`; see `owning`.
+    owning: HashMap<TyId, bool>,
     diagnostics: Vec<(FileId, Diagnostic)>,
     files: Vec<FileTypes>,
 }
@@ -736,7 +753,7 @@ impl<'a> Checker<'a> {
                     let ty = self.lower(file, param.ty);
                     self.format_param(file, ast.ty(param.ty).span, ty);
                     if let Some(name) = param.name {
-                        self.bind(&mut fx, name, ty, param.mode == Mode::Inout);
+                        self.bind(&mut fx, name, ty, param.mode == Mode::Inout, false);
                     }
                 }
                 let diverges = self.block(&mut fx, &f.body);
@@ -783,7 +800,7 @@ impl<'a> Checker<'a> {
                     Binding::Destructure(fields) => {
                         let value = self.value(&mut fx, local.value, None);
                         let span = ast.expr(local.value).span;
-                        self.destructure(&mut fx, fields, value, span, false);
+                        self.destructure(&mut fx, fields, value, span, false, false);
                     }
                 }
                 self.constant(file, local.value);
@@ -791,13 +808,13 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn bind(&mut self, fx: &mut Fx, name: Name, ty: TyId, mutable: bool) {
+    fn bind(&mut self, fx: &mut Fx, name: Name, ty: TyId, mutable: bool, owned: bool) {
         if let Some(&id) = self.names.files[fx.file.0 as usize]
             .bindings
             .get(&name.span.start)
         {
             self.files[fx.file.0 as usize].locals.insert(id, ty);
-            fx.locals.insert(id, LocalInfo { ty, mutable });
+            fx.locals.insert(id, LocalInfo { ty, mutable, owned });
         }
     }
 
@@ -810,6 +827,7 @@ impl<'a> Checker<'a> {
         value: TyId,
         span: Span,
         mutable: bool,
+        borrowed: bool,
     ) {
         if self.types.is_error(value) {
             return;
@@ -848,7 +866,15 @@ impl<'a> Checker<'a> {
                     self.error(fx.file, fx.ast.ty(ty).span, message);
                 }
                 let name = field.rename.unwrap_or(field.field);
-                self.bind(fx, name, *field_ty, mutable || field.mutable);
+                let field_mutable = mutable || field.mutable;
+                if borrowed && field_mutable && self.owning(*field_ty) {
+                    let message = format!(
+                        "`{}` would be a second owner of a buffer in a place that keeps it; bind it without `var`, or take the value first, as in `match take(inout x)`",
+                        self.text(fx.file, name.span)
+                    );
+                    self.error(fx.file, name.span, message);
+                }
+                self.bind(fx, name, *field_ty, field_mutable, !borrowed);
             }
         }
     }
@@ -857,9 +883,11 @@ impl<'a> Checker<'a> {
 
     fn block(&mut self, fx: &mut Fx, block: &Block) -> bool {
         let mut diverges = false;
+        let outer = fx.defers.len();
         for &stmt in &block.stmts {
             diverges |= self.stmt(fx, stmt);
         }
+        fx.defers.truncate(outer);
         diverges
     }
 
@@ -871,15 +899,22 @@ impl<'a> Checker<'a> {
                     let ty = self.lower(fx.file, *ty_id);
                     self.no_format(fx.file, fx.ast.ty(*ty_id).span, ty);
                     let value = self.check(fx, local.value, ty);
+                    // A `let` bound to a place borrows it; a `var` gets
+                    // its own value.
+                    let borrows = !local.mutable && self.place(fx, local.value).is_some();
+                    if !borrows {
+                        self.fresh(fx, local.value, ty);
+                    }
                     if let Some(name) = name {
-                        self.bind(fx, *name, ty, local.mutable);
+                        self.bind(fx, *name, ty, local.mutable, !borrows);
                     }
                     matches!(self.types.get(value), Ty::Never)
                 }
                 Binding::Destructure(fields) => {
                     let value = self.value(fx, local.value, None);
                     let span = fx.ast.expr(local.value).span;
-                    self.destructure(fx, fields, value, span, local.mutable);
+                    let borrowed = self.place(fx, local.value).is_some();
+                    self.destructure(fx, fields, value, span, local.mutable, borrowed);
                     false
                 }
             },
@@ -900,10 +935,11 @@ impl<'a> Checker<'a> {
             }
             StmtKind::Match { value, arms } => {
                 let scrutinee = self.value(fx, *value, None);
+                let borrowed = self.place(fx, *value).is_some();
                 let mut coverage = Coverage::default();
                 let mut all = true;
                 for arm in arms {
-                    self.patterns(fx, &arm.patterns, scrutinee, &mut coverage);
+                    self.patterns(fx, &arm.patterns, scrutinee, borrowed, &mut coverage);
                     all &= self.block(fx, &arm.body);
                 }
                 let span = fx.ast.expr(*value).span;
@@ -942,7 +978,10 @@ impl<'a> Checker<'a> {
                 true
             }
             StmtKind::Defer(call) => {
+                let outer = fx.mentioned.replace(Vec::new());
                 let item = self.expr(fx, *call, None);
+                let mentioned = std::mem::replace(&mut fx.mentioned, outer).unwrap_or_default();
+                fx.defers.push(mentioned);
                 if let Item::Value(ty) = item
                     && !self.types.is_error(ty)
                 {
@@ -1024,7 +1063,10 @@ impl<'a> Checker<'a> {
                 self.error(fx.file, span, message);
             }
             (Some(result), Some(value)) => {
+                fx.returning = Some(Vec::new());
                 self.check(fx, value, result);
+                self.fresh(fx, value, result);
+                fx.returning = None;
             }
         }
     }
@@ -1039,6 +1081,7 @@ impl<'a> Checker<'a> {
         self.require_mutable(fx, left, "assign to");
         if op == AssignOp::Set {
             self.check(fx, right, ty);
+            self.fresh(fx, right, ty);
             return;
         }
         if self.types.is_error(ty) {
@@ -1083,7 +1126,7 @@ impl<'a> Checker<'a> {
                 self.check(fx, *start, ty);
                 self.check(fx, *end, ty);
                 if let Some(name) = name {
-                    self.bind(fx, *name, ty, mutable);
+                    self.bind(fx, *name, ty, mutable, true);
                 }
             }
             Iterable::Expr(e) => {
@@ -1102,12 +1145,16 @@ impl<'a> Checker<'a> {
                             );
                             self.error(fx.file, fx.ast.ty(*ty).span, message);
                         }
+                        if mutable && self.owning(declared) {
+                            let message = "`for var` would copy each element, and its buffer would have two owners; use `for let`";
+                            self.error(fx.file, fx.ast.ty(*ty).span, message);
+                        }
                         if let Some(name) = name {
-                            self.bind(fx, *name, declared, mutable);
+                            self.bind(fx, *name, declared, mutable, false);
                         }
                     }
                     Binding::Destructure(fields) => {
-                        self.destructure(fx, fields, elem, span, mutable);
+                        self.destructure(fx, fields, elem, span, mutable, true);
                     }
                 }
             }
@@ -1145,13 +1192,29 @@ impl<'a> Checker<'a> {
 
     // Patterns.
 
-    fn patterns(&mut self, fx: &mut Fx, pats: &[PatId], scrutinee: TyId, coverage: &mut Coverage) {
+    /// Checks an arm's patterns. `borrowed` says the scrutinee is a
+    /// place, so payloads are bound where they live.
+    fn patterns(
+        &mut self,
+        fx: &mut Fx,
+        pats: &[PatId],
+        scrutinee: TyId,
+        borrowed: bool,
+        coverage: &mut Coverage,
+    ) {
         for &pat in pats {
-            self.pattern(fx, pat, scrutinee, coverage);
+            self.pattern(fx, pat, scrutinee, borrowed, coverage);
         }
     }
 
-    fn pattern(&mut self, fx: &mut Fx, pat: PatId, scrutinee: TyId, coverage: &mut Coverage) {
+    fn pattern(
+        &mut self,
+        fx: &mut Fx,
+        pat: PatId,
+        scrutinee: TyId,
+        borrowed: bool,
+        coverage: &mut Coverage,
+    ) {
         let span = fx.ast.pat(pat).span;
         if self.types.is_error(scrutinee) {
             coverage.wildcard = true;
@@ -1180,7 +1243,7 @@ impl<'a> Checker<'a> {
                 }
                 match (payload, variant_payload) {
                     (Some(fields), Some(payload)) => {
-                        self.destructure(fx, fields, *payload, span, false);
+                        self.destructure(fx, fields, *payload, span, false, borrowed);
                     }
                     (Some(_), None) => {
                         self.error(fx.file, span, format!("`{text}` carries no payload"));
@@ -1431,9 +1494,10 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Match { value, arms } => {
                 let scrutinee = self.value(fx, *value, None);
+                let borrowed = self.place(fx, *value).is_some();
                 let mut coverage = Coverage::default();
                 for arm in arms {
-                    self.patterns(fx, &arm.patterns, scrutinee, &mut coverage);
+                    self.patterns(fx, &arm.patterns, scrutinee, borrowed, &mut coverage);
                 }
                 let value_span = fx.ast.expr(*value).span;
                 self.exhaustive(fx, value_span, scrutinee, &coverage);
@@ -1471,11 +1535,16 @@ impl<'a> Checker<'a> {
 
     fn name(&mut self, fx: &mut Fx, e: ExprId, name: Name, expected: Option<TyId>) -> Item {
         match self.names.files[fx.file.0 as usize].exprs[e.index()] {
-            Some(Res::Local(id)) => Item::Value(
-                fx.locals
-                    .get(&id)
-                    .map_or_else(|| self.types.error(), |l| l.ty),
-            ),
+            Some(Res::Local(id)) => {
+                if let Some(mentioned) = &mut fx.mentioned {
+                    mentioned.push(id);
+                }
+                Item::Value(
+                    fx.locals
+                        .get(&id)
+                        .map_or_else(|| self.types.error(), |l| l.ty),
+                )
+            }
             Some(Res::Decl(decl)) => {
                 self.use_decl(fx, e, decl, name.span);
                 let text = self.text(fx.file, name.span);
@@ -1643,6 +1712,7 @@ impl<'a> Checker<'a> {
             }
             for ((_, value), (_, ty)) in fields.iter().zip(&want) {
                 self.check(fx, *value, *ty);
+                self.fresh(fx, *value, *ty);
             }
             return expected;
         }
@@ -1650,6 +1720,7 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|(name, value)| {
                 let ty = self.value(fx, *value, None);
+                self.fresh(fx, *value, ty);
                 (self.text(fx.file, name.span).to_owned(), ty)
             })
             .collect();
@@ -1665,6 +1736,7 @@ impl<'a> Checker<'a> {
             Ty::Array(len, elem) => {
                 for &e in elems {
                     self.check(fx, e, elem);
+                    self.fresh(fx, e, elem);
                 }
                 if elems.len() as u64 != len {
                     let message = format!("expected {len} elements, found {}", elems.len());
@@ -1871,6 +1943,7 @@ impl<'a> Checker<'a> {
     /// a tuple literal for a record, or one value in parentheses.
     fn construct_value(&mut self, fx: &mut Fx, value: ExprId, underlying: TyId) {
         self.check(fx, value, underlying);
+        self.fresh(fx, value, underlying);
     }
 
     fn construct_builtin(
@@ -2419,12 +2492,14 @@ impl<'a> Checker<'a> {
                 self.require_mutable(fx, a, "pass `inout`");
                 match self.types.get(v).clone() {
                     Ty::Growable(elem) => {
-                        let item = if name == "push" {
-                            elem
+                        if name == "push" {
+                            self.check(fx, args[1].value, elem);
+                            self.fresh(fx, args[1].value, elem);
                         } else {
-                            self.types.intern(Ty::View(elem))
-                        };
-                        self.check(fx, args[1].value, item);
+                            let view = self.types.intern(Ty::View(elem));
+                            self.check(fx, args[1].value, view);
+                            self.no_owning_copy(fx, span, "append", elem);
+                        }
                     }
                     Ty::Error => {}
                     _ => {
@@ -2462,10 +2537,23 @@ impl<'a> Checker<'a> {
                     }
                     return Item::Nothing;
                 }
-                if !matches!(self.types.get(v), Ty::Growable(_) | Ty::Error) {
-                    let message = format!("`take` takes a `[..]T`, not `{}`", self.show(v));
+                if self.types.is_error(v) {
+                    return Item::Value(v);
+                }
+                if !self.owning(v) {
+                    let message = format!(
+                        "`take` takes a value that owns a buffer, not `{}`",
+                        self.show(v)
+                    );
                     self.error(fx.file, fx.ast.expr(a).span, message);
                     return Item::Value(self.types.error());
+                }
+                if !self.emptiable(v) {
+                    let message = format!(
+                        "`take` cannot leave a `{}` empty: only a `[..]T`, an optional, and records and tuples of them have an empty value",
+                        self.show(v)
+                    );
+                    self.error(fx.file, fx.ast.expr(a).span, message);
                 }
                 v
             }
@@ -2475,6 +2563,7 @@ impl<'a> Checker<'a> {
                 let v = self.value(fx, args[1].value, None);
                 match self.types.get(v).clone() {
                     Ty::Growable(elem) | Ty::View(elem) | Ty::Array(_, elem) => {
+                        self.no_owning_copy(fx, span, "copy", elem);
                         let growable = self.types.intern(Ty::Growable(elem));
                         self.types.intern(Ty::Result(Some(growable), oom))
                     }

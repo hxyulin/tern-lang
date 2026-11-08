@@ -1,6 +1,6 @@
 //! The local rules that need no flow: `unsafe`, `shared` globals,
-//! exclusivity of `inout` arguments, the `Format` rule and constant
-//! global initializers.
+//! exclusivity of `inout` arguments, one owner per buffer, the `Format`
+//! rule and constant global initializers.
 
 use super::{Checker, Fx};
 use crate::ast::{DeclKind, ExprId, ExprKind, Index, Mode, StrPart, TypeDef, TypeKind, UnaryOp};
@@ -27,14 +27,14 @@ pub(super) fn spine(fx: &Fx, e: ExprId) -> Vec<ExprId> {
 
 /// Where an argument's storage starts.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Root {
+pub(super) enum Root {
     Local(LocalId),
     Global(DeclRef),
 }
 
 /// One step from a root to an argument's storage.
-#[derive(PartialEq, Eq)]
-enum Step {
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum Step {
     Field(String),
     /// An index, when it is a constant.
     Index(Option<i128>),
@@ -156,6 +156,143 @@ impl Checker<'_> {
                 Some((root, steps))
             }
             _ => None,
+        }
+    }
+
+    // One owner per buffer.
+
+    /// Whether `ty` holds a `[..]T`, so a value of it never copies
+    /// implicitly.
+    pub(super) fn owning(&mut self, ty: TyId) -> bool {
+        if let Some(&known) = self.owning.get(&ty) {
+            return known;
+        }
+        // A type that holds itself does so through a `[..]T`, which
+        // decides it before the cycle closes.
+        self.owning.insert(ty, false);
+        let parts: Vec<TyId> = match self.types.get(ty).clone() {
+            Ty::Growable(_) => {
+                self.owning.insert(ty, true);
+                return true;
+            }
+            Ty::Tuple(fields) => fields.iter().map(|(_, t)| *t).collect(),
+            Ty::Array(_, elem) | Ty::Optional(elem) => vec![elem],
+            Ty::Result(value, error) => value.into_iter().chain([error]).collect(),
+            Ty::Named(_) => match self.named_info(ty).map(|i| &i.def) {
+                Some(NamedDef::Plain { underlying, .. }) => vec![*underlying],
+                Some(NamedDef::Enum(info)) => {
+                    info.variants.iter().filter_map(|v| v.payload).collect()
+                }
+                Some(NamedDef::Union(fields)) => fields.iter().map(|(_, t)| *t).collect(),
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        let owning = parts.into_iter().any(|t| self.owning(t));
+        self.owning.insert(ty, owning);
+        owning
+    }
+
+    /// `e` becomes a new home's value of type `target`. If `target` is
+    /// owning, `e` must not be a place that keeps the buffer too. Inside
+    /// a `return` value, a place that starts at one of the function's
+    /// own locals is taken instead, once.
+    pub(super) fn fresh(&mut self, fx: &mut Fx, e: ExprId, target: TyId) {
+        if self.types.is_error(target) || !self.owning(target) {
+            return;
+        }
+        match &fx.ast.expr(e).kind {
+            ExprKind::Paren(inner) | ExprKind::Unsafe(inner) => {
+                self.fresh(fx, *inner, target);
+            }
+            ExprKind::If {
+                then, otherwise, ..
+            } => {
+                self.fresh(fx, *then, target);
+                match otherwise {
+                    crate::ast::IfElse::Branch(value) | crate::ast::IfElse::If(value) => {
+                        self.fresh(fx, *value, target);
+                    }
+                }
+            }
+            ExprKind::Match { arms, .. } => {
+                for arm in arms {
+                    self.fresh(fx, arm.body, target);
+                }
+            }
+            ExprKind::Name(_) | ExprKind::Field { .. } | ExprKind::Index { .. } => {
+                let Some(path) = self.access_path(fx, e) else {
+                    return;
+                };
+                let text = self.text(fx.file, fx.ast.expr(e).span);
+                if let (Root::Local(id), Some(taken)) = (path.0, &mut fx.returning)
+                    && fx.locals.get(&id).is_some_and(|l| l.owned)
+                {
+                    if fx.defers.iter().flatten().any(|d| *d == id) {
+                        let message = format!(
+                            "a `defer` uses `{}` after this `return`; hand the value over with `take(inout {text})`",
+                            self.text(fx.file, Self::root_name(fx, e))
+                        );
+                        self.error(fx.file, fx.ast.expr(e).span, message);
+                        return;
+                    }
+                    if !taken.iter().any(|t| overlaps(t, &path)) {
+                        taken.push(path);
+                        return;
+                    }
+                    let message = format!(
+                        "this `return` already takes `{text}` or part of it; a buffer can go to only one place"
+                    );
+                    self.error(fx.file, fx.ast.expr(e).span, message);
+                    return;
+                }
+                let message = format!(
+                    "this would copy `{text}`, and its buffer would have two owners; hand it over with `take(inout {text})` or make a second one with `try copy(alloc, {text})`"
+                );
+                self.error(fx.file, fx.ast.expr(e).span, message);
+            }
+            // Everything else is a new value. A raw pointer's target, read
+            // with `.*`, is trusted, as `unsafe` is.
+            _ => {}
+        }
+    }
+
+    /// Whether `take` can leave a value of `ty` empty: each owning part
+    /// is a `[..]T` or an optional, which becomes `none`, or a record or
+    /// tuple whose owning parts are.
+    pub(super) fn emptiable(&mut self, ty: TyId) -> bool {
+        if !self.owning(ty) {
+            return true;
+        }
+        let fields: Vec<TyId> = match self.types.get(ty) {
+            Ty::Growable(_) | Ty::Optional(_) => return true,
+            Ty::Tuple(fields) => fields.iter().map(|(_, t)| *t).collect(),
+            Ty::Named(_) => match self.named_info(ty).map(|i| &i.def) {
+                Some(NamedDef::Plain { underlying, .. }) => vec![*underlying],
+                _ => return false,
+            },
+            _ => return false,
+        };
+        fields.into_iter().all(|t| self.emptiable(t))
+    }
+
+    /// The name a place expression starts at.
+    fn root_name(fx: &Fx, e: ExprId) -> Span {
+        let spine = spine(fx, e);
+        fx.ast
+            .expr(*spine.last().expect("a spine has its start"))
+            .span
+    }
+
+    /// `append` and `copy` copy each element byte for byte, which an
+    /// owning element cannot be.
+    pub(super) fn no_owning_copy(&mut self, fx: &Fx, span: Span, name: &str, elem: TyId) {
+        if self.owning(elem) {
+            let message = format!(
+                "`{name}` copies each element, and a `{}` cannot be copied: its buffer would have two owners",
+                self.show(elem)
+            );
+            self.error(fx.file, span, message);
         }
     }
 
