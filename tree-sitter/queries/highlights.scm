@@ -1,4 +1,4 @@
-["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as" "unsafe"] @keyword
+["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as" "unsafe" "uses"] @keyword
 
 (unsafe) @keyword
 
@@ -46,3 +46,4 @@
 
 (variant name: (identifier) @constant)
 (variant_pattern name: (identifier) @constant)
+(global_use name: (identifier) @variable)

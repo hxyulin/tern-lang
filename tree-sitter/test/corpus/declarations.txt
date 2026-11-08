@@ -359,3 +359,76 @@ fn f() {
         value: (call_expression
           function: (identifier)
           arguments: (argument_list))))))
+
+================================================================================
+Functions that use mutable globals
+================================================================================
+
+var counter: u32 = 0
+
+fn bump() uses inout counter {
+    counter += 1
+}
+
+fn report(s: str, t: str) -> str in s uses counter, inout log.out {
+    write(inout log.out, "{counter}")
+    return s
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (global_declaration
+    (var_declaration
+      (identifier)
+      (type_name
+        (identifier))
+      (integer_literal)))
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (uses_clause
+      (global_use
+        (parameter_mode)
+        (identifier)))
+    (block
+      (assignment_statement
+        (identifier)
+        (integer_literal))))
+  (function_declaration
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (type_name
+          (identifier)))
+      (parameter
+        (identifier)
+        (type_name
+          (identifier))))
+    (type_name
+      (identifier))
+    (identifier)
+    (uses_clause
+      (global_use
+        (identifier))
+      (global_use
+        (parameter_mode)
+        (identifier)
+        (identifier)))
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (parameter_mode)
+              (field_expression
+                (identifier)
+                (identifier)))
+            (argument
+              (string_literal
+                (interpolation
+                  (identifier)))))))
+      (return_statement
+        (identifier)))))

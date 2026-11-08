@@ -59,6 +59,7 @@ module.exports = grammar({
       'as',
       'pub',
       'unsafe',
+      'uses',
     ],
   },
 
@@ -109,7 +110,19 @@ module.exports = grammar({
             optional(seq('in', field('borrows', $.identifier))),
           ),
         ),
+        optional(field('uses', $.uses_clause)),
         field('body', $.block),
+      ),
+
+    // uses counter, inout log.out: the mutable globals the function and
+    // its callees read, or with inout may write.
+    uses_clause: ($) => seq('uses', commaSep1($.global_use)),
+
+    global_use: ($) =>
+      seq(
+        optional(field('mode', alias('inout', $.parameter_mode))),
+        optional(seq(field('package', $.identifier), '.')),
+        field('name', $.identifier),
       ),
 
     parameter_list: ($) => seq('(', commaSep($.parameter), ')'),

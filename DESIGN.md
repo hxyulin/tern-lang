@@ -99,9 +99,12 @@ The running list. Each new keyword needs a reason.
 | `import`, `as` | import a package, renaming it on a clash |
 | `pub` | visible outside the package |
 | `unsafe` | unchecked operations, and functions with unchecked preconditions |
+| `uses` | the mutable globals a function reads or writes |
 
-Planned by earlier decisions: `unsafe`. `true` and `false` are predeclared
-names, not keywords, as in Go.
+`true` and `false` are predeclared names, not keywords, as in Go.
+
+Keywords are reserved everywhere, so none can be a field or variable
+name: a field cannot be called `type`, `in` or `sink`.
 `_` is a reserved token for discards, not a keyword.
 
 ### Keyword-led declarations and statements
@@ -951,11 +954,73 @@ functions.
 
 ### Mutable globals
 
-**Leaning.** Accessing a mutable global requires `unsafe` or a
-critical-section type, because interrupt handlers and threads share them.
-From Rust's `static mut` restrictions and embedded Rust's
-`critical_section::Mutex`. Moving a value to another thread is safe under
-value semantics.
+**Decided (2026-11-08).** A function lists the mutable globals it touches
+in its signature, with `uses`. Reading or writing a global is then safe,
+with no `unsafe` and no runtime cost.
+
+```
+var counter: u32 = 0
+
+fn bump() uses inout counter {
+    counter += 1
+}
+
+fn report() uses counter, inout log.out {
+    write(inout log.out, "{counter}")
+}
+```
+
+The problem it solves, even without threads: a callee can reach a global
+behind the caller's back, which breaks both local checks.
+
+```
+var buf: Buffer = ...
+
+fn reset() uses inout buf { clear(inout buf) }
+
+fn f() uses inout buf {
+    let v: []u8 = buf.data[0..4]
+    reset()          // error: reset writes buf while v is a live view of it
+    print(v)
+}
+```
+
+Without `uses`, `f` could not see that `reset` frees what `v` points
+into, and `bump(inout counter)` would alias if `bump` also wrote
+`counter` directly, making `noalias` wrong.
+
+Rules:
+
+- `uses g` lets a function read `g`. `uses inout g` lets it write `g`
+  too. A global acts like a hidden parameter with that mode.
+- A body may touch a global only if the signature lists it, and every call
+  in the body must be covered by the caller's own list. This is checked
+  from signatures alone.
+- At each call, the compiler compares the callee's list with the caller's
+  live views and `inout` arguments, the same exclusivity and view checks
+  as for parameters.
+- `let` globals cannot change and need no `uses`.
+- Global initializers are constant: literals, constructions and other
+  constants. Nothing runs before `main`, matching "no user code at
+  compile time".
+- A function with a `uses` list cannot become a `fn(...)` value, which
+  would hide its global access. Function types may carry `uses` later if
+  needed.
+
+Cost, accepted by the user: the list propagates. If a deep helper starts
+writing a global, every caller up the chain adds it, as with Java's
+checked exceptions. A global used everywhere, such as a logger, can be
+passed as an `inout` parameter instead.
+
+Rejected: Swift's dynamic exclusivity checks for globals. Shorter
+signatures, but a flag check per access and a rule invisible in review.
+Also rejected: the earlier leaning, which required `unsafe` for every
+access.
+
+**Open:** interrupt handlers. They preempt even on one core, so `uses`
+does not make a global safe to share with one. This belongs to the
+concurrency design, as does whether `unsafe` code may touch a global
+without listing it.
 
 ### Cleanup: `defer`
 
