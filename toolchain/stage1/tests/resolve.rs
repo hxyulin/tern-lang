@@ -6,8 +6,11 @@ use std::path::Path;
 
 use stage1::{package, resolve};
 
+mod common;
+
 /// Writes `files` (path, text) under a fresh directory named `test` and
-/// returns the resolver's messages in order.
+/// returns the resolver's messages in order. ternc's `check` must print
+/// what stage 1's prints for the same program.
 fn messages(test: &str, files: &[(&str, &str)]) -> Vec<String> {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("resolve")
@@ -21,6 +24,8 @@ fn messages(test: &str, files: &[(&str, &str)]) -> Vec<String> {
     let std_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/std");
     let program = package::load(&root, &std_dir);
     assert!(!program.has_errors(), "{}", program.render_errors());
+    let failures = common::check_differences(&root, &std_dir);
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     resolve::resolve(&program)
         .diagnostics
         .into_iter()
@@ -247,5 +252,22 @@ fn lib() {
     assert!(
         got[1].starts_with("`lib` is both imported and declared at "),
         "{got:?}"
+    );
+}
+
+#[test]
+fn qualified_names_need_a_package() {
+    let text = "type Point (x: i32)
+
+shared var count: u32 = 0
+
+fn f(_: Point.Inner) {
+    lock Point.count {
+    }
+}
+";
+    assert_eq!(
+        one("not_a_package", text),
+        ["`Point` is not a package", "`Point` is not a package"]
     );
 }

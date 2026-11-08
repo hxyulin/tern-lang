@@ -6,40 +6,23 @@
 //! corpus files. The parser runs on every tern file and every corpus case.
 //! Among the tern files, `tests/lex/malformed.tern` and
 //! `tests/parse/malformed.tern` trigger every lexer and parser error.
+//!
+//! `check` runs on every package directory here and on the loader's
+//! fixtures. The resolver's and checker's tests compare it on each
+//! program they write.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::OnceLock;
-
-use stage1::build::{Options, build};
 
 mod common;
-use common::corpus_cases;
-
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::{check_differences, corpus_cases, differences, repo};
 
 fn tmp() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
 
-/// ternc built plain and with `-O`, once for all tests.
-fn compilers() -> &'static [(PathBuf, &'static str); 2] {
-    static BUILT: OnceLock<[(PathBuf, &'static str); 2]> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        [(false, "plain"), (true, "-O")].map(|(optimize, label)| {
-            let out = tmp().join(if optimize { "ternc-O" } else { "ternc" });
-            let options = Options {
-                optimize,
-                ..Options::new(repo().join("toolchain/std"))
-            };
-            build(&repo().join("toolchain/ternc"), &out, &options)
-                .unwrap_or_else(|e| panic!("cannot build ternc ({label}):\n{e}"));
-            (out, label)
-        })
-    })
+fn stage1() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_ternc"))
 }
 
 /// Every `.tern` file under `dir`, skipping build output, npm packages and
@@ -71,40 +54,13 @@ fn corpus_files() -> Vec<PathBuf> {
     files
 }
 
-fn run(exe: &Path, command: &str, file: &Path) -> Output {
-    Command::new(exe)
-        .arg(command)
-        .arg(file)
-        .output()
-        .expect("can run")
-}
-
-fn same(a: &Output, b: &Output) -> bool {
-    a.stdout == b.stdout && a.stderr == b.stderr && a.status.code() == b.status.code()
-}
-
 /// Runs `command` with both compilers on every file and returns the
 /// differences.
 fn compare(command: &str, files: &[PathBuf]) -> Vec<String> {
-    let mut failures = Vec::new();
-    for (compiler, label) in compilers() {
-        for file in files {
-            let want = run(Path::new(env!("CARGO_BIN_EXE_ternc")), command, file);
-            let got = run(compiler, command, file);
-            if !same(&want, &got) {
-                failures.push(format!(
-                    "{} ({label}): exit {:?}, want {:?}\n--- stdout\n{}\n--- stderr\n{}\n--- want stderr\n{}",
-                    file.display(),
-                    got.status.code(),
-                    want.status.code(),
-                    String::from_utf8_lossy(&got.stdout),
-                    String::from_utf8_lossy(&got.stderr),
-                    String::from_utf8_lossy(&want.stderr),
-                ));
-            }
-        }
-    }
-    failures
+    files
+        .iter()
+        .flat_map(|file| differences(stage1(), &[command.as_ref(), file.as_os_str()]))
+        .collect()
 }
 
 #[test]
@@ -148,5 +104,39 @@ fn parser_matches_stage1() {
         "the malformed input is missing"
     );
     let failures = compare("parse", &files);
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Every directory under `dir` that holds a `.tern` file, skipping what
+/// `tern_files` skips.
+fn package_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut files = Vec::new();
+    tern_files(dir, &mut files);
+    for file in files {
+        let parent = file.parent().expect("a file has a directory").to_path_buf();
+        if !out.contains(&parent) {
+            out.push(parent);
+        }
+    }
+}
+
+#[test]
+fn checker_matches_stage1() {
+    let std_dir = repo().join("toolchain/std");
+    let mut failures = Vec::new();
+    for dir in ["examples", "toolchain/ternc"] {
+        let mut dirs = Vec::new();
+        package_dirs(&repo().join(dir), &mut dirs);
+        dirs.sort();
+        for d in dirs {
+            failures.extend(check_differences(&d, &std_dir));
+        }
+    }
+    let fixtures = repo().join("toolchain/stage1/tests/fixtures");
+    let fixture_std = fixtures.join("std");
+    for name in ["app", "bad", "cycle"] {
+        let d = fixtures.join(name);
+        failures.extend(check_differences(&d, &fixture_std));
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

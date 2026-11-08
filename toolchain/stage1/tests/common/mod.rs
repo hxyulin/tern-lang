@@ -2,6 +2,74 @@
 //! some of them.
 #![allow(dead_code)]
 
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::OnceLock;
+
+use stage1::build::{Options, build};
+
+pub fn repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// ternc, the compiler in tern, built plain and with `-O`, once per test
+/// binary. Each binary builds its own copy, so binaries can run at once.
+pub fn ternc_compilers() -> &'static [(PathBuf, &'static str); 2] {
+    static BUILT: OnceLock<[(PathBuf, &'static str); 2]> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("ternc-builds")
+            .join(env!("CARGO_CRATE_NAME"));
+        std::fs::create_dir_all(&dir).expect("can create the build directory");
+        [(false, "plain"), (true, "-O")].map(|(optimize, label)| {
+            let out = dir.join(if optimize { "ternc-O" } else { "ternc" });
+            let options = Options {
+                optimize,
+                ..Options::new(repo().join("toolchain/std"))
+            };
+            build(&repo().join("toolchain/ternc"), &out, &options)
+                .unwrap_or_else(|e| panic!("cannot build ternc ({label}):\n{e}"));
+            (out, label)
+        })
+    })
+}
+
+pub fn run<S: AsRef<OsStr>>(exe: &Path, args: &[S]) -> Output {
+    Command::new(exe).args(args).output().expect("can run")
+}
+
+pub fn same(a: &Output, b: &Output) -> bool {
+    a.stdout == b.stdout && a.stderr == b.stderr && a.status.code() == b.status.code()
+}
+
+/// Runs stage 1's ternc and both builds of ternc with `args`, and
+/// returns a description of each build whose output differs.
+pub fn differences<S: AsRef<OsStr>>(stage1: &Path, args: &[S]) -> Vec<String> {
+    let want = run(stage1, args);
+    let shown: Vec<String> = args
+        .iter()
+        .map(|a| a.as_ref().to_string_lossy().into_owned())
+        .collect();
+    let mut failures = Vec::new();
+    for (compiler, label) in ternc_compilers() {
+        let got = run(compiler, args);
+        if !same(&want, &got) {
+            failures.push(format!(
+                "ternc {} ({label}): exit {:?}, want {:?}\n--- stdout\n{}\n--- want stdout\n{}\n--- stderr\n{}\n--- want stderr\n{}",
+                shown.join(" "),
+                got.status.code(),
+                want.status.code(),
+                String::from_utf8_lossy(&got.stdout),
+                String::from_utf8_lossy(&want.stdout),
+                String::from_utf8_lossy(&got.stderr),
+                String::from_utf8_lossy(&want.stderr),
+            ));
+        }
+    }
+    failures
+}
+
 /// One test case from a tree-sitter corpus file.
 pub struct Case {
     pub name: String,
@@ -49,4 +117,18 @@ pub fn corpus_cases(text: &str) -> Vec<Case> {
         i = tree_end;
     }
     cases
+}
+
+/// The differences between stage 1's `ternc check root --std std_dir` and
+/// ternc's.
+pub fn check_differences(root: &Path, std_dir: &Path) -> Vec<String> {
+    differences(
+        Path::new(env!("CARGO_BIN_EXE_ternc")),
+        &[
+            OsStr::new("check"),
+            root.as_os_str(),
+            OsStr::new("--std"),
+            std_dir.as_os_str(),
+        ],
+    )
 }

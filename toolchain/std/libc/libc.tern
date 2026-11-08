@@ -13,6 +13,10 @@ pub extern fn close(fd: c.int) -> c.int
 pub extern fn read(fd: c.int, buf: *u8, n: c.size_t) -> c.ssize_t
 pub extern fn write(fd: c.int, buf: *u8, n: c.size_t) -> c.ssize_t
 
+pub extern fn opendir(path: *u8) -> ?*u8
+pub extern fn readdir(dir: *u8) -> ?*u8
+pub extern fn closedir(dir: *u8) -> c.int
+
 pub extern fn getenv(name: *u8) -> ?*u8
 pub extern fn strlen(s: *u8) -> c.size_t
 

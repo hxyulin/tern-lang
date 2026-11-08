@@ -1,0 +1,168 @@
+// Hash maps for the checker, one per key and value type, since tern has
+// no generics. Both use open addressing with linear probing and double
+// their table when it is half full. Nothing is ever removed.
+
+// A declaration: its file and its index in that file's declarations.
+pub type DeclRef (pub file: u32, pub index: u32)
+
+type NameSlot (used: bool, key: []u8, value: DeclRef)
+
+// Names to declarations. The keys are views the caller keeps alive.
+pub type NameMap (alloc: Allocator, slots: [..]NameSlot, count: usize)
+
+pub fn new_names(alloc: Allocator) -> NameMap {
+    return NameMap.(alloc: alloc, slots: make(alloc), count: 0)
+}
+
+fn hash_bytes(key: []u8) -> u64 {
+    // FNV-1a.
+    var h: u64 = 0xcbf29ce484222325
+    for let b: u8 in key {
+        h = wrapping_mul(h ^ u64.(b), 0x100000001b3)
+    }
+    return h
+}
+
+fn same_bytes(a: []u8, b: []u8) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for let i: usize in 0..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+pub fn get_name(m: NameMap, key: []u8) -> ?DeclRef {
+    if m.slots.len == 0 {
+        return none
+    }
+    let mask: u64 = u64.(m.slots.len) - 1
+    var at: u64 = hash_bytes(key) & mask
+    for {
+        let slot: NameSlot = m.slots[usize.(at)]
+        if !slot.used {
+            return none
+        }
+        if same_bytes(slot.key, key) {
+            return some.(value: slot.value)
+        }
+        at = (at + 1) & mask
+    }
+}
+
+// Adds key, or replaces its value.
+pub fn put_name(m: inout NameMap, key: []u8, value: DeclRef) -> ! OutOfMemory {
+    if (m.count + 1) * 2 > m.slots.len {
+        try grow_names(inout m)
+    }
+    let mask: u64 = u64.(m.slots.len) - 1
+    var at: u64 = hash_bytes(key) & mask
+    for {
+        let slot: NameSlot = m.slots[usize.(at)]
+        if !slot.used {
+            m.slots[usize.(at)] = NameSlot.(used: true, key: key, value: value)
+            m.count += 1
+            return ok
+        }
+        if same_bytes(slot.key, key) {
+            m.slots[usize.(at)].value = value
+            return ok
+        }
+        at = (at + 1) & mask
+    }
+}
+
+fn grow_names(m: inout NameMap) -> ! OutOfMemory {
+    var size: usize = m.slots.len * 2
+    if size < 16 {
+        size = 16
+    }
+    let old: [..]NameSlot = m.slots
+    m.slots = make(m.alloc)
+    let empty: NameSlot = NameSlot.(used: false, key: "", value: DeclRef.(file: 0, index: 0))
+    for let _: usize in 0..size {
+        try push(inout m.slots, empty)
+    }
+    m.count = 0
+    for let slot: NameSlot in old {
+        if slot.used {
+            try put_name(inout m, slot.key, slot.value)
+        }
+    }
+    return ok
+}
+
+type IntSlot (used: bool, key: u32, value: u32)
+
+// u32 keys to u32 values, such as a name's position to its local.
+pub type IntMap (alloc: Allocator, slots: [..]IntSlot, count: usize)
+
+pub fn new_ints(alloc: Allocator) -> IntMap {
+    return IntMap.(alloc: alloc, slots: make(alloc), count: 0)
+}
+
+fn hash_int(key: u32) -> u64 {
+    return wrapping_mul(u64.(key), 0x9e3779b97f4a7c15) >> 32
+}
+
+pub fn get_int(m: IntMap, key: u32) -> ?u32 {
+    if m.slots.len == 0 {
+        return none
+    }
+    let mask: u64 = u64.(m.slots.len) - 1
+    var at: u64 = hash_int(key) & mask
+    for {
+        let slot: IntSlot = m.slots[usize.(at)]
+        if !slot.used {
+            return none
+        }
+        if slot.key == key {
+            return some.(value: slot.value)
+        }
+        at = (at + 1) & mask
+    }
+}
+
+pub fn put_int(m: inout IntMap, key: u32, value: u32) -> ! OutOfMemory {
+    if (m.count + 1) * 2 > m.slots.len {
+        try grow_ints(inout m)
+    }
+    let mask: u64 = u64.(m.slots.len) - 1
+    var at: u64 = hash_int(key) & mask
+    for {
+        let slot: IntSlot = m.slots[usize.(at)]
+        if !slot.used {
+            m.slots[usize.(at)] = IntSlot.(used: true, key: key, value: value)
+            m.count += 1
+            return ok
+        }
+        if slot.key == key {
+            m.slots[usize.(at)].value = value
+            return ok
+        }
+        at = (at + 1) & mask
+    }
+}
+
+fn grow_ints(m: inout IntMap) -> ! OutOfMemory {
+    var size: usize = m.slots.len * 2
+    if size < 16 {
+        size = 16
+    }
+    let old: [..]IntSlot = m.slots
+    m.slots = make(m.alloc)
+    let empty: IntSlot = IntSlot.(used: false, key: 0, value: 0)
+    for let _: usize in 0..size {
+        try push(inout m.slots, empty)
+    }
+    m.count = 0
+    for let slot: IntSlot in old {
+        if slot.used {
+            try put_int(inout m, slot.key, slot.value)
+        }
+    }
+    return ok
+}

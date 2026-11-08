@@ -2005,6 +2005,14 @@ lexer and then the parser.
 - **Layout.** `main.tern` is the driver. The `syntax` package holds the
   tokens, the lexer, line lookup, the syntax tree and the parser. The
   `sexp` package prints a tree as stage 1's `ternc parse` does.
+  `program` loads a program's packages, `resolve` resolves names, and
+  `maps` holds the hash maps they use, one per key and value type.
+- **`ternc check DIR --std DIR`** reports what stage 1's `check` does.
+  It loads, resolves and checks the whole program in one `heap.Arena`.
+  Messages other than the lexer's and parser's are built as text with
+  `program.format_text`, since a checker message has too many shapes
+  for an enum. ternc takes `--std` always; it has no default location
+  for the standard library.
 - **Tested against stage 1.** `ternc lex FILE` prints what stage 1's
   `ternc lex FILE` prints, errors included. A stage 1 test builds ternc,
   plain and with `-O`, and requires identical stdout, stderr and exit
@@ -2023,6 +2031,11 @@ lexer and then the parser.
   before the arena, freeing the tree took one `free` per array. Rejected: nodes that own
   `[..]T` lists as stage 1's do, which makes freeing a walk over the
   tree.
+- **The checker is tested against stage 1 too.** Every program a
+  resolver or checker test writes is also run through both compilers'
+  `check`, which must print the same output, and so is every package
+  directory in `examples` and `toolchain/ternc` and the loader's
+  fixtures.
 - **The parser is tested like the lexer.** `ternc parse FILE` prints
   what stage 1's prints: the S-expression tree, or the diagnostics. The
   test compares the two on every tern file and every tree-sitter corpus
@@ -2034,7 +2047,11 @@ lexer and then the parser.
   `bad_digit(digit: u8, base: u32)`, and the driver turns it into text
   when it prints it.
 - **Std grows as needed.** The UTF-8 check added `std.utf8`, with
-  `valid_up_to`.
+  `valid_up_to`. The package loader added `std.fs`, whose `list` reads a
+  directory. It reads macOS's `struct dirent`, so ternc lists
+  directories only on macOS until tern has target-specific code (the
+  user chose to wait, 2026-11-09). Without errno, ternc reports an
+  unreadable root as `cannot read DIR`, with no reason.
 
 Friction found while porting the lexer, and what became of it:
 
@@ -2106,7 +2123,8 @@ Not in the first version. `[T]` is reserved for type arguments.
 - Nested functions (see Deferred).
 - The language's name.
 - Target-specific code. `errno` is the first need: a different C
-  function on macOS and Linux.
+  function on macOS and Linux. Reading a directory is the second:
+  `struct dirent` differs too.
 - An opt-in for a newtype's operators.
 - Writing through a view. The checker lets code write `v[i]` when the
   view itself is a `var` or an `inout` parameter, which is a guess:

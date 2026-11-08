@@ -1,0 +1,107 @@
+// Directories, on top of the C library.
+//
+// Reading a directory entry uses macOS's struct dirent. Linux lays it out
+// differently, which waits for a way to write target-specific code.
+
+import std.c
+import std.libc
+
+pub type Error enum {
+    open_failed
+    path_too_long
+    out_of_memory
+}
+
+pub fn describe(e: Error) -> []u8 {
+    return match e {
+        open_failed { "cannot open the directory" }
+        path_too_long { "the path is longer than 1023 bytes" }
+        out_of_memory { "out of memory" }
+    }
+}
+
+// One entry of a directory. A symbolic link is neither a file nor a
+// directory.
+pub type Entry (pub name: []u8, pub is_file: bool, pub is_dir: bool)
+
+let max_path: usize = 1024
+
+// struct dirent on macOS: d_ino, d_seekoff, d_reclen, d_namlen, d_type,
+// then the name.
+let namlen_at: usize = 18
+let type_at: usize = 20
+let name_at: usize = 21
+let dt_dir: u8 = 4
+let dt_reg: u8 = 8
+
+// The entries of the directory at path, without `.` and `..`, in the
+// order the system returns them. The names are allocated from alloc.
+pub fn list(alloc: Allocator, path: []u8) -> [..]Entry ! Error {
+    var buf: [max_path]u8 = fill[max_path](0)
+    if path.len >= buf.len {
+        return err.(error: Error.path_too_long)
+    }
+    for let i: usize in 0..path.len {
+        buf[i] = path[i]
+    }
+    // SAFETY: buf holds the path and then a 0 byte.
+    let opened: ?*u8 = unsafe { libc.opendir(&buf[0]) }
+    match opened {
+        none {
+            return err.(error: Error.open_failed)
+        }
+        some(value as dir: *u8) {
+            defer close_dir(dir)
+            return read_entries(alloc, dir)
+        }
+    }
+}
+
+fn close_dir(dir: *u8) {
+    // SAFETY: dir came from opendir and is closed once.
+    let _: c.int = unsafe { libc.closedir(dir) }
+}
+
+fn read_entries(alloc: Allocator, dir: *u8) -> [..]Entry ! Error {
+    var out: [..]Entry = make(alloc)
+    for {
+        // SAFETY: dir is open.
+        let next: ?*u8 = unsafe { libc.readdir(dir) }
+        match next {
+            none {
+                return ok.(value: out)
+            }
+            some(value as p: *u8) {
+                // SAFETY: readdir returns a struct dirent, which holds at
+                // least name_at bytes and then d_namlen bytes of name.
+                let head: []u8 = unsafe { from_pointer(p, name_at) }
+                let len: usize = usize.(head[namlen_at]) | (usize.(head[namlen_at + 1]) << 8)
+                let name: []u8 = unsafe { from_pointer(offset(p, name_at), len) }
+                match name {
+                    ".", ".." {
+                        continue
+                    }
+                    _ {
+                    }
+                }
+                var copied: [..]u8 = make(alloc)
+                match append(inout copied, name) {
+                    ok {
+                    }
+                    err(error: _) {
+                        return err.(error: Error.out_of_memory)
+                    }
+                }
+                let kind: u8 = head[type_at]
+                let entry: Entry = Entry.(name: copied, is_file: kind == dt_reg, is_dir: kind == dt_dir)
+                match push(inout out, entry) {
+                    ok {
+                    }
+                    err(error: _) {
+                        return err.(error: Error.out_of_memory)
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,17 +1,36 @@
-// ternc, the tern compiler, written in tern. So far it lexes and parses:
+// ternc, the tern compiler, written in tern. So far it lexes, parses and
+// checks:
 //
-//   ternc lex FILE      prints each token as stage 1 does
-//   ternc parse FILE    prints the syntax tree as stage 1 does
+//   ternc lex FILE               prints each token as stage 1 does
+//   ternc parse FILE             prints the syntax tree as stage 1 does
+//   ternc check DIR --std DIR    reports errors as stage 1 does
 
 import std.heap
 import std.io
 import std.os
+import program
+import resolve
 import sexp
 import std.utf8
 import syntax
 
 fn main() -> u8 {
     let args: [][]u8 = os.args()
+    if args.len == 5 {
+        match args[1] {
+            "check" {
+                match args[3] {
+                    "--std" {
+                        return check(args[2], args[4])
+                    }
+                    _ {
+                    }
+                }
+            }
+            _ {
+            }
+        }
+    }
     if args.len == 3 {
         match args[1] {
             "lex" {
@@ -24,8 +43,68 @@ fn main() -> u8 {
             }
         }
     }
-    io.eprint("usage: ternc lex FILE\n       ternc parse FILE\n")
+    io.eprint("usage: ternc lex FILE\n       ternc parse FILE\n       ternc check DIR --std DIR\n")
     return 2
+}
+
+// Loads the package in root and everything it imports, and reports
+// errors. So far that means parse, import and name errors.
+fn check(root: []u8, std_dir: []u8) -> u8 {
+    var arena: heap.Arena = heap.new_arena(heap.c_allocator)
+    defer heap.free_arena(inout arena)
+    match check_program(heap.arena_allocator(&arena), root, std_dir) {
+        ok(value as code: u8) {
+            return code
+        }
+        err(error: _) {
+            io.eprint("ternc: out of memory\n")
+            return 1
+        }
+    }
+}
+
+fn check_program(alloc: Allocator, root: []u8, std_dir: []u8) -> u8 ! OutOfMemory {
+    let p: program.Program = try program.load(alloc, root, std_dir)
+    if program.has_errors(p) {
+        render_program(p)
+        return ok.(value: 1)
+    }
+    let names: resolve.Resolution = try resolve.resolve(alloc, p)
+    if names.diagnostics.len > 0 {
+        render_diagnostics(p, names.diagnostics)
+        return ok.(value: 1)
+    }
+    io.print("{p.packages.len} packages, {p.files.len} files\n")
+    return ok.(value: 0)
+}
+
+// Every error, rendered with its source line where it has one.
+fn render_program(p: program.Program) {
+    for let e: []u8 in p.errors {
+        io.eprint("error: {e}\n")
+    }
+    render_diagnostics(p, p.diagnostics)
+}
+
+fn render_diagnostics(p: program.Program, diagnostics: []program.Diagnostic) {
+    for let diag: program.Diagnostic in diagnostics {
+        let f: program.File = p.files[usize.(diag.file)]
+        match diag.message {
+            lex(d: syntax.Diagnostic) {
+                render(f.path, f.text, f.starts, d)
+            }
+            parse(d: syntax.ParseDiagnostic) {
+                render_head(f.path, f.starts, d.start)
+                print_parse_problem(f.text, d)
+                render_tail(f.text, f.starts, d.start)
+            }
+            text(start: u32, message: []u8) {
+                render_head(f.path, f.starts, start)
+                io.eprint("{message}")
+                render_tail(f.text, f.starts, start)
+            }
+        }
+    }
 }
 
 type Command enum {
