@@ -1,0 +1,14 @@
+// Arithmetic overflow panics with a message and aborts.
+
+import std.io
+
+fn bump(x: u8) -> u8 {
+    return x + 100
+}
+
+fn main() -> u8 {
+    io.print("before\n")
+    let y: u8 = bump(200)
+    io.print("after {y}\n")
+    return 0
+}

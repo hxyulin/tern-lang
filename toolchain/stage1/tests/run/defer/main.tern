@@ -1,0 +1,31 @@
+// defer runs at the end of its block, in reverse order, on every exit.
+
+import std.io
+
+fn note(s: []u8) {
+    io.print("{s} ")
+}
+
+fn early(stop: bool) -> u32 {
+    defer note("outer")
+    if stop {
+        defer note("inner")
+        return 1
+    }
+    note("body")
+    return 2
+}
+
+fn main() -> u8 {
+    defer io.print("\n")
+    let _: u32 = early(true)
+    let _: u32 = early(false)
+    for let i: u32 in 0..3 {
+        defer note("end")
+        if i == 1 {
+            continue
+        }
+        note("loop")
+    }
+    return 0
+}

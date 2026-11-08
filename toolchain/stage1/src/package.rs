@@ -74,6 +74,26 @@ impl Program {
 /// Loads the package in `root` and everything it imports. Standard library
 /// packages are looked up in `std_dir`.
 pub fn load(root: &Path, std_dir: &Path) -> Program {
+    loader(root, std_dir).program
+}
+
+/// Loads a program for a hosted target: as [`load`], plus `std.rt`, the
+/// runtime with C's entry point, which every hosted program links.
+pub fn load_hosted(root: &Path, std_dir: &Path) -> Program {
+    let mut loader = loader(root, std_dir);
+    if !loader.program.has_errors() && !loader.by_path.contains_key("std.rt") {
+        let dir = std_dir.join("rt");
+        if let Err(e) = loader.read_package("std.rt".to_owned(), dir.clone()) {
+            loader
+                .program
+                .errors
+                .push(format!("cannot read {}: {e}", dir.display()));
+        }
+    }
+    loader.program
+}
+
+fn loader(root: &Path, std_dir: &Path) -> Loader {
     let mut loader = Loader {
         root: root.to_owned(),
         std_dir: std_dir.to_owned(),
@@ -92,7 +112,7 @@ pub fn load(root: &Path, std_dir: &Path) -> Program {
             .errors
             .push(format!("cannot read {}: {e}", root.display())),
     }
-    loader.program
+    loader
 }
 
 struct Loader {

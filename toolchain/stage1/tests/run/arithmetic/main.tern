@@ -1,0 +1,22 @@
+// Integer and float arithmetic, conversions and the built-in operations.
+
+import std.io
+
+fn main() -> u8 {
+    let a: i32 = 17
+    let b: i32 = -5
+    io.print("{a + b} {a - b} {a * b} {a / b} {a % b}\n")
+    let x: u32 = 0xF0
+    io.print("{x & 0x3C} {x | 1} {x ^ 0xFF} {x << 4} {x >> 4} {~x}\n")
+    let m: u8 = 200
+    io.print("{wrapping_add(m, 100)} {saturating_add(m, 100)} {saturating_sub(m, 250)}\n")
+    let n: i8 = -100
+    io.print("{saturating_sub(n, 100)} {saturating_add(n, -100)}\n")
+    io.print("{u64.(a)} {i64.(b)} {truncate[u8](a * 20)}\n")
+    let f: f64 = 2.5
+    let g: f64 = f * 4.0 - 1.0
+    io.print("{i32.(g)} {i32.(f64.(a) / 2.0)}\n")
+    let c: bool = (a > b && !(b > 0)) || false
+    io.print("{c} {a == 17} {b != -5} {a <= 17} {b >= 0}\n")
+    return 0
+}

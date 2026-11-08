@@ -1,7 +1,9 @@
 //! The bootstrap tern compiler.
 
 pub mod ast;
+pub mod build;
 pub mod check;
+pub mod codegen;
 pub mod diagnostic;
 pub mod lexer;
 pub mod package;

@@ -30,23 +30,31 @@ npm test
 ## Compiler
 
 [toolchain/](toolchain) is a Cargo workspace. `stage1` is the bootstrap
-compiler, written in Rust. So far it parses and checks; it does not
-generate code yet.
+compiler, written in Rust. It checks a program and compiles it through
+[keel](https://github.com/hxyulin/keel) for aarch64 macOS or x86-64
+Linux. Linking needs `clang` on the `PATH`.
 
 ```
 cd toolchain
 cargo test
-cargo run -- check ../examples/ini
-cargo run -- parse ../examples/uart/main.tern
+cargo run -- build ../examples/ini -o inicheck
+./inicheck settings.ini
+cargo run -- check ../examples/uart
 ```
 
-- `check DIR` loads the package in `DIR` and every package it imports,
-  and reports parse, import, name and type errors.
+- `build DIR` compiles the package in `DIR`, every package it imports
+  and the runtime into an executable. `-O` optimizes, `-S` writes
+  assembly and `--ir` writes keel's IR.
+- `check DIR` loads the same packages and reports parse, import, name and
+  type errors.
 - `parse FILE` prints the syntax tree in tree-sitter's S-expression form.
 
 The tests parse every program in `examples/`, compare the tree for every
 corpus input the grammar accepts with tree-sitter's, check that every
-input the grammar rejects gets an error, and type-check the examples.
+input the grammar rejects gets an error, type-check the examples, and
+build and run the programs in `toolchain/stage1/tests/run` and
+`examples/ini`, with and without optimization. `examples/uart` targets a
+microcontroller keel does not support, so it is only checked.
 
 [toolchain/std](toolchain/std) is the standard library, written in tern
 over the C library.

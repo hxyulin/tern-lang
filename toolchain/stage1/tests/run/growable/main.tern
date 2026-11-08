@@ -1,0 +1,52 @@
+// Growable arrays: make, push, append, views of them, and free.
+
+import std.heap
+import std.io
+
+fn sum(v: []u32) -> u32 {
+    var s: u32 = 0
+    for let x: u32 in v {
+        s += x
+    }
+    return s
+}
+
+fn build(alloc: Allocator, n: u32) -> [..]u32 ! OutOfMemory {
+    var out: [..]u32 = make(alloc)
+    for let i: u32 in 0..n {
+        match push(inout out, i * i) {
+            ok {
+            }
+            err(error: OutOfMemory) {
+                free(sink out)
+                return err.(error: error)
+            }
+        }
+    }
+    return ok.(value: out)
+}
+
+fn run() -> ! OutOfMemory {
+    var squares: [..]u32 = try build(heap.c_allocator, 100)
+    defer free(sink squares)
+    io.print("{squares.len} {sum(squares)} {squares[99]}\n")
+    var text: [..]u8 = make(heap.c_allocator)
+    defer free(sink text)
+    try append(inout text, "abc")
+    try append(inout text, "defgh")
+    try push(inout text, '!')
+    let view: []u8 = text
+    io.print("{view} {text.len} {view[2..5]}\n")
+    return ok
+}
+
+fn main() -> u8 {
+    match run() {
+        ok {
+            return 0
+        }
+        err(error: _) {
+            return 1
+        }
+    }
+}

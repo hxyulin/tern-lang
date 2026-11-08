@@ -3,5 +3,163 @@
 version = 4
 
 [[package]]
+name = "bumpalo"
+version = "3.20.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+
+[[package]]
+name = "cfg-if"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "crc32fast"
+version = "1.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f97d3416d5337d15c4b0d78c8c91df922ca143f57ec20e2d1c188333047ef04"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
+name = "equivalent"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
+name = "foldhash"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "hashbrown"
+version = "0.15.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
+dependencies = [
+ "foldhash",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "indexmap"
+version = "2.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
+dependencies = [
+ "equivalent",
+ "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "keel-asm"
+version = "0.1.0"
+source = "git+https://github.com/hxyulin/keel#b56275c5cddffa2e6449a33670882081f5379e16"
+dependencies = [
+ "bumpalo",
+ "keel-asm-ir",
+ "keel-util",
+ "memchr",
+ "object",
+ "smallvec",
+]
+
+[[package]]
+name = "keel-asm-ir"
+version = "0.1.0"
+source = "git+https://github.com/hxyulin/keel#b56275c5cddffa2e6449a33670882081f5379e16"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
+name = "keel-codegen"
+version = "0.1.0"
+source = "git+https://github.com/hxyulin/keel#b56275c5cddffa2e6449a33670882081f5379e16"
+dependencies = [
+ "keel-asm",
+ "keel-asm-ir",
+ "keel-ir",
+ "keel-util",
+ "profiling",
+]
+
+[[package]]
+name = "keel-frontend"
+version = "0.1.0"
+source = "git+https://github.com/hxyulin/keel#b56275c5cddffa2e6449a33670882081f5379e16"
+dependencies = [
+ "keel-ir",
+ "smallvec",
+]
+
+[[package]]
+name = "keel-ir"
+version = "0.1.0"
+source = "git+https://github.com/hxyulin/keel#b56275c5cddffa2e6449a33670882081f5379e16"
+dependencies = [
+ "keel-asm-ir",
+]
+
+[[package]]
+name = "keel-opt"
+version = "0.1.0"
+source = "git+https://github.com/hxyulin/keel#b56275c5cddffa2e6449a33670882081f5379e16"
+dependencies = [
+ "keel-ir",
+ "profiling",
+]
+
+[[package]]
+name = "keel-util"
+version = "0.1.0"
+source = "git+https://github.com/hxyulin/keel#b56275c5cddffa2e6449a33670882081f5379e16"
+
+[[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "object"
+version = "0.36.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "crc32fast",
+ "hashbrown 0.15.5",
+ "indexmap",
+ "memchr",
+]
+
+[[package]]
+name = "profiling"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+
+[[package]]
+name = "smallvec"
+version = "1.16.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
+
+[[package]]
 name = "stage1"
 version = "0.1.0"
+dependencies = [
+ "keel-codegen",
+ "keel-frontend",
+ "keel-ir",
+ "keel-opt",
+]

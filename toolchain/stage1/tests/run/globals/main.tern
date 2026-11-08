@@ -1,0 +1,33 @@
+// Constant globals, a mutable global, and a table of functions.
+
+import std.io
+
+type Op fn(i32, i32) -> i32
+
+fn add(a: i32, b: i32) -> i32 {
+    return a + b
+}
+
+fn mul(a: i32, b: i32) -> i32 {
+    return a * b
+}
+
+let ops: [2]Op = [add, mul]
+let base: u32 = 1 << 4
+let limit: u32 = base * 3 + 2
+let greeting: []u8 = "hi"
+let origin: (x: i32, y: i32) = (x: -1, y: 7)
+var calls: u32 = 0
+
+fn apply(op: Op, a: i32, b: i32) -> i32 {
+    calls += 1
+    return op(a, b)
+}
+
+fn main() -> u8 {
+    for let op: Op in ops {
+        io.print("{apply(op, 6, 7)} ")
+    }
+    io.print("\n{base} {limit} {greeting} {origin.x} {origin.y} {calls}\n")
+    return 3
+}

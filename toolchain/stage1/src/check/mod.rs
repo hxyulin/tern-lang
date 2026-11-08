@@ -31,6 +31,21 @@ use moves::{LoopFlow, Moved};
 pub struct Checked {
     pub types: Types,
     pub diagnostics: Vec<(FileId, Diagnostic)>,
+    /// What the checker found, per file, for code generation.
+    pub files: Vec<FileTypes>,
+    /// Each function's type.
+    pub fn_tys: HashMap<DeclRef, TyId>,
+}
+
+/// The checker's results for one file, indexed like its syntax tree.
+#[derive(Default)]
+pub struct FileTypes {
+    /// What each expression denotes, with its type.
+    pub exprs: Vec<Option<Item>>,
+    /// Each written type, lowered.
+    pub types: Vec<Option<TyId>>,
+    /// Each local's type.
+    pub locals: HashMap<LocalId, TyId>,
 }
 
 pub fn check(program: &Program, names: &Resolution) -> Checked {
@@ -41,6 +56,15 @@ pub fn check(program: &Program, names: &Resolution) -> Checked {
         fn_tys: HashMap::new(),
         move_only: HashMap::new(),
         diagnostics: Vec::new(),
+        files: program
+            .files
+            .iter()
+            .map(|f| FileTypes {
+                exprs: vec![None; f.ast.exprs.len()],
+                types: vec![None; f.ast.types.len()],
+                locals: HashMap::new(),
+            })
+            .collect(),
     };
     for (i, file) in program.files.iter().enumerate() {
         let file_id = FileId(u32::try_from(i).expect("few files"));
@@ -60,13 +84,15 @@ pub fn check(program: &Program, names: &Resolution) -> Checked {
     Checked {
         types: checker.types,
         diagnostics,
+        files: checker.files,
+        fn_tys: checker.fn_tys,
     }
 }
 
 /// What an expression denotes. Most are values; a few positions also
 /// accept a type, a built-in function or a variant to construct.
-#[derive(Clone, Copy)]
-enum Item {
+#[derive(Clone, Copy, Debug)]
+pub enum Item {
     Value(TyId),
     /// A call that returns nothing.
     Nothing,
@@ -163,6 +189,7 @@ struct Checker<'a> {
     /// Whether each type holds a `[..]T`, and so moves instead of copying.
     move_only: HashMap<TyId, bool>,
     diagnostics: Vec<(FileId, Diagnostic)>,
+    files: Vec<FileTypes>,
 }
 
 impl<'a> Checker<'a> {
@@ -182,6 +209,12 @@ impl<'a> Checker<'a> {
     // Types.
 
     fn lower(&mut self, file: FileId, id: TypeId) -> TyId {
+        let ty = self.lower_type(file, id);
+        self.files[file.0 as usize].types[id.index()] = Some(ty);
+        ty
+    }
+
+    fn lower_type(&mut self, file: FileId, id: TypeId) -> TyId {
         let ast = &self.program.file(file).ast;
         let kind = &ast.ty(id).kind;
         let ty = match kind {
@@ -728,6 +761,7 @@ impl<'a> Checker<'a> {
         let mut fx = Fx::new(file, ast);
         match kind {
             DeclKind::Fn(f) => {
+                self.decl_fn_ty(decl);
                 fx.result = f.result.map(|r| self.lower(file, r));
                 if let (Some(result), Some(ty)) = (fx.result, f.result) {
                     self.no_format(file, ast.ty(ty).span, result);
@@ -801,6 +835,7 @@ impl<'a> Checker<'a> {
             .get(&name.span.start)
         {
             let loop_depth = fx.loops.len();
+            self.files[fx.file.0 as usize].locals.insert(id, ty);
             fx.locals.insert(
                 id,
                 LocalInfo {
@@ -1449,6 +1484,12 @@ impl<'a> Checker<'a> {
     }
 
     fn expr(&mut self, fx: &mut Fx, e: ExprId, expected: Option<TyId>) -> Item {
+        let item = self.expr_item(fx, e, expected);
+        self.files[fx.file.0 as usize].exprs[e.index()] = Some(item);
+        item
+    }
+
+    fn expr_item(&mut self, fx: &mut Fx, e: ExprId, expected: Option<TyId>) -> Item {
         let span = fx.ast.expr(e).span;
         match &fx.ast.expr(e).kind {
             ExprKind::Name(name) => self.name(fx, e, *name, expected),
@@ -2661,6 +2702,16 @@ fn paren_inner(fx: &Fx, value: ExprId) -> ExprId {
         ExprKind::Paren(inner) => *inner,
         _ => value,
     }
+}
+
+/// The value of an integer literal, for code generation.
+pub fn parse_int_literal(text: &str) -> Option<i128> {
+    parse_int(text)
+}
+
+/// The code of a character literal, for code generation.
+pub fn char_literal(text: &str) -> Option<i128> {
+    char_value(text)
 }
 
 /// The value of an integer literal, or `None` if it does not fit in 128

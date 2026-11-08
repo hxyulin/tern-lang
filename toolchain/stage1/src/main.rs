@@ -10,13 +10,17 @@ use stage1::{check, lexer, package, parser, resolve, sexp};
 
 const USAGE: &str = "usage: ternc lex FILE
        ternc parse FILE
-       ternc check DIR [--std DIR]";
+       ternc check DIR [--std DIR]
+       ternc build DIR [-o OUT] [-O] [-S] [--ir] [--std DIR]";
 
 /// The standard library in this repository, for a compiler run from it.
 const DEFAULT_STD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../std");
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|c| c == "build") {
+        return build(&args[1..]);
+    }
     let (command, path) = match args.as_slice() {
         [command, root, rest @ ..] if command == "check" => {
             return match rest {
@@ -40,6 +44,59 @@ fn main() -> ExitCode {
         "lex" => lex(&file),
         "parse" => parse(&file),
         _ => usage(),
+    }
+}
+
+/// `ternc build DIR`: an executable named after the directory, or `-o`.
+fn build(args: &[String]) -> ExitCode {
+    let mut root: Option<&str> = None;
+    let mut out: Option<&str> = None;
+    let mut options = stage1::build::Options {
+        std_dir: DEFAULT_STD.into(),
+        optimize: false,
+        assembly_only: false,
+        ir_only: false,
+    };
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "-o" => out = rest.next().map(String::as_str),
+            "--std" => {
+                if let Some(dir) = rest.next() {
+                    options.std_dir = dir.into();
+                }
+            }
+            "-O" => options.optimize = true,
+            "-S" => options.assembly_only = true,
+            "--ir" => options.ir_only = true,
+            _ if root.is_none() => root = Some(arg),
+            _ => return usage(),
+        }
+    }
+    let Some(root) = root else {
+        return usage();
+    };
+    let root = Path::new(root);
+    let default_out = root
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "a.out".to_owned());
+    let default_out = if options.assembly_only {
+        format!("{default_out}.s")
+    } else {
+        default_out
+    };
+    let out = Path::new(out.unwrap_or(&default_out));
+    match stage1::build::build(root, out, &options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprint!("{message}");
+            if !message.ends_with('\n') {
+                eprintln!();
+            }
+            ExitCode::FAILURE
+        }
     }
 }
 

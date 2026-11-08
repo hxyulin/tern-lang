@@ -877,7 +877,11 @@ layout written down here, expressed as C:
 
 Symbols: a function's symbol is its package path and name,
 `std.io.open`. Without overloading or generics, no mangling is needed.
-The root package's path is its directory's name.
+The root package's path is its directory's name, and a package under the
+root adds its own path to that: `ini.ini.parse_line` for the `ini`
+package of a program in `ini/`. Without the prefix, a root named `ini`
+and its package `ini` would share symbols. The root's `main` is
+`tern_main`, and `@export` sets a symbol by hand.
 
 With this, std can ship as `libstd.a` or a shared library plus the export
 data that importers read, and any compiler that follows these rules can
@@ -1755,7 +1759,7 @@ proposal for the user to confirm.
 - Without user generics, one source function becomes about one backend
   function. The backend is keel (decided 2026-11-08): stage 1 takes it
   as a git dependency on https://github.com/hxyulin/keel, pinned to a
-  commit in `Cargo.lock`. The dependency is added with code generation.
+  commit in `Cargo.lock`, now `b56275c`.
 - The safety checks are local: bounds, null, use after `sink`, and
   exclusivity at each call site. Nothing crosses function boundaries.
 
@@ -1830,6 +1834,42 @@ not. The user agreed to each.
   from context, as a literal takes a newtype, and a value of a named
   function type can be called. Without this, `[2]Handler` could not
   hold functions.
+
+### Code generation
+
+**Decided (2026-11-08).** The user agreed to the plan:
+
+- **One keel module per program.** Every package, std included, is
+  lowered into one module, which keel compiles to one assembly file;
+  `clang` assembles it and links the C library. Keel cannot yet link
+  several of its modules. A hosted build always loads `std.rt`, the
+  runtime with C's `main`.
+- **Scalars are keel values; everything else is memory.** Integers,
+  `bool`, floats, pointers, function values, `?*T` and payload-free
+  enums are keel values. Records, tuples, views, arrays, `[..]T`, enums
+  with payloads, `?T`, `T ! E` and `Format` live in memory and are
+  handled through their address; copying one is a `memcpy`. Every local
+  has a stack slot, and keel's `stack_promote` pass moves scalars into
+  registers.
+- **The C calling convention, with the specified layouts.** A value in
+  memory is passed `byval` and returned through `sret`; an `inout`
+  argument is a pointer. The layouts stay Leaning: the user asked to
+  change them as development needs.
+- **Checks are inline.** Arithmetic uses keel's overflow instructions,
+  and indexing, slicing, division, shifts and conversions compare
+  first. A failed check builds a `PanicInfo` whose message carries the
+  values (`index 5 out of bounds for length 3`), calls the
+  `@panic_handler` (the program's own, or std.rt's), and calls `abort`.
+- **`[..]T` grows through one helper,** `tern.grow`, which calls the
+  array's allocator through its `alloc` or `resize` function value.
+- **`ternc build DIR`** writes an executable; `-O` runs keel's
+  optimizer, `-S` writes assembly and `--ir` keel's IR.
+
+Not lowered yet: `copy`, destructured globals, and `lock`, which runs
+its block without taking anything until a target defines what a lock
+does. A float converted to an integer saturates instead of panicking
+when it does not fit, and a panic inside the panic handler is not
+detected.
 
 ## Deferred
 

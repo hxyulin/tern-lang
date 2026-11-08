@@ -11,3 +11,9 @@ path = "src/main.rs"
 
 [lints]
 workspace = true
+
+[dependencies]
+keel-ir = { git = "https://github.com/hxyulin/keel" }
+keel-frontend = { git = "https://github.com/hxyulin/keel" }
+keel-opt = { git = "https://github.com/hxyulin/keel" }
+keel-codegen = { git = "https://github.com/hxyulin/keel" }

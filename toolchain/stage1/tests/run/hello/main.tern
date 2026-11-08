@@ -1,0 +1,18 @@
+// Formatting: text, integers, bool, views and a Format passed on.
+
+import std.io
+
+fn greet(f: Format) {
+    io.print("> {f}\n")
+}
+
+fn main() -> u8 {
+    let name: []u8 = "tern"
+    let small: i8 = -5
+    let big: u64 = 18446744073709551615
+    io.print("hello, {name}\n")
+    io.print("{small} {big} {true} {false}\n")
+    greet("nested {small}")
+    io.print("braces: \{ and }\n")
+    return 0
+}
