@@ -1602,7 +1602,9 @@ fn on_panic(info: PanicInfo) {
   them.
 - No user code runs at compile time.
 - Without user generics, one source function becomes about one backend
-  function. keel is the likely backend.
+  function. The backend is keel (decided 2026-11-08): stage 1 takes it
+  as a git dependency on https://github.com/hxyulin/keel, pinned to a
+  commit in `Cargo.lock`. The dependency is added with code generation.
 - The safety checks are local: bounds, null, use after `sink`, and
   exclusivity at each call site. Nothing crosses function boundaries.
 
