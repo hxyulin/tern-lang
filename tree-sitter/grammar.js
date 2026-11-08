@@ -1,12 +1,12 @@
 /**
- * Tree-sitter grammar for tern, part 1: declarations and bindings.
+ * Tree-sitter grammar for tern: the syntax designed so far.
  *
  * The grammar uses no `prec` and no `conflicts`, so a clean
  * `tree-sitter generate` shows it has no LR(1) conflicts. Keep it that
  * way: a conflict is a design question, not something to paper over.
  *
- * Expressions are a placeholder until part 2: names, number literals,
- * calls, field access, construction and tuple literals.
+ * Part 2 adds operators, number literal forms and compound assignment.
+ * String literals come later.
  */
 
 const commaSep1 = (rule) => seq(rule, repeat(seq(',', rule)), optional(','));
@@ -117,23 +117,138 @@ module.exports = grammar({
 
     return_statement: ($) => seq('return', optional(field('value', $._expression))),
 
+    // The left side is a postfix expression, so `a + b = c` does not
+    // parse. Compound assignment is a statement too, and there is no ++.
     assignment_statement: ($) =>
-      seq(field('left', $._expression), '=', field('right', $._expression)),
+      seq(
+        field('left', $._postfix),
+        field(
+          'operator',
+          choice('=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>='),
+        ),
+        field('right', $._expression),
+      ),
 
-    expression_statement: ($) => $._expression,
+    // Only a call can stand alone as a statement, as in Go.
+    expression_statement: ($) => $.call_expression,
 
-    // Expressions (placeholder until part 2)
+    // Expressions
+    //
+    // Operator groups form a partial order. Each group is a layer of
+    // nonterminals, so mixing unrelated groups without parentheses fails
+    // to parse. From loosest to tightest:
+    //
+    //   ||, &&            logical; the two do not mix
+    //   == != < <= > >=   comparison; non-associative
+    //   + -  above  * / %   arithmetic
+    //   & | ^, << >>      bitwise; never mixed with arithmetic or with a
+    //                     different bitwise operator
+    //   - ! ~             prefix
+    //   call . .( [ ]     postfix
 
-    _expression: ($) =>
+    _expression: ($) => choice($._comparison_level, $.and_expression, $.or_expression),
+
+    or_expression: ($) =>
+      seq(
+        field('left', choice($._comparison_level, $.or_expression)),
+        field('operator', '||'),
+        field('right', $._comparison_level),
+      ),
+
+    and_expression: ($) =>
+      seq(
+        field('left', choice($._comparison_level, $.and_expression)),
+        field('operator', '&&'),
+        field('right', $._comparison_level),
+      ),
+
+    _comparison_level: ($) => choice($._comparison_operand, $.comparison_expression),
+
+    comparison_expression: ($) =>
+      seq(
+        field('left', $._comparison_operand),
+        field('operator', choice('==', '!=', '<', '<=', '>', '>=')),
+        field('right', $._comparison_operand),
+      ),
+
+    _comparison_operand: ($) =>
+      choice(
+        $._additive_level,
+        $.bit_and_expression,
+        $.bit_or_expression,
+        $.bit_xor_expression,
+        $.shift_expression,
+      ),
+
+    _additive_level: ($) => choice($._multiplicative_level, $.additive_expression),
+
+    additive_expression: ($) =>
+      seq(
+        field('left', $._additive_level),
+        field('operator', choice('+', '-')),
+        field('right', $._multiplicative_level),
+      ),
+
+    _multiplicative_level: ($) => choice($._unary_level, $.multiplicative_expression),
+
+    multiplicative_expression: ($) =>
+      seq(
+        field('left', $._multiplicative_level),
+        field('operator', choice('*', '/', '%')),
+        field('right', $._unary_level),
+      ),
+
+    // a & b & c is allowed; a & b | c is not.
+    bit_and_expression: ($) =>
+      seq(
+        field('left', choice($._unary_level, $.bit_and_expression)),
+        field('operator', '&'),
+        field('right', $._unary_level),
+      ),
+
+    bit_or_expression: ($) =>
+      seq(
+        field('left', choice($._unary_level, $.bit_or_expression)),
+        field('operator', '|'),
+        field('right', $._unary_level),
+      ),
+
+    bit_xor_expression: ($) =>
+      seq(
+        field('left', choice($._unary_level, $.bit_xor_expression)),
+        field('operator', '^'),
+        field('right', $._unary_level),
+      ),
+
+    // Shifts do not chain: x << 1 << 2 is an error.
+    shift_expression: ($) =>
+      seq(
+        field('left', $._unary_level),
+        field('operator', choice('<<', '>>')),
+        field('right', $._unary_level),
+      ),
+
+    _unary_level: ($) => choice($._postfix, $.unary_expression),
+
+    unary_expression: ($) =>
+      seq(field('operator', choice('-', '!', '~')), field('operand', $._unary_level)),
+
+    _postfix: ($) =>
+      choice(
+        $._primary,
+        $.call_expression,
+        $.field_expression,
+        $.construct_expression,
+        $.index_expression,
+      ),
+
+    _primary: ($) =>
       choice(
         $.identifier,
         $.integer_literal,
         $.float_literal,
         $.parenthesized_expression,
         $.tuple_literal,
-        $.call_expression,
-        $.field_expression,
-        $.construct_expression,
       ),
 
     parenthesized_expression: ($) => seq('(', $._expression, ')'),
@@ -144,7 +259,7 @@ module.exports = grammar({
     tuple_field: ($) => seq(field('name', $.identifier), ':', field('value', $._expression)),
 
     call_expression: ($) =>
-      seq(field('function', $._expression), field('arguments', $.argument_list)),
+      seq(field('function', $._postfix), field('arguments', $.argument_list)),
 
     argument_list: ($) => seq('(', commaSep($.argument), ')'),
 
@@ -152,25 +267,32 @@ module.exports = grammar({
     argument: ($) => seq(optional('inout'), field('value', $._expression)),
 
     field_expression: ($) =>
-      seq(field('value', $._expression), '.', field('field', $.identifier)),
+      seq(field('value', $._postfix), '.', field('field', $.identifier)),
 
     // Point.(x: 1, y: 2), Celsius.(20.0). The checker requires the
     // prefix to name a type.
     construct_expression: ($) =>
       seq(
-        field('type', $._expression),
+        field('type', $._postfix),
         '.',
         field('value', choice($.tuple_literal, $.parenthesized_expression)),
       ),
+
+    // v[i]. Also type arguments to built-ins, as in truncate[u8](x); the
+    // checker tells them apart, as Go's does.
+    index_expression: ($) =>
+      seq(field('value', $._postfix), '[', field('index', $._expression), ']'),
 
     // Tokens
 
     // A lone `_` is the discard token, not an identifier.
     identifier: (_) => /[A-Za-z][A-Za-z0-9_]*|_[A-Za-z0-9_]+/,
 
-    integer_literal: (_) => /[0-9][0-9_]*/,
+    integer_literal: (_) =>
+      token(choice(/[0-9][0-9_]*/, /0x[0-9a-fA-F_]+/, /0b[01_]+/, /0o[0-7_]+/)),
 
-    float_literal: (_) => /[0-9][0-9_]*\.[0-9][0-9_]*/,
+    // Digits on both sides of the point: 1.0, not 1. or .5
+    float_literal: (_) => /[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9_]+)?/,
 
     line_comment: (_) => token(seq('//', /[^\n]*/)),
   },

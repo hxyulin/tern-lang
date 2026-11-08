@@ -1,0 +1,232 @@
+================================================================================
+Arithmetic precedence and associativity
+================================================================================
+
+fn f() {
+    x = a + b * c - d
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (assignment_statement
+        (identifier)
+        (additive_expression
+          (additive_expression
+            (identifier)
+            (multiplicative_expression
+              (identifier)
+              (identifier)))
+          (identifier))))))
+
+================================================================================
+Bitwise binds tighter than comparison
+================================================================================
+
+fn f() {
+    ok = flags & MASK == 0
+    m = a | b | c
+    s = (a & b) | c
+    h = x << 2
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (assignment_statement
+        (identifier)
+        (comparison_expression
+          (bit_and_expression
+            (identifier)
+            (identifier))
+          (integer_literal)))
+      (assignment_statement
+        (identifier)
+        (bit_or_expression
+          (bit_or_expression
+            (identifier)
+            (identifier))
+          (identifier)))
+      (assignment_statement
+        (identifier)
+        (bit_or_expression
+          (parenthesized_expression
+            (bit_and_expression
+              (identifier)
+              (identifier)))
+          (identifier)))
+      (assignment_statement
+        (identifier)
+        (shift_expression
+          (identifier)
+          (integer_literal))))))
+
+================================================================================
+Logical operators and prefix operators
+================================================================================
+
+fn f() {
+    ok = a < b && !done && -x >= ~y
+    any = p || q || (r && s)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (assignment_statement
+        (identifier)
+        (and_expression
+          (and_expression
+            (comparison_expression
+              (identifier)
+              (identifier))
+            (unary_expression
+              (identifier)))
+          (comparison_expression
+            (unary_expression
+              (identifier))
+            (unary_expression
+              (identifier)))))
+      (assignment_statement
+        (identifier)
+        (or_expression
+          (or_expression
+            (identifier)
+            (identifier))
+          (parenthesized_expression
+            (and_expression
+              (identifier)
+              (identifier))))))))
+
+================================================================================
+Postfix chains
+================================================================================
+
+fn f() {
+    v[i].x = g(v)[0]
+    let n: u8 = truncate[u8](x)
+    let p: Point = Point.(x: 1, y: 2)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (assignment_statement
+        (field_expression
+          (index_expression
+            (identifier)
+            (identifier))
+          (identifier))
+        (index_expression
+          (call_expression
+            (identifier)
+            (argument_list
+              (argument
+                (identifier))))
+          (integer_literal)))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (call_expression
+          (index_expression
+            (identifier)
+            (identifier))
+          (argument_list
+            (argument
+              (identifier)))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (construct_expression
+          (identifier)
+          (tuple_literal
+            (tuple_field
+              (identifier)
+              (integer_literal))
+            (tuple_field
+              (identifier)
+              (integer_literal))))))))
+
+================================================================================
+Number literals
+================================================================================
+
+fn f() {
+    a = 1_000_000
+    b = 0xFF_FF
+    c = 0b1010
+    d = 0o755
+    e = 1.5e-3
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (assignment_statement
+        (identifier)
+        (integer_literal))
+      (assignment_statement
+        (identifier)
+        (integer_literal))
+      (assignment_statement
+        (identifier)
+        (integer_literal))
+      (assignment_statement
+        (identifier)
+        (integer_literal))
+      (assignment_statement
+        (identifier)
+        (float_literal)))))
+
+================================================================================
+Compound assignment
+================================================================================
+
+fn f() {
+    total += x * 2
+    mask <<= 1
+    p.x -= 1
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (assignment_statement
+        (identifier)
+        (multiplicative_expression
+          (identifier)
+          (integer_literal)))
+      (assignment_statement
+        (identifier)
+        (integer_literal))
+      (assignment_statement
+        (field_expression
+          (identifier)
+          (identifier))
+        (integer_literal)))))

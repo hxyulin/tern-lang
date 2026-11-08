@@ -201,7 +201,90 @@ never a review topic.
 
 ### No implicit numeric conversions
 
-**Leaning.** From Go and Rust.
+**Decided (2026-11-08).** From Go and Rust. Numbers change type only
+through `T.(x)`, which is checked:
+
+- A conversion that cannot lose the value always succeeds:
+  `i64.(x)` with `x: i32`.
+- A narrowing conversion traps if the value does not fit.
+- Deliberate truncation uses a built-in, `truncate[u8](x)`.
+
+`T.(x)` never silently changes a value.
+
+### Number literals
+
+**Decided (2026-11-08).**
+
+- Decimal, `0x` hex, `0b` binary and `0o` octal integers, with `_`
+  between digits: `1_000_000`, `0xFF_FF`.
+- A float has digits on both sides of the point: `1.0` and `1.5e-3`, not
+  `1.` or `.5`.
+- No type suffixes such as Rust's `1u8`. A literal takes its type from
+  where it is used, and every binding states one. A literal that does not
+  fit, as in `let b: u8 = 300`, is a compile error.
+
+### Integer overflow
+
+**Decided (2026-11-08), syntax only.** Wrapping and saturating
+arithmetic use built-in functions such as `wrapping_add(a, b)`, not
+operators like Zig's `+%`. The operator set stays small and every intended
+wrap is visible.
+
+**Open:** what plain `+` does on overflow. The candidates are a trap in
+every build (Swift), a trap only in checked builds (Rust), or a setting per
+package. Division by zero and out-of-range shifts need the same answer.
+Embedded targets care about the cost of each check.
+
+## Expressions
+
+### Operator precedence as a partial order
+
+**Decided (2026-11-08).** Some operator groups have no order between
+them, so mixing them without parentheses is a syntax error. A reader never
+needs to remember the table for those pairs. From Carbon.
+
+| Group | Operators | Rule |
+| --- | --- | --- |
+| Postfix | call, `.field`, `.(...)`, `[i]` | Tightest |
+| Prefix | `-x`, `!x`, `~x` | |
+| Multiplicative | `*` `/` `%` | Above additive |
+| Additive | `+` `-` | |
+| Bitwise | `&` `\|` `^` `<<` `>>` | Never mixed with arithmetic or with a different bitwise operator. `&`, `\|` and `^` repeat; shifts do not chain. |
+| Comparison | `==` `!=` `<` `<=` `>` `>=` | Below arithmetic and bitwise. Non-associative. |
+| Logical | `&&` `\|\|` | Lowest. The two do not mix. |
+
+```
+a + b * c          // fine
+flags & MASK == 0  // fine: & binds tighter than ==, unlike C
+(a & b) | c        // fine
+a & b | c          // error
+x << 2 + 1         // error
+a < b < c          // error
+a && b || c        // error
+```
+
+The grammar has one layer of nonterminals per group, so it enforces these
+rules without precedence declarations.
+
+Logical operators are symbols, not the words `and`, `or` and `not`, which
+would add three keywords.
+
+### Statements built from expressions
+
+**Decided (2026-11-08).**
+
+- Assignment and compound assignment (`+=`, `<<=` and the rest) are
+  statements. No `++` or `--`.
+- The left side of an assignment is a postfix expression, so `a + b = c`
+  does not parse.
+- Only a call can stand alone as a statement, as in Go. `a + b` on its
+  own line is a syntax error.
+
+### Indexing and type arguments share `[ ]`
+
+`v[i]` and `truncate[u8](x)` parse the same way, and the checker tells
+them apart, as in Go. A highlighter cannot color a type argument
+differently without name resolution.
 
 ### Errors as values
 
