@@ -95,6 +95,7 @@ The running list. Each new keyword needs a reason.
 | `break`, `continue` | leave or restart the innermost loop |
 | `enum` | sum types and integer enums |
 | `match` | branch on a value, as a statement or an expression |
+| `try` | return early on `err` or `none` |
 
 Planned by earlier decisions: `unsafe`. `true` and `false` are predeclared
 names, not keywords, as in Go.
@@ -204,6 +205,7 @@ never a review topic.
 ### No null
 
 **Decided.** A built-in optional type instead. From Rust, Swift and Zig.
+See [Errors as values](#errors-as-values) for its spelling.
 
 ### No implicit numeric conversions
 
@@ -474,9 +476,50 @@ differently without name resolution.
 
 ### Errors as values
 
-**Leaning.** A built-in result type and one propagation operator, no
-exceptions. From Rust's `Result` and `?`, Zig's error unions and Go's
-error returns. The operator's spelling is open.
+**Decided (2026-11-08).** A built-in result type and one propagation
+operator, no exceptions. From Rust's `Result` and `?`, Zig's error unions
+and Go's error returns.
+
+Optional and result are built-in enums, so `match` handles them with no
+extra unwrapping syntax.
+
+| Type | Variants |
+| --- | --- |
+| `?T` | `some(value: T)`, `none` |
+| `T ! E` | `ok(value: T)`, `err(error: E)` |
+
+```
+fn read(f: inout File, buf: inout []u8) -> usize ! IoError { ... }
+
+fn copy(path: str) -> usize ! IoError {
+    var f: File = try open(path)
+    defer close(inout f)
+    let n: usize = try read(inout f, inout buf)
+    return ok.(value: n)
+}
+```
+
+- `E` can be any type, usually an enum.
+- A result type sits only at the top of a type, so `[]T ! E` is a result
+  holding a view. A view of results needs a named type. `T ! E ! F` does
+  not parse.
+- **Wrapping is explicit.** `return ok.(value: n)`, `return none`,
+  `return err.(error: e)`. The user chose this over Swift's and Zig's
+  implicit wrapping, keeping the no-implicit-conversion rule without
+  exceptions for now.
+- **`try`** is a prefix: `try read(...)` returns early with the `err`, or
+  with `none` for an optional. It sits at the start, where a reviewer
+  scans, unlike Rust's postfix `?`. It applies to its operand only:
+  `try read(...) + 1` adds to the unwrapped value.
+- The error type must match the function's exactly. No automatic
+  conversion like Rust's `From`; converting is an explicit `match`.
+
+**Leaning (2026-11-08):** a function that returns nothing but can fail
+is written `-> ! IoError`, and succeeds with a bare `return ok`. The
+language has no unit type, so there is no `T` to put before `!`.
+
+Rejected: `Result[T, E]` as a built-in generic. It uses the reserved
+`[T]` form but is longer in every signature.
 
 ### No user generics; built-in generic types
 
@@ -583,12 +626,12 @@ Rejected: `let (q: quot, r: rem) = ...` for renaming, because it reuses
 
 ### The `_` name
 
-**Leaning (2026-11-08).** Outside destructuring, `_` as a binding name
+**Decided (2026-11-08).** Outside destructuring, `_` as a binding name
 discards the value: `let _: u32 = f()`, or an unused parameter
 `fn handler(_: Event)`. A discard still shows its type.
 
-**Open:** whether ignoring a function's result without `let _` is an
-error, as in Zig.
+Ignoring any function result without `let _` is a compile error, as in
+Zig. Every dropped error is visible in review.
 
 ### Multiple return values
 
@@ -774,12 +817,14 @@ defer close(f)
 Forgetting a `defer` is not an error in the first version. An annotation
 or a warning for owning values that are never released may come later.
 
-**Leaning:** `defer` runs at the end of the enclosing block, as in Zig.
-Go runs it at function exit, so a `defer` inside a loop needs a runtime
-list of pending calls.
+**Decided (2026-11-08):** `defer` runs at the end of the enclosing
+block, as in Zig. Go runs it at function exit, so a `defer` inside a loop
+needs a runtime list of pending calls. `defer` takes one call; cleanup
+that needs several calls uses several `defer`s.
 
-**Open:** whether errors need a separate form that runs only on an error
-exit, like Zig's `errdefer`.
+**Deferred:** an error-only form like Zig's `errdefer`. It helps a
+function that builds something in steps and must undo them on failure,
+but it is a second cleanup form. It comes back if real code needs it.
 
 Rejected on 2026-11-08:
 
@@ -885,14 +930,13 @@ Not in the first version. `[T]` is reserved for type arguments.
 
 ## Open questions
 
-- `defer` scope, and whether an error-only form is needed.
-- Whether ignoring a function result without `let _` is an error.
+- Whether a fallible function with no value is `-> ! E` with a bare
+  `return ok`.
 - Function value syntax: the type of a function and how a function is
   passed. Everything beyond the syntax is deferred.
 - Spelling of the view source annotation (`-> str from haystack`).
 - What an interpolated string produces at runtime, which depends on the
   allocator model.
-- Spelling of the error propagation operator.
 - The allocator model, and whether a built-in map exists.
 - `static str`, and how long-lived structs refer to input.
 - Iterators and nested functions (see Deferred).

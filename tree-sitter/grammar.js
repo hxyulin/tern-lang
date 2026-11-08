@@ -53,6 +53,8 @@ module.exports = grammar({
       'continue',
       'enum',
       'match',
+      'try',
+      'defer',
     ],
   },
 
@@ -108,7 +110,19 @@ module.exports = grammar({
 
     // Types
 
-    _type: ($) => choice($.type_name, $.tuple_type, $.view_type, $.pointer_type),
+    // A result type sits at the top of a type only: `[]T ! E` is a
+    // result whose value is a view. A view of results needs a named type.
+    _type: ($) => choice($._simple_type, $.result_type),
+
+    _simple_type: ($) =>
+      choice($.type_name, $.tuple_type, $.view_type, $.pointer_type, $.optional_type),
+
+    // usize ! IoError. Without a value type, `! IoError` is a function
+    // that returns nothing but can fail.
+    result_type: ($) =>
+      seq(optional(field('value', $._simple_type)), '!', field('error', $._simple_type)),
+
+    optional_type: ($) => seq('?', field('value', $._simple_type)),
 
     type_name: ($) => $.identifier,
 
@@ -116,9 +130,9 @@ module.exports = grammar({
 
     tuple_type_field: ($) => seq(field('name', $.identifier), ':', field('type', $._type)),
 
-    view_type: ($) => seq('[', ']', field('element', $._type)),
+    view_type: ($) => seq('[', ']', field('element', $._simple_type)),
 
-    pointer_type: ($) => seq('*', field('pointee', $._type)),
+    pointer_type: ($) => seq('*', field('pointee', $._simple_type)),
 
     // Bindings
 
@@ -154,6 +168,7 @@ module.exports = grammar({
         $.for_statement,
         $.break_statement,
         $.continue_statement,
+        $.defer_statement,
         $.assignment_statement,
         $.expression_statement,
       ),
@@ -209,6 +224,9 @@ module.exports = grammar({
     // inclusive form.
     range: ($) => seq(field('start', $._additive_level), '..', field('end', $._additive_level)),
 
+    // Runs the call when the enclosing block ends.
+    defer_statement: ($) => seq('defer', field('call', $.call_expression)),
+
     break_statement: (_) => 'break',
 
     continue_statement: (_) => 'continue',
@@ -225,8 +243,9 @@ module.exports = grammar({
         field('right', $._expression),
       ),
 
-    // Only a call can stand alone as a statement, as in Go.
-    expression_statement: ($) => $.call_expression,
+    // Only a call can stand alone as a statement, as in Go, with or
+    // without try.
+    expression_statement: ($) => choice($.call_expression, $.try_expression),
 
     // Expressions
     //
@@ -352,7 +371,10 @@ module.exports = grammar({
         field('right', $._unary_level),
       ),
 
-    _unary_level: ($) => choice($._postfix, $.unary_expression),
+    _unary_level: ($) => choice($._postfix, $.unary_expression, $.try_expression),
+
+    // try read(inout f, inout buf). Returns early on err or none.
+    try_expression: ($) => seq('try', field('operand', $._unary_level)),
 
     unary_expression: ($) =>
       seq(field('operator', choice('-', '!', '~')), field('operand', $._unary_level)),

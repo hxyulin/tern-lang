@@ -1,4 +1,4 @@
-["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match"] @keyword
+["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer"] @keyword
 
 (break_statement) @keyword
 (continue_statement) @keyword
@@ -29,7 +29,7 @@
 
 [(line_comment) (block_comment)] @comment
 
-["+" "-" "*" "/" "%" "&" "|" "^" "<<" ">>" "~" "!" "&&" "||"
+["?" "+" "-" "*" "/" "%" "&" "|" "^" "<<" ">>" "~" "!" "&&" "||"
  "==" "!=" "<" "<=" ">" ">="
  "=" "+=" "-=" "*=" "/=" "%=" "&=" "|=" "^=" "<<=" ">>="] @operator
 

@@ -1,0 +1,268 @@
+================================================================================
+Optional and result types
+================================================================================
+
+fn find(v: []Point, x: i32) -> ?Point {
+    return none
+}
+
+fn read(f: inout File, buf: inout []u8) -> usize ! IoError {
+    return ok.(value: 0)
+}
+
+fn save(f: inout File) -> ! IoError {
+    return err.(error: IoError.full)
+}
+
+type Lookup (hit: ?u32, raw: []u8 ! ParseError)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (view_type
+          (type_name
+            (identifier))))
+      (parameter
+        (identifier)
+        (type_name
+          (identifier))))
+    (optional_type
+      (type_name
+        (identifier)))
+    (block
+      (return_statement
+        (identifier))))
+  (function_declaration
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (parameter_mode)
+        (type_name
+          (identifier)))
+      (parameter
+        (identifier)
+        (parameter_mode)
+        (view_type
+          (type_name
+            (identifier)))))
+    (result_type
+      (type_name
+        (identifier))
+      (type_name
+        (identifier)))
+    (block
+      (return_statement
+        (construct_expression
+          (identifier)
+          (tuple_literal
+            (tuple_field
+              (identifier)
+              (integer_literal)))))))
+  (function_declaration
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (parameter_mode)
+        (type_name
+          (identifier))))
+    (result_type
+      (type_name
+        (identifier)))
+    (block
+      (return_statement
+        (construct_expression
+          (identifier)
+          (tuple_literal
+            (tuple_field
+              (identifier)
+              (field_expression
+                (identifier)
+                (identifier))))))))
+  (type_declaration
+    (identifier)
+    (tuple_type
+      (tuple_type_field
+        (identifier)
+        (optional_type
+          (type_name
+            (identifier))))
+      (tuple_type_field
+        (identifier)
+        (result_type
+          (view_type
+            (type_name
+              (identifier)))
+          (type_name
+            (identifier)))))))
+
+================================================================================
+try and defer
+================================================================================
+
+fn copy(path: str) -> usize ! IoError {
+    var f: File = try open(path)
+    defer close(inout f)
+    try save(inout f)
+    let n: usize = try read(inout f, inout buf) + 1
+    return ok.(value: n)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (type_name
+          (identifier))))
+    (result_type
+      (type_name
+        (identifier))
+      (type_name
+        (identifier)))
+    (block
+      (var_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (try_expression
+          (call_expression
+            (identifier)
+            (argument_list
+              (argument
+                (identifier))))))
+      (defer_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (identifier)))))
+      (expression_statement
+        (try_expression
+          (call_expression
+            (identifier)
+            (argument_list
+              (argument
+                (identifier))))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (additive_expression
+          (try_expression
+            (call_expression
+              (identifier)
+              (argument_list
+                (argument
+                  (identifier))
+                (argument
+                  (identifier)))))
+          (integer_literal)))
+      (return_statement
+        (construct_expression
+          (identifier)
+          (tuple_literal
+            (tuple_field
+              (identifier)
+              (identifier))))))))
+
+================================================================================
+Matching optional and result values
+================================================================================
+
+fn f() {
+    let p: Point = match find(v, 3) {
+        some(value: Point) { value }
+        none { origin }
+    }
+    match read(inout f, inout buf) {
+        ok(value: usize) {
+            g(value)
+        }
+        err(error: IoError) {
+            report(error)
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (match_expression
+          (call_expression
+            (identifier)
+            (argument_list
+              (argument
+                (identifier))
+              (argument
+                (integer_literal))))
+          (match_expression_arm
+            (variant_pattern
+              (identifier)
+              (destructuring_pattern
+                (destructuring_field
+                  (identifier)
+                  (type_name
+                    (identifier)))))
+            (branch
+              (identifier)))
+          (match_expression_arm
+            (variant_pattern
+              (identifier))
+            (branch
+              (identifier)))))
+      (match_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (identifier))
+            (argument
+              (identifier))))
+        (match_arm
+          (variant_pattern
+            (identifier)
+            (destructuring_pattern
+              (destructuring_field
+                (identifier)
+                (type_name
+                  (identifier)))))
+          (block
+            (expression_statement
+              (call_expression
+                (identifier)
+                (argument_list
+                  (argument
+                    (identifier)))))))
+        (match_arm
+          (variant_pattern
+            (identifier)
+            (destructuring_pattern
+              (destructuring_field
+                (identifier)
+                (type_name
+                  (identifier)))))
+          (block
+            (expression_statement
+              (call_expression
+                (identifier)
+                (argument_list
+                  (argument
+                    (identifier)))))))))))
