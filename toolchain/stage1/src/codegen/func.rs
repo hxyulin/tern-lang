@@ -78,6 +78,8 @@ pub struct FnGen<'g, 'a> {
     joined: HashSet<Block>,
     /// The block where the next `match` arm's test starts.
     pending_next: Option<Block>,
+    /// The function's place in the module, taken when it starts.
+    index: usize,
 }
 
 impl Gen<'_> {
@@ -96,6 +98,7 @@ impl Gen<'_> {
             .collect();
         let ast = &self.program.file(decl.file).ast;
         let fn_name = self.text(decl.file, fn_decl.name.span);
+        let index = self.reserve_function();
         let mut fx = FnGen {
             g: self,
             f,
@@ -112,6 +115,7 @@ impl Gen<'_> {
             loops: Vec::new(),
             joined: HashSet::new(),
             pending_next: None,
+            index,
         };
         let mut next = usize::from(abi.sret);
         for (param, pass) in fn_decl.params.iter().zip(&abi.params) {
@@ -204,7 +208,21 @@ impl<'a> FnGen<'_, 'a> {
                 self.f.ins(InsertPoint::End(b)).trap();
             }
         }
-        self.g.module.functions.push(self.f);
+        self.g.module.functions[self.index] = self.f;
+    }
+
+    /// The address of a data object.
+    fn data_addr(&mut self, symbol: &str) -> Value {
+        self.g.reference_data(symbol);
+        let data = self.f.import_data(symbol);
+        self.ins().symbol_addr(Symbol::Data(data))
+    }
+
+    /// A function this one refers to, recorded for the module's
+    /// declarations.
+    fn import(&mut self, name: &str, sig: Signature) -> keel_ir::FuncRef {
+        self.g.reference(name, &sig);
+        self.f.import_function(name, sig)
     }
 
     fn iconst(&mut self, ty: Type, n: i64) -> Value {
@@ -262,9 +280,7 @@ impl<'a> FnGen<'_, 'a> {
         returns: &[Type],
         args: &[Value],
     ) -> Option<Value> {
-        let callee = self
-            .f
-            .import_function(name, Signature::new(params, returns));
+        let callee = self.import(name, Signature::new(params, returns));
         let inst = self.ins().call(callee, args);
         self.f.inst_results(inst).first().copied()
     }
@@ -934,7 +950,7 @@ impl<'a> FnGen<'_, 'a> {
         self.switch_to(compare, true);
         let ptr = self.ins().load(Type::Ptr, view);
         let symbol = self.g.string_symbol(bytes);
-        let lit = Gen::data_addr(&mut self.f, self.block, &symbol);
+        let lit = self.data_addr(&symbol);
         let diff = self
             .libc(
                 "memcmp",
@@ -1111,7 +1127,7 @@ impl<'a> FnGen<'_, 'a> {
 
     fn decl_addr(&mut self, decl: DeclRef) -> Value {
         let symbol = self.g.symbol(decl);
-        Gen::data_addr(&mut self.f, self.block, &symbol)
+        self.data_addr(&symbol)
     }
 
     /// The address of `value[i]`, after a bounds check, and the element
@@ -1302,7 +1318,7 @@ impl<'a> FnGen<'_, 'a> {
                          function value, whose records are passed by pointer"
                     ));
                 }
-                let callee = self.f.import_function(&symbol, abi.sig);
+                let callee = self.import(&symbol, abi.sig);
                 V::S(self.ins().symbol_addr(Symbol::Func(callee)))
             }
             _ => {
@@ -1983,7 +1999,7 @@ impl<'a> FnGen<'_, 'a> {
 
     fn string_view(&mut self, bytes: &[u8], ty: TyId) -> V {
         let symbol = self.g.string_symbol(bytes);
-        let ptr = Gen::data_addr(&mut self.f, self.block, &symbol);
+        let ptr = self.data_addr(&symbol);
         let len = self.usize_const(bytes.len() as u64);
         self.make_view(ty, ptr, len)
     }
@@ -2133,11 +2149,11 @@ impl<'a> FnGen<'_, 'a> {
             let site = self
                 .g
                 .panic_site(&path, self.fn_name, position.line, position.column);
-            let site = Gen::data_addr(&mut self.f, self.block, &site);
+            let site = self.data_addr(&site);
             args.push(site);
             let params = panic_helper_params(message.as_deref());
             let name = self.panic_helper(message);
-            let callee = self.f.import_function(&name, Signature::new(&params, &[]));
+            let callee = self.import(&name, Signature::new(&params, &[]));
             self.ins().call(callee, &args);
         } else {
             self.libc("abort", &[], &[], &[]);
@@ -2160,6 +2176,7 @@ impl<'a> FnGen<'_, 'a> {
         f.attrs.noinline = true;
         f.attrs.noreturn = true;
         let entry = f.create_block();
+        let index = self.g.reserve_function();
         let values: Vec<Value> = params
             .iter()
             .map(|t| f.append_block_param(entry, *t))
@@ -2180,6 +2197,7 @@ impl<'a> FnGen<'_, 'a> {
             loops: Vec::new(),
             joined: HashSet::new(),
             pending_next: None,
+            index,
         };
         let (&site, values) = values.split_last().expect("the site is a parameter");
         let format_ty = fx.g.types.named_ty(NamedId::Builtin(BuiltinNamed::Format));
@@ -2326,7 +2344,7 @@ impl<'a> FnGen<'_, 'a> {
 
     fn direct_call(&mut self, symbol: &str, abi: &super::FnAbi, args: Vec<CallArg>) -> V {
         let (values, out) = self.lower_args(abi, args);
-        let callee = self.f.import_function(symbol, abi.sig.clone());
+        let callee = self.import(symbol, abi.sig.clone());
         let inst = self.ins().call(callee, &values);
         self.call_result(inst, out)
     }
@@ -2448,7 +2466,7 @@ impl<'a> FnGen<'_, 'a> {
                 let align = self.usize_const(l.align);
                 let grow = self.g.grow_symbol();
                 let grow_sig = super::grow_signature();
-                let callee = self.f.import_function(&grow, grow_sig);
+                let callee = self.import(&grow, grow_sig);
                 let inst = self.ins().call(callee, &[v, size, align, needed]);
                 let grown = self.f.first_result(inst);
                 self.brif(grown, stored, failed);
@@ -2712,7 +2730,7 @@ impl<'a> FnGen<'_, 'a> {
                     _ => Vec::new(),
                 };
                 let symbol = self.g.string_symbol(&bytes);
-                V::S(Gen::data_addr(&mut self.f, self.block, &symbol))
+                V::S(self.data_addr(&symbol))
             }
             "volatile_load" => {
                 let p = self.expr(arg(0));

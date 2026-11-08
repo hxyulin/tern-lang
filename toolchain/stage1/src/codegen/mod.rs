@@ -15,11 +15,11 @@ mod data;
 mod func;
 mod layout;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use keel_ir::{
     AbiParam, ArgExt, DataInit, DataItem, DataObject, Function, InsertPoint, IntCC, Module,
-    Purpose, Signature, Symbol, Type,
+    Purpose, Signature, Type,
 };
 
 use crate::ast::{Attribute, DeclKind, Mode};
@@ -61,9 +61,11 @@ pub fn generate(program: &Program, names: &Resolution, checked: Checked) -> Resu
         grow: None,
         panic_helpers: HashMap::new(),
         panic_sites: 0,
+        references: Vec::new(),
+        referenced: HashSet::new(),
+        data_names: HashSet::new(),
         errors: Vec::new(),
     };
-    g.module.decls.clear();
     // The symbols code outside the program may refer to.
     let mut exported: Vec<String> = Vec::new();
     for (i, file) in program.files.iter().enumerate() {
@@ -83,31 +85,20 @@ pub fn generate(program: &Program, names: &Resolution, checked: Checked) -> Resu
                 DeclKind::Global { .. } => g.global(decl),
                 DeclKind::ExternVar { .. } => {
                     let name = g.symbol(decl);
-                    g.module.data.push(DataObject {
-                        name,
-                        ..DataObject::default()
-                    });
+                    g.reference_data(&name);
                 }
                 DeclKind::ExternFn { .. } | DeclKind::Type { .. } => {}
             }
         }
     }
-    // A name both declared and defined, such as `tern_main`, is defined;
-    // every other function called is declared, as C's are.
-    let defined: Vec<String> = g.module.functions.iter().map(|f| f.name.clone()).collect();
-    g.module.decls.retain(|d| !defined.contains(&d.name));
-    let mut called: Vec<keel_ir::FuncDecl> = Vec::new();
-    for f in &g.module.functions {
-        for (_, callee) in f.callees() {
-            let known = defined.contains(&callee.name)
-                || g.module.decls.iter().any(|d| d.name == callee.name)
-                || called.iter().any(|d| d.name == callee.name);
-            if !known {
-                called.push(callee.clone());
-            }
-        }
-    }
-    g.module.decls.extend(called);
+    // Every function referred to but not defined is declared, in the order
+    // of the first reference, as keel's C API declares them. A name both
+    // declared and defined, such as `tern_main`, is defined.
+    let defined: HashSet<String> = g.module.functions.iter().map(|f| f.name.clone()).collect();
+    g.module.decls = std::mem::take(&mut g.references)
+        .into_iter()
+        .filter(|d| !defined.contains(&d.name))
+        .collect();
     // The module is the whole program, so everything not exported is
     // local to it, which lets keel inline it.
     keel_ir::internalize(&mut g.module, |name| exported.iter().any(|e| e == name));
@@ -136,6 +127,11 @@ pub struct Gen<'a> {
     panic_helpers: HashMap<Option<Vec<MessagePart>>, String>,
     /// How many panic sites have their `PanicInfo` in data.
     panic_sites: usize,
+    /// Every function referred to, in the order of the first reference.
+    references: Vec<keel_ir::FuncDecl>,
+    referenced: HashSet<String>,
+    /// The names of the module's data objects.
+    data_names: HashSet<String>,
     errors: Vec<Error>,
 }
 
@@ -344,7 +340,7 @@ impl<'a> Gen<'a> {
         let name = format!("tern.str.{}", self.strings.len());
         let mut with_nul = bytes.to_vec();
         with_nul.push(0);
-        self.module.data.push(DataObject {
+        self.add_data(DataObject {
             name: name.clone(),
             local: true,
             init: Some(DataInit {
@@ -509,7 +505,7 @@ impl<'a> Gen<'a> {
         }
         let name = format!("tern.panic_site.{}", self.panic_sites);
         self.panic_sites += 1;
-        self.module.data.push(DataObject {
+        self.add_data(DataObject {
             name: name.clone(),
             local: true,
             init: Some(DataInit {
@@ -522,11 +518,25 @@ impl<'a> Gen<'a> {
         name
     }
 
-    /// The address of a global's data object.
-    pub fn data_addr(func: &mut Function, block: keel_ir::Block, symbol: &str) -> keel_ir::Value {
-        let data = func.import_data(symbol);
-        func.ins(InsertPoint::End(block))
-            .symbol_addr(Symbol::Data(data))
+    /// A data object that code refers to. Until it is defined, it is
+    /// declared where it was first referred to, as keel's C API places it.
+    pub fn reference_data(&mut self, name: &str) {
+        if self.data_names.insert(name.to_owned()) {
+            self.module.data.push(DataObject {
+                name: name.to_owned(),
+                ..DataObject::default()
+            });
+        }
+    }
+
+    /// Defines a data object, in the place of its declaration if code
+    /// referred to it first.
+    pub fn add_data(&mut self, object: DataObject) {
+        if self.data_names.insert(object.name.clone()) {
+            self.module.data.push(object);
+        } else if let Some(slot) = self.module.data.iter_mut().find(|d| d.name == object.name) {
+            *slot = object;
+        }
     }
 
     /// `std.fmt.Part`, if the program uses std.fmt.
@@ -565,6 +575,27 @@ impl<'a> Gen<'a> {
             }
         }
         found
+    }
+
+    /// Takes the next place among the module's functions for a function
+    /// being built, so functions keep the order they were started in, as
+    /// keel's C API orders them.
+    pub fn reserve_function(&mut self) -> usize {
+        self.module
+            .functions
+            .push(Function::new(String::new(), Signature::new(&[], &[])));
+        self.module.functions.len() - 1
+    }
+
+    /// Records a reference to the function `name`.
+    pub fn reference(&mut self, name: &str, sig: &Signature) {
+        if self.referenced.insert(name.to_owned()) {
+            self.references.push(keel_ir::FuncDecl {
+                name: name.to_owned(),
+                sig: sig.clone(),
+                attrs: keel_ir::function::FunctionAttrs::default(),
+            });
+        }
     }
 
     fn unsupported(&mut self, what: impl Into<String>) {

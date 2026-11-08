@@ -1,7 +1,7 @@
 //! Globals: each initializer is a constant, evaluated here into bytes and
 //! the addresses the linker fills in.
 
-use keel_ir::{DataInit, DataItem, DataObject, FuncDecl};
+use keel_ir::{DataInit, DataItem, DataObject};
 
 use super::Gen;
 use super::layout::{EnumKind, type_size};
@@ -36,7 +36,7 @@ impl Gen<'_> {
         self.constant(decl.file, local.value, ty, &mut bytes, 0);
         let name = self.symbol(decl);
         let items = items(bytes);
-        self.module.data.push(DataObject {
+        self.add_data(DataObject {
             name,
             init: Some(DataInit {
                 constant: !local.mutable,
@@ -275,19 +275,9 @@ impl Gen<'_> {
 
     /// A function a global points to must be declared in the module.
     fn declare_for_data(&mut self, decl: DeclRef) {
-        if !matches!(self.decl_kind(decl), DeclKind::ExternFn { .. }) {
-            return;
-        }
         let name = self.symbol(decl);
-        if self.module.decls.iter().any(|d| d.name == name) {
-            return;
-        }
         let sig = self.decl_abi(decl).sig;
-        self.module.decls.push(FuncDecl {
-            attrs: keel_ir::function::FunctionAttrs::default(),
-            name,
-            sig,
-        });
+        self.reference(&name, &sig);
     }
 
     /// The value of an integer constant, before it is cut to its type.
