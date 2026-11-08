@@ -1,0 +1,265 @@
+================================================================================
+Enum with payloads
+================================================================================
+
+type Shape enum {
+    circle(radius: f32)
+    rect(w: f32, h: f32)
+    empty
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_declaration
+    (identifier)
+    (enum_type
+      (variant
+        (identifier)
+        (tuple_type
+          (tuple_type_field
+            (identifier)
+            (type_name
+              (identifier)))))
+      (variant
+        (identifier)
+        (tuple_type
+          (tuple_type_field
+            (identifier)
+            (type_name
+              (identifier)))
+          (tuple_type_field
+            (identifier)
+            (type_name
+              (identifier)))))
+      (variant
+        (identifier)))))
+
+================================================================================
+Closed and open integer enums
+================================================================================
+
+type Irq enum u8 { timer = 0; uart = 3 }
+
+type Opcode enum u8 {
+    nop = 0
+    halt = 1
+    _
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_declaration
+    (identifier)
+    (enum_type
+      (type_name
+        (identifier))
+      (variant
+        (identifier)
+        (integer_literal))
+      (variant
+        (identifier)
+        (integer_literal))))
+  (type_declaration
+    (identifier)
+    (enum_type
+      (type_name
+        (identifier))
+      (variant
+        (identifier)
+        (integer_literal))
+      (variant
+        (identifier)
+        (integer_literal))
+      (discard))))
+
+================================================================================
+Constructing variants
+================================================================================
+
+fn f() {
+    let s: Shape = Shape.circle.(radius: 1.0)
+    let e: Shape = Shape.empty
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (construct_expression
+          (field_expression
+            (identifier)
+            (identifier))
+          (tuple_literal
+            (tuple_field
+              (identifier)
+              (float_literal)))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (field_expression
+          (identifier)
+          (identifier))))))
+
+================================================================================
+Match statement
+================================================================================
+
+fn f() {
+    match s {
+        circle(radius: f32) {
+            draw_circle(radius)
+        }
+        rect(w: f32, h: _) {
+            g(w)
+        }
+        _ {
+            return
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (match_statement
+        (identifier)
+        (match_arm
+          (variant_pattern
+            (identifier)
+            (destructuring_pattern
+              (destructuring_field
+                (identifier)
+                (type_name
+                  (identifier)))))
+          (block
+            (expression_statement
+              (call_expression
+                (identifier)
+                (argument_list
+                  (argument
+                    (identifier)))))))
+        (match_arm
+          (variant_pattern
+            (identifier)
+            (destructuring_pattern
+              (destructuring_field
+                (identifier)
+                (type_name
+                  (identifier)))
+              (destructuring_field
+                (identifier)
+                (discard))))
+          (block
+            (expression_statement
+              (call_expression
+                (identifier)
+                (argument_list
+                  (argument
+                    (identifier)))))))
+        (match_arm
+          (discard)
+          (block
+            (return_statement)))))))
+
+================================================================================
+Match expression with literal patterns
+================================================================================
+
+fn f() {
+    let area: f32 = match s {
+        circle(radius: f32) { pi * radius * radius }
+        rect(w: f32, h: f32) { w * h }
+        empty { 0.0 }
+    }
+    let name: str = match code { 0 { "ok" }; -1 { "failed" }; 'x' { "exit" }; _ { "other" } }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (match_expression
+          (identifier)
+          (match_expression_arm
+            (variant_pattern
+              (identifier)
+              (destructuring_pattern
+                (destructuring_field
+                  (identifier)
+                  (type_name
+                    (identifier)))))
+            (branch
+              (multiplicative_expression
+                (multiplicative_expression
+                  (identifier)
+                  (identifier))
+                (identifier))))
+          (match_expression_arm
+            (variant_pattern
+              (identifier)
+              (destructuring_pattern
+                (destructuring_field
+                  (identifier)
+                  (type_name
+                    (identifier)))
+                (destructuring_field
+                  (identifier)
+                  (type_name
+                    (identifier)))))
+            (branch
+              (multiplicative_expression
+                (identifier)
+                (identifier))))
+          (match_expression_arm
+            (variant_pattern
+              (identifier))
+            (branch
+              (float_literal)))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (match_expression
+          (identifier)
+          (match_expression_arm
+            (integer_literal)
+            (branch
+              (string_literal
+                (string_content))))
+          (match_expression_arm
+            (negative_literal
+              (integer_literal))
+            (branch
+              (string_literal
+                (string_content))))
+          (match_expression_arm
+            (char_literal)
+            (branch
+              (string_literal
+                (string_content))))
+          (match_expression_arm
+            (discard)
+            (branch
+              (string_literal
+                (string_content)))))))))

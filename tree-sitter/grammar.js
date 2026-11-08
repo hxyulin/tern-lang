@@ -12,6 +12,11 @@
 const commaSep1 = (rule) => seq(rule, repeat(seq(',', rule)), optional(','));
 const commaSep = (rule) => optional(commaSep1(rule));
 
+// Braces hold items separated by line ends or `;`. Parentheses hold items
+// separated by commas.
+const lines = ($, rule) =>
+  optional(seq(rule, repeat(seq($._terminator, rule)), optional($._terminator)));
+
 module.exports = grammar({
   name: 'tern',
 
@@ -46,19 +51,19 @@ module.exports = grammar({
       'in',
       'break',
       'continue',
+      'enum',
+      'match',
     ],
   },
 
   rules: {
-    source_file: ($) => optional($._declarations),
-
-    _declarations: ($) =>
-      seq($._declaration, repeat(seq($._terminator, $._declaration)), optional($._terminator)),
+    source_file: ($) => lines($, $._declaration),
 
     _declaration: ($) =>
       choice($.function_declaration, $.type_declaration, $.let_declaration, $.var_declaration),
 
     _terminator: ($) => choice(';', $._automatic_semicolon),
+
 
     // fn name(params) -> Result { ... }
     function_declaration: ($) =>
@@ -82,8 +87,24 @@ module.exports = grammar({
 
     parameter_mode: (_) => choice('inout', 'sink'),
 
-    // type Name T
-    type_declaration: ($) => seq('type', field('name', $.identifier), field('type', $._type)),
+    // type Name T. An enum appears only here, so every enum has a name.
+    type_declaration: ($) =>
+      seq('type', field('name', $.identifier), field('type', choice($._type, $.enum_type))),
+
+    // enum { circle(radius: f32); empty }, enum u8 { nop = 0; halt = 1; _ }
+    // A trailing `_` makes the enum open: every value of the integer type
+    // is valid.
+    enum_type: ($) =>
+      seq('enum', optional(field('integer_type', $.type_name)), '{', lines($, $._enum_item), '}'),
+
+    _enum_item: ($) => choice($.variant, $.discard),
+
+    variant: ($) =>
+      seq(
+        field('name', $.identifier),
+        optional(field('payload', $.tuple_type)),
+        optional(seq('=', field('value', $._expression))),
+      ),
 
     // Types
 
@@ -121,10 +142,7 @@ module.exports = grammar({
 
     // Statements
 
-    block: ($) => seq('{', optional($._statements), '}'),
-
-    _statements: ($) =>
-      seq($._statement, repeat(seq($._terminator, $._statement)), optional($._terminator)),
+    block: ($) => seq('{', lines($, $._statement), '}'),
 
     _statement: ($) =>
       choice(
@@ -132,6 +150,7 @@ module.exports = grammar({
         $.var_declaration,
         $.return_statement,
         $.if_statement,
+        $.match_statement,
         $.for_statement,
         $.break_statement,
         $.continue_statement,
@@ -149,6 +168,27 @@ module.exports = grammar({
         field('consequence', $.block),
         optional(seq('else', field('alternative', choice($.block, $.if_statement)))),
       ),
+
+    match_statement: ($) =>
+      seq('match', field('value', $._expression), '{', lines($, $.match_arm), '}'),
+
+    match_arm: ($) => seq(field('pattern', $._pattern), field('body', $.block)),
+
+    // A bare name is a variant, never a new binding.
+    _pattern: ($) =>
+      choice(
+        $.variant_pattern,
+        $.integer_literal,
+        $.negative_literal,
+        $.char_literal,
+        $.string_literal,
+        $.discard,
+      ),
+
+    variant_pattern: ($) =>
+      seq(field('name', $.identifier), optional(field('payload', $.destructuring_pattern))),
+
+    negative_literal: ($) => seq('-', $.integer_literal),
 
     // for { }, for cond { }, for let x: T in xs { }, for let i: u32 in 0..n { }
     for_statement: ($) =>
@@ -205,7 +245,19 @@ module.exports = grammar({
     // An if expression sits at the top level only, so it is never an
     // operand: `1 + if c { a } else { b }` does not parse.
     _expression: ($) =>
-      choice($._comparison_level, $.and_expression, $.or_expression, $.if_expression),
+      choice(
+        $._comparison_level,
+        $.and_expression,
+        $.or_expression,
+        $.if_expression,
+        $.match_expression,
+      ),
+
+    // Each arm is one expression, as in an if expression.
+    match_expression: ($) =>
+      seq('match', field('value', $._expression), '{', lines($, $.match_expression_arm), '}'),
+
+    match_expression_arm: ($) => seq(field('pattern', $._pattern), field('body', $.branch)),
 
     // let x: i32 = if c { a } else { b }. The else is required and each
     // branch is one expression.

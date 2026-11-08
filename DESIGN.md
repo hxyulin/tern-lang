@@ -93,6 +93,8 @@ The running list. Each new keyword needs a reason.
 | `if`, `else` | branches, as a statement or an expression |
 | `for`, `in` | the one loop form |
 | `break`, `continue` | leave or restart the innermost loop |
+| `enum` | sum types and integer enums |
+| `match` | branch on a value, as a statement or an expression |
 
 Planned by earlier decisions: `unsafe`. `true` and `false` are predeclared
 names, not keywords, as in Go.
@@ -266,6 +268,58 @@ with a `char` type for Unicode scalar values and character literals typed
 from context. Grapheme clusters (Swift's `Character`) need Unicode tables,
 too much for embedded targets.
 
+### Enums
+
+**Decided (2026-11-08).** An enum is a sum type. Each variant may carry a
+payload, which is a named tuple.
+
+```
+type Shape enum {
+    circle(radius: f32)
+    rect(w: f32, h: f32)
+    empty
+}
+```
+
+- An enum appears only in a `type` declaration, so every enum has a name.
+- Variants are separated by line ends, or `;` on one line. No commas.
+- A value is built with the construction rule:
+  `Shape.circle.(radius: 1.0)`, and `Shape.empty` for a variant without a
+  payload.
+
+### Integer enums, closed and open
+
+**Decided (2026-11-08).** An enum without payloads can name its integer
+type and give each variant a value, for hardware and protocol values.
+
+```
+type Irq enum u8 { timer = 0; uart = 3 }
+
+type Opcode enum u8 {
+    nop = 0
+    halt = 1
+    _
+}
+```
+
+- **Closed** (`Irq`): only the listed values exist. `Irq.(byte)` traps if
+  `byte` is not one of them, the same checked conversion numbers use.
+- **Open** (`Opcode`, marked by a trailing `_`): every `u8` is a valid
+  `Opcode`, and the names are the known ones. `Opcode.(byte)` always
+  succeeds, so a register or packet holding an unknown value is not an
+  error. From Zig's non-exhaustive enums.
+- `u8.(op)` always succeeds for both.
+
+The user called these "raw enums". Untagged unions (C's `union`) were the
+other reading, and belong with `unsafe` in part 7.
+
+### Line items and comma items
+
+Braces hold items separated by line ends: statements, enum variants and
+match arms. Parentheses hold items separated by commas: fields,
+parameters and arguments. A multi-line parenthesized list ends each line
+with a comma.
+
 ## Expressions
 
 ### Operator precedence as a partial order
@@ -373,6 +427,36 @@ tree-sitter grammar showed that destructuring there was ambiguous:
 `for (a: b, c: d) ...` reads as a pattern before `in` or a tuple-literal
 condition, and the parser cannot tell until `in`. The user chose
 `for let` to fix it.
+
+### `match`
+
+**Decided (2026-11-08).** `match` has the same shape as `if`: arms with
+blocks as a statement, arms with one expression each as an expression.
+There is no `=>`.
+
+```
+let area: f32 = match s {
+    circle(radius: f32) { pi * radius * radius }
+    rect(w: f32, h: _) { w * w }
+    empty { 0.0 }
+}
+```
+
+- A payload pattern is the destructuring syntax: fields by name, each with
+  a type or `_`.
+- A bare name in a pattern is always a variant, never a new binding,
+  because bindings always state a type. Variants are not qualified
+  (`empty`, not `Shape.empty`); the matched value's type says which enum.
+- Integer, character and string literals are patterns too, including
+  negative integers.
+- A match must be exhaustive. Arms never fall through.
+- A `_` arm matches everything else. The user chose to allow it on enums
+  too: it is useful in most matches. The cost is that a new variant falls
+  into an existing `_` arm without a compile error.
+- A match on an open enum always needs a `_` arm.
+
+**Open:** several patterns in one arm, such as `'a' | 'b'`, and range
+patterns.
 
 ### `break` and `continue`
 

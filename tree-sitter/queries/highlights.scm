@@ -1,4 +1,4 @@
-["fn" "type" "let" "var" "return" "if" "else" "for" "in"] @keyword
+["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match"] @keyword
 
 (break_statement) @keyword
 (continue_statement) @keyword
@@ -37,3 +37,6 @@
 (char_literal) @character
 (escape_sequence) @string.escape
 (interpolation ["{" "}"] @punctuation.special)
+
+(variant name: (identifier) @constant)
+(variant_pattern name: (identifier) @constant)
