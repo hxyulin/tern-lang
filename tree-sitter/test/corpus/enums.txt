@@ -264,3 +264,60 @@ fn f() {
             (branch
               (string_literal
                 (string_content)))))))))
+
+================================================================================
+Several patterns in one arm
+================================================================================
+
+fn f() {
+    match c {
+        ';', '#' {
+            g()
+        }
+        _ {
+        }
+    }
+    let k: Kind = match op { add, sub { Kind.additive }; _ { Kind.other } }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (match_statement
+        (identifier)
+        (match_arm
+          (char_literal)
+          (char_literal)
+          (block
+            (expression_statement
+              (call_expression
+                (identifier)
+                (argument_list)))))
+        (match_arm
+          (discard)
+          (block)))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (match_expression
+          (identifier)
+          (match_expression_arm
+            (variant_pattern
+              (identifier))
+            (variant_pattern
+              (identifier))
+            (branch
+              (field_expression
+                (identifier)
+                (identifier))))
+          (match_expression_arm
+            (discard)
+            (branch
+              (field_expression
+                (identifier)
+                (identifier)))))))))

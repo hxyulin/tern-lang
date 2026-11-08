@@ -17,6 +17,31 @@ pub type ParseError enum {
     unclosed_section
 }
 
+// Iterates over the lines of a text, without their '\n'.
+pub type Lines (rest: []u8)
+
+pub fn lines(text: []u8) -> Lines {
+    return Lines.(rest: text)
+}
+
+pub fn next(it: inout Lines) -> ?[]u8 {
+    if it.rest.len == 0 {
+        return none
+    }
+    match index_of(it.rest, '\n') {
+        some(value as end: usize) {
+            let line: []u8 = it.rest[..end]
+            it.rest = it.rest[end + 1..]
+            return some.(value: line)
+        }
+        none {
+            let line: []u8 = it.rest
+            it.rest = it.rest[it.rest.len..]
+            return some.(value: line)
+        }
+    }
+}
+
 pub fn parse_line(line: []u8) -> Line ! ParseError {
     let t: []u8 = trim(strip_comment(line))
     if t.len == 0 {
@@ -47,10 +72,7 @@ pub fn parse_line(line: []u8) -> Line ! ParseError {
 fn strip_comment(s: []u8) -> []u8 {
     for let i: usize in 0..s.len {
         match s[i] {
-            ';' {
-                return s[..i]
-            }
-            '#' {
+            ';', '#' {
                 return s[..i]
             }
             _ {

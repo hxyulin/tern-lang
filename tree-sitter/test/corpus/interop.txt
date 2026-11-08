@@ -190,3 +190,29 @@ fn f() {
             (field_expression
               (identifier)
               (identifier))))))))
+
+================================================================================
+Extern variables
+================================================================================
+
+extern var errno: c.int
+extern let _sbss: u8
+pub extern let _estack: u32
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (extern_variable
+    (identifier)
+    (type_name
+      (identifier)
+      (identifier)))
+  (extern_variable
+    (identifier)
+    (type_name
+      (identifier)))
+  (extern_variable
+    (visibility)
+    (identifier)
+    (type_name
+      (identifier))))

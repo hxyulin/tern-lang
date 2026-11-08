@@ -56,9 +56,9 @@ Two observations about AI-assisted programming motivated a new language:
 
 ## Not in the first version
 
-OOP, traits, user-defined generics, iterators, nested functions, macros,
-and running user code at compile time. Iterators and nested functions have
-candidate designs, recorded under [Deferred](#deferred).
+OOP, traits, user-defined generics, iterator adapters, nested functions,
+macros, and running user code at compile time. Nested functions have a
+candidate design, recorded under [Deferred](#deferred).
 
 ## Syntax
 
@@ -250,10 +250,20 @@ arithmetic use built-in functions such as `wrapping_add(a, b)`, not
 operators like Zig's `+%`. The operator set stays small and every intended
 wrap is visible.
 
-**Open:** what plain `+` does on overflow. The candidates are a trap in
-every build (Swift), a trap only in checked builds (Rust), or a setting per
-package. Division by zero and out-of-range shifts need the same answer.
-Embedded targets care about the cost of each check.
+**Decided (2026-11-08):** plain arithmetic traps on overflow in every
+build, as in Swift and like bounds checks. So do division by zero,
+`i32.min / -1`, and a shift by at least the type's bit width. Rust traps
+only in debug builds, so release code behaves differently from the code
+that was tested and reviewed; a reviewer would have to know which build
+they reason about.
+
+The cost is a branch per operation, which the optimizer removes in most
+loops with known bounds. Code that cannot afford it uses
+`wrapping_add` for an intended wrap, or an `unsafe` `unchecked_add` where
+the author knows it cannot overflow.
+
+**Open:** what a trap does on each target, such as which handler runs on
+a microcontroller. It belongs with the runtime.
 
 ### Strings and text
 
@@ -446,6 +456,48 @@ tree-sitter grammar showed that destructuring there was ambiguous:
 condition, and the parser cannot tell until `in`. The user chose
 `for let` to fix it.
 
+### Iterators
+
+**Decided (2026-11-08): candidate A, external iterators without
+traits.** The user preferred Rust's external iterators to internal ones.
+Deferred earlier the same day, because an iterator holding a view needed
+a view struct; once views could be fields, an iterator became an
+ordinary struct.
+
+```
+type Lines (rest: []u8)
+
+fn lines(s: []u8) -> Lines { return Lines.(rest: s) }
+fn next(it: inout Lines) -> ?[]u8 { ... }
+
+for let line: []u8 in lines(text) { ... }
+```
+
+- `for let x: T in e` works on arrays, views and ranges, and on any
+  value of a type `X` whose package declares
+  `fn next(it: inout X) -> ?T`. The compiler finds `next` by name, as
+  Zig does, with no traits.
+- The INI example iterates over lines this way.
+
+Limitations:
+
+- Each item borrows the iterator, not the collection, so it ends when
+  `next` is called again. A `for` loop is unaffected, but collecting
+  earlier items is not possible. Rust tells the cases apart with named
+  lifetimes.
+- A recursive traversal needs an explicit stack inside the iterator.
+- No `map` or `filter` adapters without generics.
+
+A supports `zip`, peeking, and pausing an iteration.
+
+Candidate B, internal iteration. An `iter fn` `yield`s to the loop body,
+which the compiler inlines. No iterator object exists, and recursion works.
+It cannot express `zip` or pausing. From CLU iterators, Ruby blocks and
+Hylo projections.
+
+Rejected: candidate B as well. Choosing both would give two ways to
+iterate.
+
 ### `match`
 
 **Decided (2026-11-08).** `match` has the same shape as `if`: arms with
@@ -473,8 +525,21 @@ let area: f32 = match s {
   into an existing `_` arm without a compile error.
 - A match on an open enum always needs a `_` arm.
 
-**Open:** several patterns in one arm, such as `'a' | 'b'`, and range
-patterns.
+**Decided (2026-11-08):** commas separate several patterns in one arm.
+
+```
+match s[i] {
+    ';', '#' { return s[..i] }
+    _ { }
+}
+```
+
+- An arm with more than one pattern cannot bind payloads, so no rule is
+  needed for alternatives that bind different names.
+- Range patterns are deferred. Ranges exclude their end, so `a` to `z`
+  would read `'a'..'{'`, and an inclusive form would be a second range
+  syntax. `if` covers these cases.
+- No guards such as `x if x > 3`; they are another way to write `if`.
 
 ### `break` and `continue`
 
@@ -536,9 +601,11 @@ fn copy(path: []u8) -> usize ! IoError {
 - The error type must match the function's exactly. No automatic
   conversion like Rust's `From`; converting is an explicit `match`.
 
-**Leaning (2026-11-08):** a function that returns nothing but can fail
+**Decided (2026-11-08):** a function that returns nothing but can fail
 is written `-> ! IoError`, and succeeds with a bare `return ok`. The
-language has no unit type, so there is no `T` to put before `!`.
+language has no unit type, so there is no `T` to put before `!`. Falling
+off the end of such a function is an error: success is written out, as
+all wrapping is. The INI example uses this form.
 
 Rejected: `Result[T, E]` as a built-in generic. It uses the reserved
 `[T]` form but is longer in every signature.
@@ -734,6 +801,18 @@ extern fn printf(format: *u8, ...) -> c.int
   length.
 - `...` marks a C variadic function. It comes last, and only in an
   `extern` declaration.
+
+**Decided (2026-11-08):** `extern let` and `extern var` declare a C
+global or a linker symbol, with a type and no initializer.
+
+```
+extern var errno: c.int
+extern let _sbss: u8        // only its address matters: &_sbss
+```
+
+- Reading or writing one requires `unsafe`, since C or the linker owns
+  it. Taking its address with `&` is safe, as for any pointer.
+- It adds no keyword.
 - C's integer types come from a standard package: `c.int`, `c.long`,
   `c.size_t`.
 - `@export` or `@export("name")` gives a function an unmangled symbol so
@@ -1036,9 +1115,14 @@ The check stays after temporal safety was dropped, because it is local to
 one call. It no longer proves that an `inout` parameter is unaliased: the
 callee can reach the same value through a global, a view or a pointer.
 
-**Open:** whether that aliasing is undefined behavior, as for Fortran
-arguments and C's `restrict`. If it is, the backend can mark every
-`inout` parameter `noalias`; if not, it cannot.
+**Decided (2026-11-08):** that aliasing is defined behavior. The
+backend marks a parameter `noalias` only where it proves it, for example
+in a function that touches no globals and no pointers. Fortran's rule,
+which makes the aliasing undefined so every `inout` gets `noalias`, would
+add a second kind of undefined behavior that nothing in the code shows.
+C code mostly runs without `restrict` and does fine. An attribute that
+opts one function into `noalias` can come later; it would change speed,
+not meaning.
 
 ### Views
 
@@ -1315,43 +1399,6 @@ Rejected on 2026-11-08:
 
 ## Deferred
 
-### Iterators
-
-Deferred on 2026-11-08. The user preferred Rust's external iterators to
-internal ones. Without iterators, `for` works only on built-in arrays,
-views and ranges.
-
-Candidate A, external iterators without traits. The compiler knows the
-`next` protocol by name, as in Zig. Since views can be fields, an
-iterator is an ordinary struct holding a view.
-
-```
-type LineIter (rest: []u8)
-
-fn lines(s: []u8) -> LineIter { ... }
-fn next(it: inout LineIter) -> ?[]u8 { ... }
-
-for line in lines(text) { ... }
-```
-
-Limitations of A:
-
-- Each item borrows the iterator, not the collection, so it ends when
-  `next` is called again. A `for` loop is unaffected, but collecting
-  earlier items is not possible. Rust tells the cases apart with named
-  lifetimes.
-- A recursive traversal needs an explicit stack inside the iterator.
-- No `map` or `filter` adapters without generics.
-
-A supports `zip`, peeking, and pausing an iteration.
-
-Candidate B, internal iteration. An `iter fn` `yield`s to the loop body,
-which the compiler inlines. No iterator object exists, and recursion works.
-It cannot express `zip` or pausing. From CLU iterators, Ruby blocks and
-Hylo projections.
-
-Choosing both would give two ways to iterate.
-
 ### Nested functions
 
 Deferred on 2026-11-08. Candidate: nested functions that can read and
@@ -1382,12 +1429,10 @@ Not in the first version. `[T]` is reserved for type arguments.
 
 ## Open questions
 
-- Whether a fallible function with no value is `-> ! E` with a bare
-  `return ok`.
 - What an interpolated string produces at runtime, which depends on the
   allocator model.
 - The allocator model, and whether a built-in map exists.
-- Iterators and nested functions (see Deferred).
+- Nested functions (see Deferred).
 - The language's name.
 
 Raised by the programs in `examples/` on 2026-11-08. They parse, but a

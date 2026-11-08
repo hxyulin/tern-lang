@@ -89,6 +89,7 @@ module.exports = grammar({
       choice(
         $.function_declaration,
         $.extern_declaration,
+        $.extern_variable,
         $.type_declaration,
         $.global_declaration,
       ),
@@ -117,6 +118,20 @@ module.exports = grammar({
         field('name', $.identifier),
         field('parameters', $.extern_parameter_list),
         optional(seq('->', field('result', $._type))),
+      ),
+
+    // extern var errno: c.int, extern let _sbss: u8. A C global or a
+    // linker symbol. Reading or writing one is unsafe; taking its address
+    // is safe.
+    extern_variable: ($) =>
+      seq(
+        attributes($),
+        optional(field('visibility', $.visibility)),
+        'extern',
+        field('kind', choice('let', 'var')),
+        field('name', $.identifier),
+        ':',
+        field('type', $._type),
       ),
 
     // `...` marks a C variadic function and comes last.
@@ -335,7 +350,12 @@ module.exports = grammar({
     match_statement: ($) =>
       seq('match', field('value', $._expression), '{', lines($, $.match_arm), '}'),
 
-    match_arm: ($) => seq(field('pattern', $._pattern), field('body', $.block)),
+    match_arm: ($) => seq($._patterns, field('body', $.block)),
+
+    // ';', '#' { ... }: alternatives share one arm. The checker forbids
+    // payload bindings in an arm with more than one pattern.
+    _patterns: ($) =>
+      seq(field('pattern', $._pattern), repeat(seq(',', field('pattern', $._pattern)))),
 
     // A bare name is a variant, never a new binding.
     _pattern: ($) =>
@@ -444,7 +464,7 @@ module.exports = grammar({
     match_expression: ($) =>
       seq('match', field('value', $._expression), '{', lines($, $.match_expression_arm), '}'),
 
-    match_expression_arm: ($) => seq(field('pattern', $._pattern), field('body', $.branch)),
+    match_expression_arm: ($) => seq($._patterns, field('body', $.branch)),
 
     // let x: i32 = if c { a } else { b }. The else is required and each
     // branch is one expression.

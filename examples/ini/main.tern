@@ -46,11 +46,9 @@ fn read_all(path: []u8) -> String ! io.Error {
 
 fn check(text: []u8) -> ! AppError {
     var line_no: u32 = 0
-    var start: usize = 0
-    for start < text.len {
-        let end: usize = line_end(text, start)
+    for let line: []u8 in ini.lines(text) {
         line_no += 1
-        match ini.parse_line(text[start..end]) {
+        match ini.parse_line(line) {
             ok(value: ini.Line) {
                 show(value)
             }
@@ -58,7 +56,6 @@ fn check(text: []u8) -> ! AppError {
                 return err.(error: AppError.bad_line.(line: line_no, error: error))
             }
         }
-        start = end + 1
     }
     return ok
 }
@@ -74,15 +71,6 @@ fn show(line: ini.Line) {
             io.print("  {key} = {value}\n")
         }
     }
-}
-
-// The index of the next '\n' at or after start, or the end of text.
-fn line_end(text: []u8, start: usize) -> usize {
-    var i: usize = start
-    for i < text.len && text[i] != '\n' {
-        i += 1
-    }
-    return i
 }
 
 fn report(e: AppError) {
