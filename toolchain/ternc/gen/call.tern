@@ -1,0 +1,452 @@
+// Panics, calls and built-in functions. Ported from stage 1's
+// codegen/func.rs.
+
+import check
+import keel
+import maps
+import program
+import resolve
+import syntax
+
+// One piece of a compiler-written panic message.
+type Piece enum {
+    text(text: []u8)
+    unsigned(value: keel.Value)
+    signed(value: keel.Value)
+}
+
+// An argument, ready for the call.
+type CallArg enum {
+    value(value: keel.Value)
+    addr(value: keel.Value)
+    nothing
+}
+
+// The values a call passes, and the memory its result goes to.
+type Lowered (values: [..]keel.Value, out: ?keel.Value)
+
+// Panics with the message unless fine is true.
+fn check_or_panic(g: inout Gen, fx: inout Fx, fine: keel.Value, message: []Piece, span: syntax.Span) -> ! OutOfMemory {
+    let pass: keel.Block = try new_block(inout fx)
+    let fail: keel.Block = try new_block(inout fx)
+    try brif(inout fx, fine, pass, fail)
+    switch_to(inout fx, fail, true)
+    var values: [..]keel.Value = make(g.alloc)
+    for let piece: Piece in message {
+        match piece {
+            text(text: _) {
+            }
+            unsigned(value as v: keel.Value) {
+                try push(inout values, v)
+            }
+            signed(value as v: keel.Value) {
+                try push(inout values, v)
+            }
+        }
+    }
+    try call_panic_helper(inout g, inout fx, some.(value: message), values, span)
+    switch_to(inout fx, pass, true)
+    return ok
+}
+
+// Reports through the panic handler and aborts.
+fn panic_value(g: inout Gen, fx: inout Fx, message: V, span: syntax.Span) -> ! OutOfMemory {
+    let format_ty: check.TyId = try check.named_ty(inout g.types, check.NamedId.builtin.(which: check.BuiltinNamed.format))
+    let addr: keel.Value = try spill(inout g, fx, message, format_ty)
+    var values: [..]keel.Value = make(g.alloc)
+    try push(inout values, addr)
+    return call_panic_helper(inout g, inout fx, none, values, span)
+}
+
+// Calls the cold helper that reports a panic with message, passing args
+// and the address of the site's constant `PanicInfo`. Without a panic
+// handler, aborts instead. Keeping the message and `PanicInfo` out of
+// the function keeps them out of its frame.
+fn call_panic_helper(g: inout Gen, fx: inout Fx, message: ?[]Piece, args: [..]keel.Value, span: syntax.Span) -> ! OutOfMemory {
+    let has_info: bool = match check.named_info(g.types, check.NamedId.builtin.(which: check.BuiltinNamed.panic_info)) {
+        some(value: _) { true }
+        none { false }
+    }
+    var has_handler: bool = false
+    match g.handler {
+        some(value: _) {
+            has_handler = true
+        }
+        none {
+        }
+    }
+    if has_info && has_handler {
+        let f: program.File = g.program.files[usize.(fx.file)]
+        let pos: syntax.Position = syntax.position(f.starts, span.start)
+        let site: keel.Symbol = try panic_site(inout g, f.path, fx.fn_name, pos.line, pos.column)
+        var all: [..]keel.Value = args
+        try push(inout all, data_addr(fx, site))
+        let helper: keel.Symbol = try panic_helper(inout g, fx, message)
+        keel.call(fx.m, fx.block, helper, all)
+    } else {
+        let none_types: [..]keel.Type = make(g.alloc)
+        let none_values: [..]keel.Value = make(g.alloc)
+        let _: ?keel.Value = try libc_call(inout g, fx, "abort", none_types, none_types, none_values)
+    }
+    return trap_here(inout fx)
+}
+
+// A panic helper's parameters: a 64-bit integer for each value in the
+// message, or the address of a `Format`, then the site's `PanicInfo`.
+fn helper_params(alloc: Allocator, message: ?[]Piece) -> [..]keel.Type ! OutOfMemory {
+    var params: [..]keel.Type = make(alloc)
+    match message {
+        none {
+            try push(inout params, keel.Type.ptr)
+        }
+        some(value as parts: []Piece) {
+            for let part: Piece in parts {
+                match part {
+                    text(text: _) {
+                    }
+                    _ {
+                        try push(inout params, keel.Type.int64)
+                    }
+                }
+            }
+        }
+    }
+    try push(inout params, keel.Type.ptr)
+    return ok.(value: params)
+}
+
+// A key that tells messages apart: `f` for a `Format`, else each piece
+// as `t` and its text and a NUL, `u` or `s`.
+fn message_key(alloc: Allocator, message: ?[]Piece) -> [..]u8 ! OutOfMemory {
+    var key: [..]u8 = make(alloc)
+    match message {
+        none {
+            try push(inout key, 'f')
+        }
+        some(value as parts: []Piece) {
+            try push(inout key, 'm')
+            for let part: Piece in parts {
+                match part {
+                    text(text as t: []u8) {
+                        try push(inout key, 't')
+                        try append(inout key, t)
+                        try push(inout key, 0)
+                    }
+                    unsigned(value: _) {
+                        try push(inout key, 'u')
+                    }
+                    signed(value: _) {
+                        try push(inout key, 's')
+                    }
+                }
+            }
+        }
+    }
+    return ok.(value: key)
+}
+
+// The cold helper for message, made the first time: it builds the
+// message and a `PanicInfo` from the site and calls the panic handler.
+fn panic_helper(g: inout Gen, fx: Fx, message: ?[]Piece) -> keel.Symbol ! OutOfMemory {
+    let key: [..]u8 = try message_key(g.alloc, message)
+    match maps.get_text(g.helpers, key) {
+        some(value as n: u32) {
+            return ok.(value: g.syms[usize.(n)])
+        }
+        none {
+        }
+    }
+    let name: []u8 = try program.format_text(g.alloc, "tern.panic.{g.helper_count}")
+    g.helper_count += 1
+    let params: [..]keel.Type = try helper_params(g.alloc, message)
+    let none_types: [..]keel.Type = make(g.alloc)
+    let sig: keel.Signature = try plain_signature(g, params, none_types)
+    let f: keel.Function = try define(inout g, name, sig)
+    keel.set_local(g.m, f)
+    let s: keel.Symbol = keel.function_symbol(g.m, f)
+    keel.set_attributes(g.m, s, keel.cold | keel.noinline | keel.noreturn)
+    try maps.put_text(inout g.helpers, key, u32.(g.syms.len - 1))
+    var inner: Fx = try new_fx(g, fx.file, f, fx.fn_name, none)
+    let entry: keel.Block = inner.block
+    var values: [..]keel.Value = make(g.alloc)
+    for let t: keel.Type in params {
+        try push(inout values, keel.block_param(inner.m, entry, t))
+    }
+    let site: keel.Value = values[values.len - 1]
+    let format_ty: check.TyId = try check.named_ty(inout g.types, check.NamedId.builtin.(which: check.BuiltinNamed.format))
+    var text: V = V.unit
+    match message {
+        none {
+            text = V.memory.(addr: values[0])
+        }
+        some(value as parts: []Piece) {
+            var pieces: [..]FormatPiece = make(g.alloc)
+            var next: usize = 0
+            for let part: Piece in parts {
+                match part {
+                    text(text as t: []u8) {
+                        try push(inout pieces, FormatPiece.text.(bytes: t))
+                    }
+                    unsigned(value: _) {
+                        let u64_ty: check.TyId = try check.int_ty(inout g.types, check.IntTy.u64)
+                        try push(inout pieces, FormatPiece.value.(v: V.scalar.(value: values[next]), ty: u64_ty))
+                        next += 1
+                    }
+                    signed(value: _) {
+                        let i64_ty: check.TyId = try check.int_ty(inout g.types, check.IntTy.i64)
+                        try push(inout pieces, FormatPiece.value.(v: V.scalar.(value: values[next]), ty: i64_ty))
+                        next += 1
+                    }
+                }
+            }
+            text = try format(inout g, inout inner, pieces, format_ty)
+        }
+    }
+    let info_ty: check.TyId = try check.named_ty(inout g.types, check.NamedId.builtin.(which: check.BuiltinNamed.panic_info))
+    let info: keel.Value = try temp(inout g, inner, info_ty)
+    let info_layout: TyLayout = try ty_layout(inout g, info_ty)
+    copy_bytes(inner, info, site, info_layout.size, false)
+    let message_field: FieldInfo = try field_of(inout g, info_ty, "message")
+    let at: keel.Value = offset_by(inner, info, message_field.offset)
+    try store_v(inout g, inner, text, format_ty, at, false)
+    match g.handler {
+        some(value as handler: maps.DeclRef) {
+            let abi: FnAbi = try decl_abi(inout g, handler)
+            let handler_name: []u8 = try symbol(inout g, handler)
+            var args: [..]CallArg = make(g.alloc)
+            try push(inout args, CallArg.addr.(value: info))
+            let _: V = try direct_call(inout g, inout inner, handler_name, abi, args)
+        }
+        none {
+        }
+    }
+    let none_values: [..]keel.Value = make(g.alloc)
+    let _: ?keel.Value = try libc_call(inout g, inner, "abort", none_types, none_types, none_values)
+    try trap_here(inout inner)
+    finish(inner)
+    return ok.(value: s)
+}
+
+// Calls.
+
+fn call_expr(g: inout Gen, fx: inout Fx, callee: syntax.ExprId, args: syntax.List, ty: check.TyId, span: syntax.Span) -> V ! OutOfMemory {
+    var builtin: ?[]u8 = none
+    match expr_at(fx, callee).kind {
+        index(value: syntax.ExprId, index: _) {
+            match res_of(fx, value) {
+                some(value as r: resolve.Res) {
+                    match r {
+                        builtin(name: []u8) {
+                            builtin = some.(value: name)
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        _ {
+            match res_of(fx, callee) {
+                some(value as r: resolve.Res) {
+                    match r {
+                        builtin(name: []u8) {
+                            builtin = some.(value: name)
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+    }
+    match builtin {
+        some(value as name: []u8) {
+            return builtin_call(inout g, inout fx, name, args, ty, span)
+        }
+        none {
+        }
+    }
+    match res_decl(res_of(fx, callee)) {
+        some(value as decl: maps.DeclRef) {
+            var is_fn: bool = false
+            match decl_of(g, decl).kind {
+                function(is_unsafe: _, name: _, params: _, result: _, body: _) {
+                    is_fn = true
+                }
+                extern_fn(name: _, params: _, variadic: _, result: _) {
+                    is_fn = true
+                }
+                _ {
+                }
+            }
+            if is_fn {
+                let abi: FnAbi = try decl_abi(inout g, decl)
+                let call_args: [..]CallArg = try lower_call_args(inout g, inout fx, args, abi)
+                let name: []u8 = try symbol(inout g, decl)
+                return direct_call(inout g, inout fx, name, abi, call_args)
+            }
+        }
+        none {
+        }
+    }
+    // A function value.
+    let fty: check.TyId = try expr_ty(inout g, fx, callee)
+    let abi: FnAbi = try fn_abi(inout g, fty, false, false)
+    let target_v: V = try expr(inout g, inout fx, callee)
+    let target: keel.Value = scalar_v(fx, target_v)
+    let call_args: [..]CallArg = try lower_call_args(inout g, inout fx, args, abi)
+    let lowered: Lowered = try lower_args(inout g, fx, abi, call_args)
+    if abi.returns {
+        let r: keel.Value = keel.call_indirect_value(fx.m, fx.block, abi.sig, target, lowered.values)
+        return ok.(value: call_result(some.(value: r), lowered.out))
+    }
+    keel.call_indirect(fx.m, fx.block, abi.sig, target, lowered.values)
+    return ok.(value: call_result(none, lowered.out))
+}
+
+fn lower_call_args(g: inout Gen, fx: inout Fx, args: syntax.List, abi: FnAbi) -> [..]CallArg ! OutOfMemory {
+    var fn_params: []check.FnParam = check.fn_params(g.types, check.Range.(start: 0, len: 0))
+    match check.get(g.types, core_ty(g, abi.fn_ty)) {
+        function(params: check.Range, result: _) {
+            fn_params = check.fn_params(g.types, params)
+        }
+        _ {
+        }
+    }
+    // A call inside an argument that passes something `inout` could
+    // change a borrowed argument before the callee reads it, so then
+    // borrowed arguments are copied.
+    let ast: syntax.Ast = fx.ast
+    let arg_ids: []u32 = syntax.items(ast.extra, args)
+    var changes: bool = false
+    for let a: u32 in arg_ids {
+        if changes_in_call(ast, ast.args[usize.(a)].value) {
+            changes = true
+        }
+    }
+    var out: [..]CallArg = make(g.alloc)
+    for let i: usize in 0..arg_ids.len {
+        let arg: syntax.Arg = ast.args[usize.(arg_ids[i])]
+        if i < abi.passes.len {
+            let param_ty: check.TyId = fn_params[i].ty
+            match abi.passes[i] {
+                place {
+                    try push(inout out, CallArg.addr.(value: try addr_of(inout g, inout fx, arg.value)))
+                }
+                skip {
+                    let _: V = try expr(inout g, inout fx, arg.value)
+                    try push(inout out, CallArg.nothing)
+                }
+                scalar_arg {
+                    let v: V = try value_as(inout g, inout fx, arg.value, param_ty)
+                    try push(inout out, CallArg.value.(value: scalar_v(fx, v)))
+                }
+                byval {
+                    let v: V = try value_as(inout g, inout fx, arg.value, param_ty)
+                    try push(inout out, CallArg.addr.(value: try spill(inout g, fx, v, param_ty)))
+                }
+                borrow {
+                    let actual: check.TyId = try expr_ty(inout g, fx, arg.value)
+                    var direct: bool = !changes && check.same_ty(actual, param_ty)
+                    if direct {
+                        direct = try borrowable(inout g, fx, arg.value)
+                    }
+                    if direct {
+                        try push(inout out, CallArg.addr.(value: try addr_of(inout g, inout fx, arg.value)))
+                    } else {
+                        let v: V = try value_as(inout g, inout fx, arg.value, param_ty)
+                        let copy_addr: keel.Value = try temp(inout g, fx, param_ty)
+                        try store_v(inout g, fx, v, param_ty, copy_addr, false)
+                        try push(inout out, CallArg.addr.(value: copy_addr))
+                    }
+                }
+            }
+            continue
+        }
+        // A C variadic argument: widened as C promotes it.
+        let aty: check.TyId = try expr_ty(inout g, fx, arg.value)
+        let v: V = try expr(inout g, inout fx, arg.value)
+        var x: keel.Value = scalar_v(fx, v)
+        let t: keel.Type = try scalar_of(inout g, aty)
+        match t {
+            int8, int16 {
+                match int_of(g, aty) {
+                    some(value as int: check.IntTy) {
+                        if check.int_signed(int) {
+                            x = convert_to(fx, keel.ConvertOp.sext, keel.Type.int32, x)
+                        } else {
+                            x = convert_to(fx, keel.ConvertOp.uext, keel.Type.int32, x)
+                        }
+                    }
+                    none {
+                    }
+                }
+            }
+            float32 {
+                x = convert_to(fx, keel.ConvertOp.fpext, keel.Type.float64, x)
+            }
+            _ {
+            }
+        }
+        try push(inout out, CallArg.value.(value: x))
+    }
+    return ok.(value: out)
+}
+
+fn direct_call(g: inout Gen, fx: inout Fx, name: []u8, abi: FnAbi, args: []CallArg) -> V ! OutOfMemory {
+    let lowered: Lowered = try lower_args(inout g, fx, abi, args)
+    let s: keel.Symbol = try function_symbol(inout g, name, abi.sig)
+    if abi.returns {
+        let r: keel.Value = keel.call_value(fx.m, fx.block, s, lowered.values)
+        return ok.(value: call_result(some.(value: r), lowered.out))
+    }
+    keel.call(fx.m, fx.block, s, lowered.values)
+    return ok.(value: call_result(none, lowered.out))
+}
+
+fn lower_args(g: inout Gen, fx: Fx, abi: FnAbi, args: []CallArg) -> Lowered ! OutOfMemory {
+    var values: [..]keel.Value = make(g.alloc)
+    var out: ?keel.Value = none
+    if abi.sret {
+        match abi.result {
+            some(value as r: check.TyId) {
+                let addr: keel.Value = try temp(inout g, fx, r)
+                try push(inout values, addr)
+                out = some.(value: addr)
+            }
+            none {
+            }
+        }
+    }
+    for let arg: CallArg in args {
+        match arg {
+            value(value as v: keel.Value) {
+                try push(inout values, v)
+            }
+            addr(value as v: keel.Value) {
+                try push(inout values, v)
+            }
+            nothing {
+            }
+        }
+    }
+    return ok.(value: Lowered.(values: values, out: out))
+}
+
+fn call_result(result: ?keel.Value, out: ?keel.Value) -> V {
+    match out {
+        some(value as addr: keel.Value) {
+            return V.memory.(addr: addr)
+        }
+        none {
+        }
+    }
+    return match result {
+        some(value as v: keel.Value) { V.scalar.(value: v) }
+        none { V.unit }
+    }
+}

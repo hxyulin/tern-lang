@@ -80,6 +80,33 @@ type Loader (
 // Loads the package in root and everything it imports. Standard library
 // packages are looked up in std_dir.
 pub fn load(alloc: Allocator, root: []u8, std_dir: []u8) -> Program ! OutOfMemory {
+    let l: Loader = try new_loader(alloc, root, std_dir)
+    return ok.(value: l.program)
+}
+
+// Loads a program for a hosted target: as `load`, plus `std.rt`, the
+// runtime with C's entry point, which every hosted program links.
+pub fn load_hosted(alloc: Allocator, root: []u8, std_dir: []u8) -> Program ! OutOfMemory {
+    var l: Loader = try new_loader(alloc, root, std_dir)
+    let missing: bool = match find_package(l.program, "std.rt") {
+        some(value: _) { false }
+        none { true }
+    }
+    if !has_errors(l.program) && missing {
+        let dir: []u8 = try join(alloc, std_dir, "rt")
+        match try read_package(inout l, "std.rt", dir) {
+            loaded(id: _), empty {
+            }
+            unreadable {
+                let message: []u8 = try format_text(alloc, "cannot read {dir}")
+                try push(inout l.program.errors, message)
+            }
+        }
+    }
+    return ok.(value: l.program)
+}
+
+fn new_loader(alloc: Allocator, root: []u8, std_dir: []u8) -> Loader ! OutOfMemory {
     var l: Loader = Loader.(
         alloc: alloc,
         root: root,
@@ -105,7 +132,7 @@ pub fn load(alloc: Allocator, root: []u8, std_dir: []u8) -> Program ! OutOfMemor
             try push(inout l.program.errors, message)
         }
     }
-    return ok.(value: l.program)
+    return ok.(value: l)
 }
 
 type Read enum {

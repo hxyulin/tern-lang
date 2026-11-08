@@ -1,0 +1,756 @@
+// Code generation: lowers a checked program to one keel module through
+// keel's C API. Ported from stage 1's codegen, which builds the same
+// module through keel's Rust API; the tests compare the two modules'
+// IR text.
+//
+// Scalars (integers, `bool`, floats, pointers, function values and
+// payload-free enums) are keel values. Every other value lives in memory
+// and is handled through its address. Every local has a stack slot;
+// keel's `stack_promote` pass moves the scalar ones into registers.
+//
+// Every function uses the C calling convention. A value held in memory
+// is returned through `sret`, and an `inout` argument is passed as a
+// pointer. A `let` parameter held in memory is a pointer to the caller's
+// value, which C sees as `const T *`; a record an `extern` function
+// takes is passed `byval`, as C passes records.
+//
+// keel's C API decides the order of the module: a function or global is
+// placed when it is first defined or referred to. Stage 1 places them
+// the same way.
+
+import check
+import keel
+import maps
+import program
+import resolve
+import syntax
+
+pub type Gen (
+    alloc: Allocator,
+    program: program.Program,
+    names: resolve.Resolution,
+    types: check.Types,
+    files: [..]check.FileTypes,
+    fn_tys: [..]?check.TyId,
+    // The root package's directory name, which prefixes its symbols.
+    root_name: []u8,
+    m: keel.Module,
+    // Per type, by id, once worked out.
+    layouts: [..]?TyLayout,
+    fields_cache: [..]FieldsSlot,
+    shapes: [..]ShapeSlot,
+    abi_layouts: [..]?keel.Layout,
+    // Per declaration, by number, once worked out.
+    decl_symbols: [..]?[]u8,
+    decl_abis: [..]?FnAbi,
+    // Every symbol in the module by name, as a number in syms.
+    symbols: maps.TextMap,
+    syms: [..]keel.Symbol,
+    // A string's bytes to the number of its data object's symbol.
+    strings: maps.TextMap,
+    string_count: u32,
+    // `tern.grow`, once made.
+    grow: ?keel.Symbol,
+    // The cold helper for each kind of panic, by a key for its message.
+    helpers: maps.TextMap,
+    helper_count: u32,
+    panic_sites: u32,
+    // The `@panic_handler` function: the program's own, or std.rt's.
+    handler: ?maps.DeclRef,
+    // Features stage 1 does not lower either.
+    errors: [..][]u8,
+)
+
+// A module, or the first feature code generation does not support.
+pub type Generated enum {
+    module(m: keel.Module)
+    unsupported(message: []u8)
+}
+
+// How one parameter crosses a call.
+type Pass enum {
+    scalar_arg
+    // The address of the value; the callee gets its own copy.
+    byval
+    // The address of the caller's value, which the callee only reads.
+    borrow
+    // The address of the caller's place.
+    place
+    // A value with no bytes, which is not passed.
+    skip
+}
+
+// A function's signature and how its parameters and result cross.
+type FnAbi (
+    sig: keel.Signature,
+    // The keel parameters, in order.
+    params: [..]keel.AbiValue,
+    passes: [..]Pass,
+    // The result goes through memory the caller passes first.
+    sret: bool,
+    // The function returns a keel value.
+    returns: bool,
+    result: ?check.TyId,
+    fn_ty: check.TyId,
+)
+
+// Lowers a program that checked without errors. root_name is the root
+// directory's name.
+pub fn generate(alloc: Allocator, p: program.Program, names: resolve.Resolution, checked: check.Checked, root_name: []u8) -> Generated ! OutOfMemory {
+    var g: Gen = Gen.(
+        alloc: alloc,
+        program: p,
+        names: names,
+        types: checked.types,
+        files: checked.files,
+        fn_tys: checked.fn_tys,
+        root_name: root_name,
+        m: keel.create(),
+        layouts: make(alloc),
+        fields_cache: make(alloc),
+        shapes: make(alloc),
+        abi_layouts: make(alloc),
+        decl_symbols: make(alloc),
+        decl_abis: make(alloc),
+        symbols: maps.new_texts(alloc),
+        syms: make(alloc),
+        strings: maps.new_texts(alloc),
+        string_count: 0,
+        grow: none,
+        helpers: maps.new_texts(alloc),
+        helper_count: 0,
+        panic_sites: 0,
+        handler: none,
+        errors: make(alloc),
+    )
+    for let _: usize in 0..g.types.decl_infos.len {
+        try push(inout g.decl_symbols, none)
+        try push(inout g.decl_abis, none)
+    }
+    g.handler = find_panic_handler(g)
+    for let i: usize in 0..p.files.len {
+        let decls: [..]syntax.Decl = p.files[i].ast.decls
+        for let index: usize in 0..decls.len {
+            let decl: maps.DeclRef = maps.DeclRef.(file: u32.(i), index: u32.(index))
+            match decls[index].kind {
+                function(is_unsafe: _, name: _, params: _, result: _, body: _) {
+                    try gen_function(inout g, decl)
+                }
+                global(is_shared: _, local: _) {
+                    try gen_global(inout g, decl)
+                }
+                extern_var(mutable: _, name: _, ty: _) {
+                    let name: []u8 = try symbol(inout g, decl)
+                    let _: keel.Symbol = try data_symbol(inout g, name)
+                }
+                extern_fn(name: _, params: _, variadic: _, result: _) {
+                }
+                type_decl(name: _, def: _) {
+                }
+            }
+        }
+    }
+    if g.errors.len > 0 {
+        keel.destroy(g.m)
+        return ok.(value: Generated.unsupported.(message: g.errors[0]))
+    }
+    return ok.(value: Generated.module.(m: g.m))
+}
+
+// Declarations.
+
+fn decl_of(g: Gen, decl: maps.DeclRef) -> syntax.Decl {
+    return g.program.files[usize.(decl.file)].ast.decls[usize.(decl.index)]
+}
+
+fn file_text(g: Gen, file: u32, s: syntax.Span) -> []u8 {
+    return program.slice(g.program.files[usize.(file)], s.start, s.end)
+}
+
+fn decl_name(g: Gen, decl: maps.DeclRef) -> []u8 {
+    match decl_of(g, decl).kind {
+        function(is_unsafe: _, name: syntax.Span, params: _, result: _, body: _) {
+            return file_text(g, decl.file, name)
+        }
+        extern_fn(name: syntax.Span, params: _, variadic: _, result: _) {
+            return file_text(g, decl.file, name)
+        }
+        extern_var(mutable: _, name: syntax.Span, ty: _) {
+            return file_text(g, decl.file, name)
+        }
+        type_decl(name: syntax.Span, def: _) {
+            return file_text(g, decl.file, name)
+        }
+        global(is_shared: _, local: syntax.Local) {
+            match local.binding {
+                single(name: ?syntax.Span, ty: _) {
+                    match name {
+                        some(value as n: syntax.Span) {
+                            return file_text(g, decl.file, n)
+                        }
+                        none {
+                        }
+                    }
+                }
+                destructure(fields: _) {
+                }
+            }
+            return "_"
+        }
+    }
+}
+
+fn is_extern_fn(g: Gen, decl: maps.DeclRef) -> bool {
+    return match decl_of(g, decl).kind {
+        extern_fn(name: _, params: _, variadic: _, result: _) { true }
+        _ { false }
+    }
+}
+
+// The attribute `@name` on a declaration.
+fn attribute(g: Gen, decl: maps.DeclRef, name: []u8) -> ?syntax.Attribute {
+    let ast: syntax.Ast = g.program.files[usize.(decl.file)].ast
+    for let i: u32 in syntax.items(ast.extra, decl_of(g, decl).attributes) {
+        let a: syntax.Attribute = ast.attributes[usize.(i)]
+        var text: []u8 = file_text(g, decl.file, a.name)
+        if text.len > 0 && text[0] == '@' {
+            text = text[1..]
+        }
+        if same_text(text, name) {
+            return some.(value: a)
+        }
+    }
+    return none
+}
+
+fn has_attribute(g: Gen, decl: maps.DeclRef, name: []u8) -> bool {
+    return match attribute(g, decl, name) {
+        some(value: _) { true }
+        none { false }
+    }
+}
+
+// A package's prefix for symbols: `std.io`, or the root's directory name
+// and then the package's path.
+fn package_prefix(g: Gen, package: u32) -> []u8 ! OutOfMemory {
+    let path: []u8 = g.program.packages[usize.(package)].path
+    if path.len == 0 {
+        return ok.(value: g.root_name)
+    }
+    if same_text(path, "std") || (path.len > 4 && same_text(path[..4], "std.")) {
+        return ok.(value: path)
+    }
+    return program.format_text(g.alloc, "{g.root_name}.{path}")
+}
+
+// The linker symbol of a function or global.
+fn symbol(g: inout Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
+    let number: usize = usize.(check.decl_number(g.types, decl))
+    match g.decl_symbols[number] {
+        some(value as known: []u8) {
+            return ok.(value: known)
+        }
+        none {
+        }
+    }
+    let made: []u8 = try make_symbol(g, decl)
+    g.decl_symbols[number] = some.(value: made)
+    return ok.(value: made)
+}
+
+fn make_symbol(g: Gen, decl: maps.DeclRef) -> []u8 ! OutOfMemory {
+    let name: []u8 = decl_name(g, decl)
+    let package: u32 = g.program.files[usize.(decl.file)].package
+    match decl_of(g, decl).kind {
+        extern_fn(name: _, params: _, variadic: _, result: _) {
+            return ok.(value: name)
+        }
+        extern_var(mutable: _, name: _, ty: _) {
+            return ok.(value: name)
+        }
+        function(is_unsafe: _, name: _, params: _, result: _, body: _) {
+            match attribute(g, decl, "export") {
+                some(value as export: syntax.Attribute) {
+                    let ast: syntax.Ast = g.program.files[usize.(decl.file)].ast
+                    let args: []u32 = syntax.items(ast.extra, export.args)
+                    if args.len == 0 {
+                        return ok.(value: name)
+                    }
+                    var text: []u8 = file_text(g, decl.file, ast.exprs[usize.(args[0])].span)
+                    for text.len > 0 && text[0] == '"' {
+                        text = text[1..]
+                    }
+                    for text.len > 0 && text[text.len - 1] == '"' {
+                        text = text[..text.len - 1]
+                    }
+                    return ok.(value: text)
+                }
+                none {
+                }
+            }
+            if g.program.packages[usize.(package)].path.len == 0 && same_text(name, "main") {
+                return ok.(value: "tern_main")
+            }
+        }
+        _ {
+        }
+    }
+    let prefix: []u8 = try package_prefix(g, package)
+    return program.format_text(g.alloc, "{prefix}.{name}")
+}
+
+fn fn_ty_of(g: Gen, decl: maps.DeclRef) -> check.TyId {
+    match g.fn_tys[usize.(check.decl_number(g.types, decl))] {
+        some(value as ty: check.TyId) {
+            return ty
+        }
+        none {
+            panic("internal error: a function without a type")
+        }
+    }
+}
+
+// Signatures.
+
+fn abi_param(g: inout Gen, ty: check.TyId) -> keel.AbiValue ! OutOfMemory {
+    let t: keel.Type = try scalar_of(inout g, ty)
+    var ext: keel.Extension = keel.Extension.plain
+    match t {
+        int8, int16 {
+            var signed: bool = false
+            match check.as_int(g.types, core_ty(g, ty)) {
+                some(value as int: check.IntTy) {
+                    signed = check.int_signed(int)
+                }
+                none {
+                }
+            }
+            ext = if signed { keel.Extension.sign } else { keel.Extension.zero }
+        }
+        _ {
+        }
+    }
+    return ok.(value: keel.abi(t, ext))
+}
+
+// The ABI of a function type. c_records is set for an `extern` function,
+// which takes records by value as C does.
+fn fn_abi(g: inout Gen, fn_ty: check.TyId, variadic: bool, c_records: bool) -> FnAbi ! OutOfMemory {
+    var params_r: check.Range = check.Range.(start: 0, len: 0)
+    var result: ?check.TyId = none
+    match check.get(g.types, core_ty(g, fn_ty)) {
+        function(params as r: check.Range, result as res: ?check.TyId) {
+            params_r = r
+            result = res
+        }
+        _ {
+            panic("internal error: a call of something that is not a function")
+        }
+    }
+    var params: [..]keel.AbiValue = make(g.alloc)
+    var returns: [..]keel.AbiValue = make(g.alloc)
+    var passes: [..]Pass = make(g.alloc)
+    var sret: bool = false
+    match result {
+        some(value as r: check.TyId) {
+            match try ty_repr(inout g, r) {
+                scalar(ty: _) {
+                    try push(inout returns, try abi_param(inout g, r))
+                }
+                memory {
+                    sret = true
+                    let layout: keel.Layout = try abi_layout(inout g, r)
+                    try push(inout params, keel.abi_memory(keel.Purpose.sret, layout))
+                }
+                unit {
+                }
+            }
+        }
+        none {
+        }
+    }
+    let fn_params: []check.FnParam = check.fn_params(g.types, params_r)
+    for let p: check.FnParam in fn_params {
+        let repr: Repr = try ty_repr(inout g, p.ty)
+        var pass: Pass = Pass.skip
+        match p.mode {
+            inout_mode {
+                pass = Pass.place
+            }
+            let_mode {
+                pass = match repr {
+                    unit { Pass.skip }
+                    scalar(ty: _) { Pass.scalar_arg }
+                    memory {
+                        if c_records { Pass.byval } else { Pass.borrow }
+                    }
+                }
+            }
+        }
+        match pass {
+            scalar_arg {
+                try push(inout params, try abi_param(inout g, p.ty))
+            }
+            place, borrow {
+                try push(inout params, keel.abi(keel.Type.ptr, keel.Extension.plain))
+            }
+            byval {
+                let layout: keel.Layout = try abi_layout(inout g, p.ty)
+                try push(inout params, keel.abi_memory(keel.Purpose.byval, layout))
+            }
+            skip {
+            }
+        }
+        try push(inout passes, pass)
+    }
+    let sig: keel.Signature = keel.signature(g.m, params, returns, variadic)
+    return ok.(value: FnAbi.(sig: sig, params: params, passes: passes, sret: sret, returns: returns.len > 0, result: result, fn_ty: fn_ty))
+}
+
+fn decl_abi(g: inout Gen, decl: maps.DeclRef) -> FnAbi ! OutOfMemory {
+    let number: usize = usize.(check.decl_number(g.types, decl))
+    match g.decl_abis[number] {
+        some(value as known: FnAbi) {
+            return ok.(value: known)
+        }
+        none {
+        }
+    }
+    var variadic: bool = false
+    var c_records: bool = false
+    match decl_of(g, decl).kind {
+        extern_fn(name: _, params: _, variadic as v: bool, result: _) {
+            variadic = v
+            c_records = true
+        }
+        _ {
+        }
+    }
+    let made: FnAbi = try fn_abi(inout g, fn_ty_of(g, decl), variadic, c_records)
+    g.decl_abis[number] = some.(value: made)
+    return ok.(value: made)
+}
+
+// A signature of plain scalars.
+fn plain_signature(g: Gen, params: []keel.Type, returns: []keel.Type) -> keel.Signature ! OutOfMemory {
+    var p: [..]keel.AbiValue = make(g.alloc)
+    for let t: keel.Type in params {
+        try push(inout p, keel.abi(t, keel.Extension.plain))
+    }
+    var r: [..]keel.AbiValue = make(g.alloc)
+    for let t: keel.Type in returns {
+        try push(inout r, keel.abi(t, keel.Extension.plain))
+    }
+    return ok.(value: keel.signature(g.m, p, r, false))
+}
+
+// Symbols.
+
+fn find_symbol(g: Gen, name: []u8) -> ?keel.Symbol {
+    return match maps.get_text(g.symbols, name) {
+        some(value as n: u32) { some.(value: g.syms[usize.(n)]) }
+        none { none }
+    }
+}
+
+fn record_symbol(g: inout Gen, name: []u8, s: keel.Symbol) -> ! OutOfMemory {
+    try maps.put_text(inout g.symbols, name, u32.(g.syms.len))
+    try push(inout g.syms, s)
+    return ok
+}
+
+// The symbol of a function code refers to, declared with sig the first
+// time.
+fn function_symbol(g: inout Gen, name: []u8, sig: keel.Signature) -> keel.Symbol ! OutOfMemory {
+    match find_symbol(g, name) {
+        some(value as s: keel.Symbol) {
+            return ok.(value: s)
+        }
+        none {
+        }
+    }
+    let s: keel.Symbol = keel.declare_function(g.m, name, sig)
+    try record_symbol(inout g, name, s)
+    return ok.(value: s)
+}
+
+// A function definition, turning an earlier declaration into it.
+fn define(g: inout Gen, name: []u8, sig: keel.Signature) -> keel.Function ! OutOfMemory {
+    match find_symbol(g, name) {
+        some(value as s: keel.Symbol) {
+            return ok.(value: keel.define_function(g.m, s))
+        }
+        none {
+        }
+    }
+    let f: keel.Function = keel.add_function(g.m, name, sig)
+    try record_symbol(inout g, name, keel.function_symbol(g.m, f))
+    return ok.(value: f)
+}
+
+// The symbol of a data object code refers to, declared the first time.
+fn data_symbol(g: inout Gen, name: []u8) -> keel.Symbol ! OutOfMemory {
+    match find_symbol(g, name) {
+        some(value as s: keel.Symbol) {
+            return ok.(value: s)
+        }
+        none {
+        }
+    }
+    let s: keel.Symbol = keel.declare_global(g.m, name)
+    try record_symbol(inout g, name, s)
+    return ok.(value: s)
+}
+
+// Defines a data object, in the place of its declaration if code
+// referred to it first.
+fn define_data(g: inout Gen, name: []u8, items: []keel.Item, align: u32, flags: u32) -> keel.Symbol ! OutOfMemory {
+    let s: keel.Symbol = try keel.add_global(g.alloc, g.m, name, items, align, flags)
+    match find_symbol(g, name) {
+        some(value: _) {
+        }
+        none {
+            try record_symbol(inout g, name, s)
+        }
+    }
+    return ok.(value: s)
+}
+
+// The data object holding a string's bytes and a NUL after them.
+fn string_symbol(g: inout Gen, bytes: []u8) -> keel.Symbol ! OutOfMemory {
+    match maps.get_text(g.strings, bytes) {
+        some(value as n: u32) {
+            return ok.(value: g.syms[usize.(n)])
+        }
+        none {
+        }
+    }
+    let name: []u8 = try program.format_text(g.alloc, "tern.str.{g.string_count}")
+    g.string_count += 1
+    var with_nul: [..]u8 = make(g.alloc)
+    try append(inout with_nul, bytes)
+    try push(inout with_nul, 0)
+    let items: [1]keel.Item = [keel.Item.bytes.(bytes: with_nul)]
+    let s: keel.Symbol = try define_data(inout g, name, items, 1, keel.constant | keel.local)
+    let key: []u8 = with_nul[..bytes.len]
+    try maps.put_text(inout g.strings, key, u32.(g.syms.len - 1))
+    return ok.(value: s)
+}
+
+// The symbol of `tern.grow(v: *[..]T, size, align, needed) -> bool`,
+// which makes room for `needed` elements of `size` bytes, through the
+// array's allocator.
+fn grow_symbol(g: inout Gen) -> keel.Symbol ! OutOfMemory {
+    match g.grow {
+        some(value as s: keel.Symbol) {
+            return ok.(value: s)
+        }
+        none {
+        }
+    }
+    let int64: keel.Type = keel.Type.int64
+    let ptr: keel.Type = keel.Type.ptr
+    let params: [4]keel.AbiValue = [keel.abi(ptr, keel.Extension.plain), keel.abi(int64, keel.Extension.plain), keel.abi(int64, keel.Extension.plain), keel.abi(int64, keel.Extension.plain)]
+    let returns: [1]keel.AbiValue = [keel.abi(keel.Type.int8, keel.Extension.zero)]
+    let sig: keel.Signature = keel.signature(g.m, params, returns, false)
+    let m: keel.Module = g.m
+    let f: keel.Function = try define(inout g, "tern.grow", sig)
+    keel.set_local(m, f)
+    let s: keel.Symbol = keel.function_symbol(m, f)
+    // Callers test the capacity first, so this only runs to grow.
+    keel.set_attributes(m, s, keel.noinline | keel.cold)
+    let entry: keel.Block = keel.create_block(m, f)
+    let v: keel.Value = keel.block_param(m, entry, ptr)
+    let size: keel.Value = keel.block_param(m, entry, int64)
+    let align: keel.Value = keel.block_param(m, entry, int64)
+    let needed: keel.Value = keel.block_param(m, entry, int64)
+    let off16: keel.Value = keel.iconst(m, entry, int64, 16)
+    let cap_addr: keel.Value = keel.ptradd(m, entry, v, off16)
+    let cap: keel.Value = keel.load(m, entry, int64, cap_addr)
+    let enough: keel.Value = keel.icmp(m, entry, keel.IntCC.ule, needed, cap)
+    let done: keel.Block = keel.create_block(m, f)
+    let grow: keel.Block = keel.create_block(m, f)
+    keel.brif(m, entry, enough, done, grow)
+    let one: [1]keel.Value = [keel.iconst(m, done, keel.Type.int8, 1)]
+    keel.ret(m, done, one)
+    // The new capacity: twice the old, at least 4 and at least needed.
+    let two: keel.Value = keel.iconst(m, grow, int64, 2)
+    let doubled: keel.Value = keel.binary(m, grow, keel.BinaryOp.imul, cap, two)
+    let four: keel.Value = keel.iconst(m, grow, int64, 4)
+    let more: keel.Value = keel.icmp(m, grow, keel.IntCC.ugt, doubled, four)
+    let base: keel.Value = keel.select(m, grow, more, doubled, four)
+    let fits: keel.Value = keel.icmp(m, grow, keel.IntCC.ugt, base, needed)
+    let new_cap: keel.Value = keel.select(m, grow, fits, base, needed)
+    let bytes: keel.Overflow = keel.overflow(m, grow, keel.OverflowOp.umul, new_cap, size)
+    let fail: keel.Block = keel.create_block(m, f)
+    let call: keel.Block = keel.create_block(m, f)
+    keel.brif(m, grow, bytes.overflow, fail, call)
+    let zero: [1]keel.Value = [keel.iconst(m, fail, keel.Type.int8, 0)]
+    keel.ret(m, fail, zero)
+    // alloc is at offset 24: context, alloc, resize, free.
+    let old: keel.Value = keel.load(m, call, ptr, v)
+    let context: keel.Value = load_at(m, call, v, 24, ptr)
+    let zero64: keel.Value = keel.iconst(m, call, int64, 0)
+    let null: keel.Value = keel.convert(m, call, keel.ConvertOp.int_to_ptr, ptr, zero64)
+    let fresh: keel.Value = keel.icmp(m, call, keel.IntCC.eq, old, null)
+    let alloc_block: keel.Block = keel.create_block(m, f)
+    let resize_block: keel.Block = keel.create_block(m, f)
+    let after: keel.Block = keel.create_block(m, f)
+    let result: keel.Value = keel.block_param(m, after, ptr)
+    keel.brif(m, call, fresh, alloc_block, resize_block)
+    let alloc_fn: keel.Value = load_at(m, alloc_block, v, 32, ptr)
+    let alloc_params: [3]keel.Type = [ptr, int64, int64]
+    let ptr_result: [1]keel.Type = [ptr]
+    let alloc_sig: keel.Signature = try plain_signature(g, alloc_params, ptr_result)
+    let alloc_args: [3]keel.Value = [context, bytes.result, align]
+    let fresh_p: [1]keel.Value = [keel.call_indirect_value(m, alloc_block, alloc_sig, alloc_fn, alloc_args)]
+    keel.jump_with(m, alloc_block, after, fresh_p)
+    let resize_fn: keel.Value = load_at(m, resize_block, v, 40, ptr)
+    let resize_params: [5]keel.Type = [ptr, ptr, int64, int64, int64]
+    let resize_sig: keel.Signature = try plain_signature(g, resize_params, ptr_result)
+    let old_bytes: keel.Value = keel.binary(m, resize_block, keel.BinaryOp.imul, cap, size)
+    let resize_args: [5]keel.Value = [context, old, old_bytes, bytes.result, align]
+    let moved_p: [1]keel.Value = [keel.call_indirect_value(m, resize_block, resize_sig, resize_fn, resize_args)]
+    keel.jump_with(m, resize_block, after, moved_p)
+    let failed: keel.Value = keel.icmp(m, after, keel.IntCC.eq, result, null)
+    let stored: keel.Block = keel.create_block(m, f)
+    keel.brif(m, after, failed, fail, stored)
+    keel.store(m, stored, result, v)
+    keel.store(m, stored, new_cap, cap_addr)
+    let one_more: [1]keel.Value = [keel.iconst(m, stored, keel.Type.int8, 1)]
+    keel.ret(m, stored, one_more)
+    g.grow = some.(value: s)
+    return ok.(value: s)
+}
+
+fn load_at(m: keel.Module, b: keel.Block, base: keel.Value, off: i64, ty: keel.Type) -> keel.Value {
+    let n: keel.Value = keel.iconst(m, b, keel.Type.int64, off)
+    let addr: keel.Value = keel.ptradd(m, b, base, n)
+    return keel.load(m, b, ty, addr)
+}
+
+// One field of a constant PanicInfo, at its offset.
+type SiteField (offset: u64, items: [..]keel.Item)
+
+fn item_size(item: keel.Item) -> u64 {
+    return match item {
+        bytes(bytes as b: []u8) { u64.(b.len) }
+        zero(size: u32) { u64.(size) }
+        integer(ty: keel.Type, value: _) { type_size(ty) }
+        pointer(symbol: _) { 8 }
+    }
+}
+
+// A constant `PanicInfo` for a panic at line and column of path in
+// function, with an empty message the helper fills in.
+fn panic_site(g: inout Gen, path: []u8, function: []u8, line: u32, column: u32) -> keel.Symbol ! OutOfMemory {
+    let info_ty: check.TyId = try check.named_ty(inout g.types, check.NamedId.builtin.(which: check.BuiltinNamed.panic_info))
+    var fields: [..]SiteField = make(g.alloc)
+    let texts: [2][]u8 = [path, function]
+    let text_fields: [2][]u8 = ["file", "function"]
+    for let i: usize in 0..2 {
+        let text: []u8 = texts[i]
+        let s: keel.Symbol = try string_symbol(inout g, text)
+        let f: FieldInfo = try field_of(inout g, info_ty, text_fields[i])
+        var items: [..]keel.Item = make(g.alloc)
+        try push(inout items, keel.Item.pointer.(symbol: s))
+        try push(inout items, keel.Item.integer.(ty: keel.Type.int64, value: i64.(text.len)))
+        try push(inout fields, SiteField.(offset: f.offset, items: items))
+    }
+    let numbers: [2]u32 = [line, column]
+    let number_fields: [2][]u8 = ["line", "column"]
+    for let i: usize in 0..2 {
+        let f: FieldInfo = try field_of(inout g, info_ty, number_fields[i])
+        var items: [..]keel.Item = make(g.alloc)
+        try push(inout items, keel.Item.integer.(ty: keel.Type.int32, value: i64.(numbers[i])))
+        try push(inout fields, SiteField.(offset: f.offset, items: items))
+    }
+    // By offset; insertion keeps equal offsets in order, as a stable sort.
+    for let i: usize in 1..fields.len {
+        var j: usize = i
+        for j > 0 && fields[j - 1].offset > fields[j].offset {
+            let held: SiteField = fields[j]
+            fields[j] = fields[j - 1]
+            fields[j - 1] = held
+            j -= 1
+        }
+    }
+    let layout: TyLayout = try ty_layout(inout g, info_ty)
+    var items: [..]keel.Item = make(g.alloc)
+    var at: u64 = 0
+    for let field: SiteField in fields {
+        if field.offset > at {
+            try push(inout items, keel.Item.zero.(size: u32.(field.offset - at)))
+        }
+        at = field.offset
+        for let item: keel.Item in field.items {
+            at += item_size(item)
+        }
+        try append(inout items, field.items)
+    }
+    if layout.size > at {
+        try push(inout items, keel.Item.zero.(size: u32.(layout.size - at)))
+    }
+    let name: []u8 = try program.format_text(g.alloc, "tern.panic_site.{g.panic_sites}")
+    g.panic_sites += 1
+    return define_data(inout g, name, items, u32.(layout.align), keel.constant | keel.local)
+}
+
+// `std.fmt.Part`, if the program uses std.fmt.
+fn fmt_part(g: inout Gen) -> ?check.TyId ! OutOfMemory {
+    match program.find_package(g.program, "std.fmt") {
+        some(value as index: u32) {
+            match maps.get_name(g.names.scopes[usize.(index)], "Part") {
+                some(value as decl: maps.DeclRef) {
+                    let id: check.NamedId = check.NamedId.decl.(decl: decl)
+                    match check.named_info(g.types, id) {
+                        some(value: _) {
+                            return ok.(value: some.(value: try check.named_ty(inout g.types, id)))
+                        }
+                        none {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        none {
+        }
+    }
+    return ok.(value: none)
+}
+
+// The `@panic_handler` function: the program's own, or std.rt's.
+fn find_panic_handler(g: Gen) -> ?maps.DeclRef {
+    var found: ?maps.DeclRef = none
+    for let i: usize in 0..g.program.files.len {
+        let f: program.File = g.program.files[i]
+        for let index: usize in 0..f.ast.decls.len {
+            let decl: maps.DeclRef = maps.DeclRef.(file: u32.(i), index: u32.(index))
+            match f.ast.decls[index].kind {
+                function(is_unsafe: _, name: _, params: _, result: _, body: _) {
+                    if has_attribute(g, decl, "panic_handler") {
+                        let path: []u8 = g.program.packages[usize.(f.package)].path
+                        let in_std: bool = path.len >= 3 && same_text(path[..3], "std")
+                        let none_yet: bool = match found {
+                            none { true }
+                            some(value: _) { false }
+                        }
+                        if none_yet || !in_std {
+                            found = some.(value: decl)
+                        }
+                    }
+                }
+                _ {
+                }
+            }
+        }
+    }
+    return found
+}
+
+fn unsupported(g: inout Gen, what: []u8) -> ! OutOfMemory {
+    try push(inout g.errors, what)
+    return ok
+}

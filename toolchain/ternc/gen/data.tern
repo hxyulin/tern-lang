@@ -1,0 +1,785 @@
+// Globals: each initializer is a constant, evaluated here into bytes and
+// the addresses the linker fills in. Ported from stage 1's
+// codegen/data.rs.
+
+import check
+import keel
+import maps
+import program
+import resolve
+import syntax
+
+// Parses a decimal floating-point number, as C does: correctly rounded.
+extern fn strtod(text: *u8, end: ?*u8) -> f64
+
+// An address the linker writes at an offset of a global's bytes.
+type Reloc (offset: usize, symbol: keel.Symbol)
+
+// A global's bytes, with the offsets where the linker writes an address.
+type Bytes (data: [..]u8, relocs: [..]Reloc)
+
+fn gen_global(g: inout Gen, decl: maps.DeclRef) -> ! OutOfMemory {
+    match decl_of(g, decl).kind {
+        global(is_shared: _, local: syntax.Local) {
+            return global_data(inout g, decl, local)
+        }
+        _ {
+            return ok
+        }
+    }
+}
+
+fn global_data(g: inout Gen, decl: maps.DeclRef, local: syntax.Local) -> ! OutOfMemory {
+    var written: syntax.TypeId = syntax.TypeId.(0)
+    match local.binding {
+        single(name: _, ty: syntax.TypeId) {
+            written = ty
+        }
+        destructure(fields: _) {
+            return unsupported(inout g, "code generation does not support a destructured global yet")
+        }
+    }
+    let ty: check.TyId = written_type(g, decl.file, written)
+    let layout: TyLayout = try ty_layout(inout g, ty)
+    var size: usize = usize.(layout.size)
+    if size == 0 {
+        size = 1
+    }
+    var bytes: Bytes = Bytes.(data: make(g.alloc), relocs: make(g.alloc))
+    for let _: usize in 0..size {
+        try push(inout bytes.data, 0)
+    }
+    try constant(inout g, decl.file, local.value, ty, inout bytes, 0)
+    let name: []u8 = try symbol(inout g, decl)
+    let items: [..]keel.Item = try data_items(g.alloc, inout bytes)
+    var flags: u32 = keel.local
+    if !local.mutable {
+        flags = flags | keel.constant
+    }
+    let _: keel.Symbol = try define_data(inout g, name, items, u32.(layout.align), flags)
+    return ok
+}
+
+fn written_type(g: Gen, file: u32, id: syntax.TypeId) -> check.TyId {
+    match g.files[usize.(file)].types[usize.(id)] {
+        some(value as ty: check.TyId) {
+            return ty
+        }
+        none {
+            panic("internal error: a type the checker did not lower")
+        }
+    }
+}
+
+fn file_item(g: Gen, file: u32, e: syntax.ExprId) -> ?check.Item {
+    return g.files[usize.(file)].exprs[usize.(e)]
+}
+
+fn file_res(g: Gen, file: u32, e: syntax.ExprId) -> ?resolve.Res {
+    return g.names.files[usize.(file)].exprs[usize.(e)]
+}
+
+fn expr_of(g: Gen, file: u32, e: syntax.ExprId) -> syntax.Expr {
+    return g.program.files[usize.(file)].ast.exprs[usize.(e)]
+}
+
+fn builtin_named(res: ?resolve.Res, name: []u8) -> bool {
+    return match res {
+        some(value as r: resolve.Res) {
+            match r {
+                builtin(name as n: []u8) { same_text(n, name) }
+                _ { false }
+            }
+        }
+        none { false }
+    }
+}
+
+// The name a callee resolves to: `fill` in `fill[4](0)` as in `fill(0)`.
+fn callee_res(g: Gen, file: u32, callee: syntax.ExprId) -> ?resolve.Res {
+    return match expr_of(g, file, callee).kind {
+        index(value: syntax.ExprId, index: _) { file_res(g, file, value) }
+        _ { file_res(g, file, callee) }
+    }
+}
+
+// The value of a float literal.
+fn float_value(g: Gen, text: []u8) -> f64 ! OutOfMemory {
+    var digits: [..]u8 = make(g.alloc)
+    for let c: u8 in text {
+        if c != '_' {
+            try push(inout digits, c)
+        }
+    }
+    try push(inout digits, 0)
+    return ok.(value: unsafe { strtod(&digits[0], none) })
+}
+
+// The IEEE bits of a float, read through a pointer to an integer.
+fn f64_bits(x: f64) -> u64 {
+    let held: f64 = x
+    // SAFETY: the pointer is to held, which has the integer's size.
+    return unsafe { cast[*u64](&held).* }
+}
+
+fn f32_bits(x: f32) -> u32 {
+    let held: f32 = x
+    // SAFETY: the pointer is to held, which has the integer's size.
+    return unsafe { cast[*u32](&held).* }
+}
+
+// Writes the constant e, of type ty, at offset.
+fn constant(g: inout Gen, file: u32, e: syntax.ExprId, ty: check.TyId, out: inout Bytes, offset: usize) -> ! OutOfMemory {
+    let ast: syntax.Ast = g.program.files[usize.(file)].ast
+    let node: syntax.Expr = ast.exprs[usize.(e)]
+    let ty_core: check.TyId = core_ty(g, ty)
+    match node.kind {
+        paren(inner: syntax.ExprId) {
+            return constant(inout g, file, inner, ty, inout out, offset)
+        }
+        float {
+            let x: f64 = try float_value(g, file_text(g, file, node.span))
+            let layout: TyLayout = try ty_layout(inout g, ty)
+            if layout.size == 4 {
+                write(inout out, offset, check.wide(u64.(f32_bits(f32.(x)))), 4)
+            } else {
+                write(inout out, offset, check.wide(f64_bits(x)), 8)
+            }
+            return ok
+        }
+        str(parts: syntax.List) {
+            let text: [..]u8 = try string_bytes(g, file, parts)
+            let s: keel.Symbol = try string_symbol(inout g, text)
+            try push(inout out.relocs, Reloc.(offset: offset, symbol: s))
+            write(inout out, offset + 8, check.wide(u64.(text.len)), 8)
+            return ok
+        }
+        tuple(items: syntax.List) {
+            for let i: u32 in syntax.items(ast.extra, items) {
+                let item: syntax.TupleItem = ast.tuple_items[usize.(i)]
+                let f: FieldInfo = try field_of(inout g, ty_core, file_text(g, file, item.name))
+                try constant(inout g, file, item.value, f.ty, inout out, offset + usize.(f.offset))
+            }
+            return ok
+        }
+        array(elems: syntax.List) {
+            match check.get(g.types, ty_core) {
+                array(len: _, elem: check.TyId) {
+                    let el: TyLayout = try ty_layout(inout g, elem)
+                    let size: usize = usize.(el.size)
+                    var i: usize = 0
+                    for let x: u32 in syntax.items(ast.extra, elems) {
+                        try constant(inout g, file, syntax.ExprId.(x), elem, inout out, offset + i * size)
+                        i += 1
+                    }
+                }
+                _ {
+                }
+            }
+            return ok
+        }
+        construct(ty as target: syntax.ExprId, value: syntax.ExprId) {
+            var item: ?check.Item = file_item(g, file, target)
+            match file_res(g, file, target) {
+                some(value as r: resolve.Res) {
+                    match r {
+                        builtin(name: []u8) {
+                            match name {
+                                "some", "ok", "err" {
+                                    item = some.(value: check.Item.builtin.(name: name))
+                                }
+                                _ {
+                                }
+                            }
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            match item {
+                some(value as it: check.Item) {
+                    match it {
+                        variant(ty as enum_ty: check.TyId, index: u32) {
+                            return variant_constant(inout g, file, enum_ty, usize.(index), some.(value: value), inout out, offset)
+                        }
+                        builtin(name: []u8) {
+                            match try shape_of(inout g, ty) {
+                                some(value as shape: EnumShape) {
+                                    let index: usize = variant_index(shape, name)
+                                    return variant_constant(inout g, file, ty, index, some.(value: value), inout out, offset)
+                                }
+                                none {
+                                }
+                            }
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            if !is_union(g, ty_core) {
+                match try fields_of(inout g, ty_core) {
+                    some(value: _) {
+                        return constant(inout g, file, value, ty_core, inout out, offset)
+                    }
+                    none {
+                    }
+                }
+            }
+            // A conversion or a newtype: one value in parentheses.
+            let inner: syntax.ExprId = match ast.exprs[usize.(value)].kind {
+                paren(inner as x: syntax.ExprId) { x }
+                _ { value }
+            }
+            return constant(inout g, file, inner, ty, inout out, offset)
+        }
+        call(callee: syntax.ExprId, args: syntax.List) {
+            let res: ?resolve.Res = callee_res(g, file, callee)
+            let arg_ids: []u32 = syntax.items(ast.extra, args)
+            if builtin_named(res, "fill") {
+                match check.get(g.types, ty_core) {
+                    array(len: u64, elem: check.TyId) {
+                        let el: TyLayout = try ty_layout(inout g, elem)
+                        let size: usize = usize.(el.size)
+                        let first: syntax.Arg = ast.args[usize.(arg_ids[0])]
+                        for let i: usize in 0..usize.(len) {
+                            try constant(inout g, file, first.value, elem, inout out, offset + i * size)
+                        }
+                    }
+                    _ {
+                    }
+                }
+                return ok
+            }
+            if builtin_named(res, "c_string") {
+                let first: syntax.Arg = ast.args[usize.(arg_ids[0])]
+                match ast.exprs[usize.(first.value)].kind {
+                    str(parts: syntax.List) {
+                        let text: [..]u8 = try string_bytes(g, file, parts)
+                        let s: keel.Symbol = try string_symbol(inout g, text)
+                        try push(inout out.relocs, Reloc.(offset: offset, symbol: s))
+                    }
+                    _ {
+                    }
+                }
+                return ok
+            }
+        }
+        name(name: _) {
+            if try named_constant(inout g, file, e, ty, inout out, offset) {
+                return ok
+            }
+        }
+        field(value: _, name: _) {
+            if try named_constant(inout g, file, e, ty, inout out, offset) {
+                return ok
+            }
+        }
+        _ {
+        }
+    }
+    let layout: TyLayout = try ty_layout(inout g, ty)
+    match try const_int(inout g, file, e, 0) {
+        some(value as n: check.Wide) {
+            write(inout out, offset, n, usize.(layout.size))
+        }
+        none {
+            let text: []u8 = file_text(g, file, node.span)
+            try unsupported(inout g, try program.format_text(g.alloc, "code generation cannot evaluate the constant `{text}` yet"))
+        }
+    }
+    return ok
+}
+
+// A name or field in a constant: a function's address, another global's
+// value, `none`, or a variant. False if it is none of those.
+fn named_constant(g: inout Gen, file: u32, e: syntax.ExprId, ty: check.TyId, out: inout Bytes, offset: usize) -> bool ! OutOfMemory {
+    match file_res(g, file, e) {
+        some(value as r: resolve.Res) {
+            match r {
+                decl(decl: maps.DeclRef) {
+                    match decl_of(g, decl).kind {
+                        function(is_unsafe: _, name: _, params: _, result: _, body: _) {
+                            let s: keel.Symbol = try decl_function_symbol(inout g, decl)
+                            try push(inout out.relocs, Reloc.(offset: offset, symbol: s))
+                            return ok.(value: true)
+                        }
+                        extern_fn(name: _, params: _, variadic: _, result: _) {
+                            let s: keel.Symbol = try decl_function_symbol(inout g, decl)
+                            try push(inout out.relocs, Reloc.(offset: offset, symbol: s))
+                            return ok.(value: true)
+                        }
+                        global(is_shared: _, local: syntax.Local) {
+                            try constant(inout g, decl.file, local.value, ty, inout out, offset)
+                            return ok.(value: true)
+                        }
+                        _ {
+                        }
+                    }
+                }
+                builtin(name: []u8) {
+                    if same_text(name, "none") {
+                        return ok.(value: true)
+                    }
+                }
+                _ {
+                }
+            }
+        }
+        none {
+        }
+    }
+    match expr_of(g, file, e).kind {
+        field(value: _, name: syntax.Span) {
+            let name_text: []u8 = file_text(g, file, name)
+            match file_item(g, file, e) {
+                some(value as it: check.Item) {
+                    match it {
+                        value(ty as vty: check.TyId) {
+                            if !same_text(name_text, "len") {
+                                match try shape_of(inout g, vty) {
+                                    some(value as shape: EnumShape) {
+                                        let index: usize = variant_index(shape, name_text)
+                                        try variant_constant(inout g, file, vty, index, none, inout out, offset)
+                                        return ok.(value: true)
+                                    }
+                                    none {
+                                    }
+                                }
+                            }
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        _ {
+        }
+    }
+    return ok.(value: false)
+}
+
+// The symbol of a function declaration, declared if it is not yet in the
+// module.
+fn decl_function_symbol(g: inout Gen, decl: maps.DeclRef) -> keel.Symbol ! OutOfMemory {
+    let name: []u8 = try symbol(inout g, decl)
+    let abi: FnAbi = try decl_abi(inout g, decl)
+    return function_symbol(inout g, name, abi.sig)
+}
+
+fn variant_constant(g: inout Gen, file: u32, ty: check.TyId, index: usize, payload: ?syntax.ExprId, out: inout Bytes, offset: usize) -> ! OutOfMemory {
+    var shape: EnumShape = EnumShape.(variants: make(g.alloc), kind: EnumKind.nullable_pointer)
+    match try shape_of(inout g, ty) {
+        some(value as s: EnumShape) {
+            shape = s
+        }
+        none {
+            panic("internal error: a variant of something that is not an enum")
+        }
+    }
+    let variant: VariantShape = shape.variants[index]
+    match shape.kind {
+        scalar_tag(tag: keel.Type) {
+            write(inout out, offset, wide_from_i64(variant.tag), usize.(type_size(tag)))
+        }
+        nullable_pointer {
+            match payload {
+                some(value as value: syntax.ExprId) {
+                    match variant.payload {
+                        some(value as p: check.TyId) {
+                            // some.(value: f): the pointer itself.
+                            let f: FieldInfo = try field_of(inout g, p, "value")
+                            let inner: syntax.ExprId = tuple_field_expr(g, file, value, "value")
+                            try constant(inout g, file, inner, f.ty, inout out, offset)
+                        }
+                        none {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        tagged(tag: keel.Type, payload_offset: u64) {
+            write(inout out, offset, wide_from_i64(variant.tag), usize.(type_size(tag)))
+            match payload {
+                some(value as value: syntax.ExprId) {
+                    match variant.payload {
+                        some(value as p: check.TyId) {
+                            try constant(inout g, file, value, p, inout out, offset + usize.(payload_offset))
+                        }
+                        none {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+    }
+    return ok
+}
+
+// The expression for one field of a tuple literal.
+fn tuple_field_expr(g: Gen, file: u32, e: syntax.ExprId, field: []u8) -> syntax.ExprId {
+    let ast: syntax.Ast = g.program.files[usize.(file)].ast
+    match ast.exprs[usize.(e)].kind {
+        tuple(items: syntax.List) {
+            for let i: u32 in syntax.items(ast.extra, items) {
+                let item: syntax.TupleItem = ast.tuple_items[usize.(i)]
+                if same_text(file_text(g, file, item.name), field) {
+                    return item.value
+                }
+            }
+            return e
+        }
+        paren(inner: syntax.ExprId) {
+            return tuple_field_expr(g, file, inner, field)
+        }
+        _ {
+            return e
+        }
+    }
+}
+
+fn wide_from_i64(n: i64) -> check.Wide {
+    if n >= 0 {
+        return check.wide(u64.(n))
+    }
+    // -n, as -(n + 1) + 1, which fits even for the minimum.
+    return check.wide_neg(check.wide(u64.(-(n + 1)) + 1))
+}
+
+// The low 64 bits of a value, as Rust's `as i64` takes them.
+fn low_i64(w: check.Wide) -> i64 {
+    if w.lo >> 63 == 0 {
+        return i64.(w.lo)
+    }
+    return -i64.(~w.lo) - 1
+}
+
+fn bool_wide(b: bool) -> check.Wide {
+    if b {
+        return check.wide(1)
+    }
+    return check.wide(0)
+}
+
+// The value of an integer constant, before it is cut to its type.
+fn const_int(g: inout Gen, file: u32, e: syntax.ExprId, depth: u32) -> ?check.Wide ! OutOfMemory {
+    if depth > 64 {
+        return ok.(value: none)
+    }
+    let ast: syntax.Ast = g.program.files[usize.(file)].ast
+    let node: syntax.Expr = ast.exprs[usize.(e)]
+    match node.kind {
+        int {
+            return ok.(value: check.parse_int(file_text(g, file, node.span)))
+        }
+        char {
+            return ok.(value: check.char_value(file_text(g, file, node.span)))
+        }
+        paren(inner: syntax.ExprId) {
+            return const_int(inout g, file, inner, depth)
+        }
+        unary(op: syntax.UnaryOp, operand: syntax.ExprId) {
+            var n: check.Wide = check.wide(0)
+            match try const_int(inout g, file, operand, depth) {
+                some(value as v: check.Wide) {
+                    n = v
+                }
+                none {
+                    return ok.(value: none)
+                }
+            }
+            return match op {
+                neg { ok.(value: some.(value: check.wide_neg(n))) }
+                bit_not { ok.(value: some.(value: check.wide_not(n))) }
+                not { ok.(value: some.(value: bool_wide(check.wide_equal(n, check.wide(0))))) }
+                address_of { ok.(value: none) }
+            }
+        }
+        binary(op: syntax.BinaryOp, left: syntax.ExprId, right: syntax.ExprId) {
+            var a: check.Wide = check.wide(0)
+            match try const_int(inout g, file, left, depth) {
+                some(value as v: check.Wide) {
+                    a = v
+                }
+                none {
+                    return ok.(value: none)
+                }
+            }
+            var b: check.Wide = check.wide(0)
+            match try const_int(inout g, file, right, depth) {
+                some(value as v: check.Wide) {
+                    b = v
+                }
+                none {
+                    return ok.(value: none)
+                }
+            }
+            let zero: check.Wide = check.wide(0)
+            return match op {
+                add { ok.(value: check.wide_add(a, b)) }
+                sub { ok.(value: check.wide_sub(a, b)) }
+                mul { ok.(value: check.wide_mul(a, b)) }
+                div { ok.(value: check.wide_div(a, b)) }
+                rem { ok.(value: check.wide_rem(a, b)) }
+                shl { ok.(value: check.wide_shl(a, b)) }
+                shr { ok.(value: check.wide_shr(a, b)) }
+                bit_and { ok.(value: some.(value: check.wide_and(a, b))) }
+                bit_or { ok.(value: some.(value: check.wide_or(a, b))) }
+                bit_xor { ok.(value: some.(value: check.wide_xor(a, b))) }
+                and { ok.(value: some.(value: bool_wide(!check.wide_equal(a, zero) && !check.wide_equal(b, zero)))) }
+                or { ok.(value: some.(value: bool_wide(!check.wide_equal(a, zero) || !check.wide_equal(b, zero)))) }
+                eq { ok.(value: some.(value: bool_wide(check.wide_equal(a, b)))) }
+                ne { ok.(value: some.(value: bool_wide(!check.wide_equal(a, b)))) }
+                lt { ok.(value: some.(value: bool_wide(check.wide_less(a, b)))) }
+                le { ok.(value: some.(value: bool_wide(!check.wide_less(b, a)))) }
+                gt { ok.(value: some.(value: bool_wide(check.wide_less(b, a)))) }
+                ge { ok.(value: some.(value: bool_wide(!check.wide_less(a, b)))) }
+            }
+        }
+        construct(ty: _, value: syntax.ExprId) {
+            return const_int(inout g, file, value, depth)
+        }
+        call(callee: syntax.ExprId, args: syntax.List) {
+            let res: ?resolve.Res = callee_res(g, file, callee)
+            if builtin_named(res, "truncate") || builtin_named(res, "from_address") {
+                let first: syntax.Arg = ast.args[usize.(syntax.items(ast.extra, args)[0])]
+                return const_int(inout g, file, first.value, depth)
+            }
+            return ok.(value: none)
+        }
+        name(name: _) {
+            return named_int(inout g, file, e, depth)
+        }
+        field(value: _, name: _) {
+            return named_int(inout g, file, e, depth)
+        }
+        _ {
+            return ok.(value: none)
+        }
+    }
+}
+
+fn named_int(g: inout Gen, file: u32, e: syntax.ExprId, depth: u32) -> ?check.Wide ! OutOfMemory {
+    match file_res(g, file, e) {
+        some(value as r: resolve.Res) {
+            match r {
+                builtin(name: []u8) {
+                    if same_text(name, "true") {
+                        return ok.(value: some.(value: check.wide(1)))
+                    }
+                    if same_text(name, "false") {
+                        return ok.(value: some.(value: check.wide(0)))
+                    }
+                    return ok.(value: none)
+                }
+                decl(decl: maps.DeclRef) {
+                    match decl_of(g, decl).kind {
+                        global(is_shared: _, local: syntax.Local) {
+                            if !local.mutable {
+                                return const_int(inout g, decl.file, local.value, depth + 1)
+                            }
+                        }
+                        _ {
+                        }
+                    }
+                    return ok.(value: none)
+                }
+                _ {
+                    return ok.(value: none)
+                }
+            }
+        }
+        none {
+        }
+    }
+    let ast: syntax.Ast = g.program.files[usize.(file)].ast
+    var value: syntax.ExprId = syntax.ExprId.(0)
+    var name_span: syntax.Span = syntax.Span.(start: 0, end: 0)
+    match ast.exprs[usize.(e)].kind {
+        field(value as v: syntax.ExprId, name as n: syntax.Span) {
+            value = v
+            name_span = n
+        }
+        _ {
+            return ok.(value: none)
+        }
+    }
+    let name: []u8 = file_text(g, file, name_span)
+    var base: check.TyId = check.TyId.(0)
+    match file_item(g, file, value) {
+        some(value as it: check.Item) {
+            match it {
+                value(ty: check.TyId) {
+                    base = ty
+                }
+                type_item(ty: check.TyId) {
+                    base = ty
+                }
+                _ {
+                    return ok.(value: none)
+                }
+            }
+        }
+        none {
+            return ok.(value: none)
+        }
+    }
+    if same_text(name, "len") {
+        match check.get(g.types, core_ty(g, base)) {
+            array(len: u64, elem: _) {
+                return ok.(value: some.(value: check.wide(len)))
+            }
+            _ {
+            }
+        }
+        match ast.exprs[usize.(value)].kind {
+            str(parts: syntax.List) {
+                let text: [..]u8 = try string_bytes(g, file, parts)
+                return ok.(value: some.(value: check.wide(u64.(text.len))))
+            }
+            _ {
+            }
+        }
+    }
+    match try shape_of(inout g, base) {
+        some(value as shape: EnumShape) {
+            for let v: VariantShape in shape.variants {
+                if same_text(v.name, name) {
+                    return match shape.kind {
+                        scalar_tag(tag: _) { ok.(value: some.(value: wide_from_i64(v.tag))) }
+                        _ { ok.(value: none) }
+                    }
+                }
+            }
+        }
+        none {
+        }
+    }
+    return ok.(value: none)
+}
+
+// The bytes of a string literal without interpolation, escapes decoded.
+fn string_bytes(g: Gen, file: u32, parts: syntax.List) -> [..]u8 ! OutOfMemory {
+    let ast: syntax.Ast = g.program.files[usize.(file)].ast
+    var out: [..]u8 = make(g.alloc)
+    for let i: u32 in syntax.items(ast.extra, parts) {
+        match ast.str_parts[usize.(i)] {
+            text(span: syntax.Span) {
+                try unescape(file_text(g, file, span), inout out)
+            }
+            interpolation(value: _) {
+            }
+        }
+    }
+    return ok.(value: out)
+}
+
+fn hex_digit(c: u8) -> u8 {
+    if c >= '0' && c <= '9' {
+        return c - '0'
+    }
+    if c >= 'a' && c <= 'f' {
+        return c - 'a' + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return c - 'A' + 10
+    }
+    return 255
+}
+
+// Decodes `\n \t \r \0 \\ \" \' \{ \xNN`.
+fn unescape(text: []u8, out: inout [..]u8) -> ! OutOfMemory {
+    var i: usize = 0
+    for i < text.len {
+        if text[i] == '\\' && i + 1 < text.len {
+            let c: u8 = text[i + 1]
+            i += 2
+            var b: u8 = c
+            match c {
+                'n' {
+                    b = '\n'
+                }
+                't' {
+                    b = '\t'
+                }
+                'r' {
+                    b = '\r'
+                }
+                '0' {
+                    b = 0
+                }
+                'x' {
+                    if i + 1 < text.len {
+                        let hi: u8 = hex_digit(text[i])
+                        let lo: u8 = hex_digit(text[i + 1])
+                        i += 2
+                        b = 0
+                        if hi < 16 && lo < 16 {
+                            b = hi * 16 + lo
+                        }
+                    }
+                }
+                _ {
+                }
+            }
+            try push(inout out, b)
+        } else {
+            try push(inout out, text[i])
+            i += 1
+        }
+    }
+    return ok
+}
+
+fn write(out: inout Bytes, offset: usize, value: check.Wide, size: usize) {
+    var n: usize = size
+    if n > 16 {
+        n = 16
+    }
+    for let i: usize in 0..n {
+        let at: usize = offset + i
+        if at < out.data.len {
+            let word: u64 = if i < 8 { value.lo } else { value.hi }
+            out.data[at] = u8.((word >> u64.((i % 8) * 8)) & 0xff)
+        }
+    }
+}
+
+// Splits bytes into keel data items at each address.
+fn data_items(alloc: Allocator, bytes: inout Bytes) -> [..]keel.Item ! OutOfMemory {
+    // By offset, keeping equal offsets in order.
+    for let i: usize in 1..bytes.relocs.len {
+        var j: usize = i
+        for j > 0 && bytes.relocs[j - 1].offset > bytes.relocs[j].offset {
+            let held: Reloc = bytes.relocs[j]
+            bytes.relocs[j] = bytes.relocs[j - 1]
+            bytes.relocs[j - 1] = held
+            j -= 1
+        }
+    }
+    var items: [..]keel.Item = make(alloc)
+    var at: usize = 0
+    for let r: Reloc in bytes.relocs {
+        if r.offset > at {
+            try push(inout items, keel.Item.bytes.(bytes: bytes.data[at..r.offset]))
+        }
+        try push(inout items, keel.Item.pointer.(symbol: r.symbol))
+        at = r.offset + 8
+    }
+    if at < bytes.data.len {
+        try push(inout items, keel.Item.bytes.(bytes: bytes.data[at..]))
+    }
+    return ok.(value: items)
+}

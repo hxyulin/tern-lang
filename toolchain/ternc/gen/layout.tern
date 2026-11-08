@@ -1,0 +1,737 @@
+// The layout of every type, following "A specified layout for every type"
+// in DESIGN.md: C's rules for records, a tag and then a C union for enums
+// with payloads, and a nullable pointer for `?*T`. Ported from stage 1's
+// codegen/layout.rs.
+//
+// Layouts, record fields and enum shapes are kept per type once worked
+// out.
+
+import check
+import keel
+
+// How a value of a type is held while code runs.
+pub type Repr enum {
+    // No bytes: `never`, an empty record.
+    unit
+    // One keel value.
+    scalar(ty: keel.Type)
+    // Bytes in memory, reached through their address.
+    memory
+}
+
+pub type TyLayout (size: u64, align: u64, repr: Repr)
+
+// A field of a record with its offset. A union's members all sit at 0.
+type FieldInfo (name: []u8, ty: check.TyId, offset: u64)
+
+type VariantShape (name: []u8, payload: ?check.TyId, tag: i64)
+
+type EnumKind enum {
+    // No payloads: the value is the tag.
+    scalar_tag(tag: keel.Type)
+    // A tag of this type, then the payloads at payload_offset.
+    tagged(tag: keel.Type, payload_offset: u64)
+    // `?*T` and an optional function: null is `none`.
+    nullable_pointer
+}
+
+// An enum, optional or result, as its variants and where they live.
+type EnumShape (variants: [..]VariantShape, kind: EnumKind)
+
+// What is known about a type's shape or fields.
+type ShapeSlot enum {
+    unknown
+    absent
+    found(shape: EnumShape)
+}
+
+type FieldsSlot enum {
+    unknown
+    absent
+    found(fields: [..]FieldInfo)
+}
+
+fn int_type(bits: u32) -> keel.Type {
+    return match bits {
+        8 { keel.Type.int8 }
+        16 { keel.Type.int16 }
+        32 { keel.Type.int32 }
+        _ { keel.Type.int64 }
+    }
+}
+
+fn scalar_layout(ty: keel.Type, size: u64) -> TyLayout {
+    return TyLayout.(size: size, align: size, repr: Repr.scalar.(ty: ty))
+}
+
+fn type_size(ty: keel.Type) -> u64 {
+    return match ty {
+        int8 { 1 }
+        int16 { 2 }
+        int32, float32 { 4 }
+        _ { 8 }
+    }
+}
+
+// n rounded up to a multiple of align, which is at least 1.
+fn round_up(n: u64, align: u64) -> u64 {
+    return (n + align - 1) / align * align
+}
+
+fn max_u64(a: u64, b: u64) -> u64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// The size and alignment of a record of fields with these layouts, by
+// C's rules, and each field's offset.
+type Placed (offsets: [..]u64, size: u64, align: u64)
+
+fn place_fields(alloc: Allocator, fields: []TyLayout) -> Placed ! OutOfMemory {
+    var offset: u64 = 0
+    var align: u64 = 1
+    var offsets: [..]u64 = make(alloc)
+    for let field: TyLayout in fields {
+        offset = round_up(offset, field.align)
+        try push(inout offsets, offset)
+        offset += field.size
+        align = max_u64(align, field.align)
+    }
+    return ok.(value: Placed.(offsets: offsets, size: round_up(offset, align), align: align))
+}
+
+pub fn ty_layout(g: inout Gen, ty: check.TyId) -> TyLayout ! OutOfMemory {
+    let index: usize = usize.(ty)
+    if index < g.layouts.len {
+        match g.layouts[index] {
+            some(value as known: TyLayout) {
+                return ok.(value: known)
+            }
+            none {
+            }
+        }
+    }
+    let computed: TyLayout = try compute_layout(inout g, ty)
+    for g.layouts.len <= index {
+        try push(inout g.layouts, none)
+    }
+    g.layouts[index] = some.(value: computed)
+    return ok.(value: computed)
+}
+
+pub fn ty_repr(g: inout Gen, ty: check.TyId) -> Repr ! OutOfMemory {
+    let l: TyLayout = try ty_layout(inout g, ty)
+    return ok.(value: l.repr)
+}
+
+// The keel type of a scalar, or i64 for anything else.
+fn scalar_of(g: inout Gen, ty: check.TyId) -> keel.Type ! OutOfMemory {
+    return match try ty_repr(inout g, ty) {
+        scalar(ty as t: keel.Type) { ok.(value: t) }
+        _ { ok.(value: keel.Type.int64) }
+    }
+}
+
+fn unit_layout() -> TyLayout {
+    return TyLayout.(size: 0, align: 1, repr: Repr.unit)
+}
+
+fn compute_layout(g: inout Gen, ty: check.TyId) -> TyLayout ! OutOfMemory {
+    match check.get(g.types, ty) {
+        int(int: check.IntTy) {
+            let bits: u32 = check.int_bits(int)
+            return ok.(value: scalar_layout(int_type(bits), u64.(bits / 8)))
+        }
+        float(bits: u32) {
+            if bits == 32 {
+                return ok.(value: scalar_layout(keel.Type.float32, 4))
+            }
+            return ok.(value: scalar_layout(keel.Type.float64, 8))
+        }
+        boolean {
+            return ok.(value: scalar_layout(keel.Type.int8, 1))
+        }
+        pointer(elem: _) {
+            return ok.(value: scalar_layout(keel.Type.ptr, 8))
+        }
+        function(params: _, result: _) {
+            return ok.(value: scalar_layout(keel.Type.ptr, 8))
+        }
+        never, error {
+            return ok.(value: unit_layout())
+        }
+        array(len: u64, elem: check.TyId) {
+            let e: TyLayout = try ty_layout(inout g, elem)
+            return ok.(value: TyLayout.(size: e.size * len, align: e.align, repr: Repr.memory))
+        }
+        named(id: _) {
+            match newtype_underlying(g, ty) {
+                some(value as u: check.TyId) {
+                    return ty_layout(inout g, u)
+                }
+                none {
+                }
+            }
+            match try shape_of(inout g, ty) {
+                some(value as shape: EnumShape) {
+                    return enum_layout(inout g, shape)
+                }
+                none {
+                }
+            }
+            match union_members(g, ty) {
+                some(value as members: []check.TupleField) {
+                    var size: u64 = 0
+                    var align: u64 = 1
+                    for let member: check.TupleField in members {
+                        let l: TyLayout = try ty_layout(inout g, member.ty)
+                        size = max_u64(size, l.size)
+                        align = max_u64(align, l.align)
+                    }
+                    return ok.(value: TyLayout.(size: round_up(size, align), align: align, repr: Repr.memory))
+                }
+                none {
+                }
+            }
+            return record_layout(inout g, ty)
+        }
+        optional(elem: _) {
+            match try shape_of(inout g, ty) {
+                some(value as shape: EnumShape) {
+                    return enum_layout(inout g, shape)
+                }
+                none {
+                    return ok.(value: unit_layout())
+                }
+            }
+        }
+        result(value: _, error: _) {
+            match try shape_of(inout g, ty) {
+                some(value as shape: EnumShape) {
+                    return enum_layout(inout g, shape)
+                }
+                none {
+                    return ok.(value: unit_layout())
+                }
+            }
+        }
+        tuple(fields: _) {
+            return record_layout(inout g, ty)
+        }
+        view(elem: _) {
+            return record_layout(inout g, ty)
+        }
+        growable(elem: _) {
+            return record_layout(inout g, ty)
+        }
+    }
+}
+
+fn enum_layout(g: inout Gen, shape: EnumShape) -> TyLayout ! OutOfMemory {
+    match shape.kind {
+        scalar_tag(tag: keel.Type) {
+            return ok.(value: scalar_layout(tag, type_size(tag)))
+        }
+        nullable_pointer {
+            return ok.(value: scalar_layout(keel.Type.ptr, 8))
+        }
+        tagged(tag: keel.Type, payload_offset: u64) {
+            var size: u64 = 0
+            var align: u64 = type_size(tag)
+            for let v: VariantShape in shape.variants {
+                match v.payload {
+                    some(value as p: check.TyId) {
+                        let l: TyLayout = try ty_layout(inout g, p)
+                        size = max_u64(size, l.size)
+                        align = max_u64(align, l.align)
+                    }
+                    none {
+                    }
+                }
+            }
+            return ok.(value: TyLayout.(size: round_up(payload_offset + size, align), align: align, repr: Repr.memory))
+        }
+    }
+}
+
+fn record_layout(g: inout Gen, ty: check.TyId) -> TyLayout ! OutOfMemory {
+    var layouts: [..]TyLayout = make(g.alloc)
+    match try fields_of(inout g, ty) {
+        some(value as fields: []FieldInfo) {
+            for let f: FieldInfo in fields {
+                try push(inout layouts, try ty_layout(inout g, f.ty))
+            }
+        }
+        none {
+        }
+    }
+    let placed: Placed = try place_fields(g.alloc, layouts)
+    let repr: Repr = if placed.size == 0 { Repr.unit } else { Repr.memory }
+    return ok.(value: TyLayout.(size: placed.size, align: placed.align, repr: repr))
+}
+
+// A named type that is not a record, enum or union: the type it names,
+// which has the same layout.
+pub fn newtype_underlying(g: Gen, ty: check.TyId) -> ?check.TyId {
+    match check.get(g.types, ty) {
+        named(id: check.NamedId) {
+            match check.named_info(g.types, id) {
+                some(value as info: check.NamedInfo) {
+                    match info.def {
+                        plain(underlying: check.TyId, pub_fields: _) {
+                            match check.get(g.types, underlying) {
+                                tuple(fields: _) {
+                                    return none
+                                }
+                                _ {
+                                    return some.(value: underlying)
+                                }
+                            }
+                        }
+                        _ {
+                            return none
+                        }
+                    }
+                }
+                none {
+                    return none
+                }
+            }
+        }
+        _ {
+            return none
+        }
+    }
+}
+
+// Strips newtypes.
+pub fn core_ty(g: Gen, ty: check.TyId) -> check.TyId {
+    var t: check.TyId = ty
+    for {
+        match newtype_underlying(g, t) {
+            some(value as u: check.TyId) {
+                t = u
+            }
+            none {
+                return t
+            }
+        }
+    }
+}
+
+fn union_members(g: Gen, ty: check.TyId) -> ?[]check.TupleField {
+    match check.get(g.types, ty) {
+        named(id: check.NamedId) {
+            match check.named_info(g.types, id) {
+                some(value as info: check.NamedInfo) {
+                    match info.def {
+                        union_def(fields: check.Range) {
+                            return some.(value: check.tuple_fields(g.types, fields))
+                        }
+                        _ {
+                            return none
+                        }
+                    }
+                }
+                none {
+                    return none
+                }
+            }
+        }
+        _ {
+            return none
+        }
+    }
+}
+
+fn is_union(g: Gen, ty: check.TyId) -> bool {
+    return match union_members(g, ty) {
+        some(value: _) { true }
+        none { false }
+    }
+}
+
+// A record's fields with their offsets: records, tuples, views and
+// growable arrays. A union's members all sit at offset 0.
+fn fields_of(g: inout Gen, ty: check.TyId) -> ?[]FieldInfo ! OutOfMemory {
+    let index: usize = usize.(ty)
+    if index < g.fields_cache.len {
+        match g.fields_cache[index] {
+            found(fields: [..]FieldInfo) {
+                return ok.(value: some.(value: fields))
+            }
+            absent {
+                return ok.(value: none)
+            }
+            unknown {
+            }
+        }
+    }
+    let computed: FieldsSlot = try compute_fields(inout g, ty)
+    for g.fields_cache.len <= index {
+        try push(inout g.fields_cache, FieldsSlot.unknown)
+    }
+    g.fields_cache[index] = computed
+    return match computed {
+        found(fields: [..]FieldInfo) { ok.(value: some.(value: fields)) }
+        _ { ok.(value: none) }
+    }
+}
+
+fn compute_fields(g: inout Gen, ty: check.TyId) -> FieldsSlot ! OutOfMemory {
+    var fields: [..]check.TupleField = make(g.alloc)
+    match check.get(g.types, ty) {
+        tuple(fields as r: check.Range) {
+            try append(inout fields, check.tuple_fields(g.types, r))
+        }
+        view(elem: check.TyId) {
+            let p: check.TyId = try check.intern(inout g.types, check.Ty.pointer.(elem: elem))
+            let n: check.TyId = try check.usize_ty(inout g.types)
+            try push(inout fields, check.TupleField.(name: "ptr", ty: p))
+            try push(inout fields, check.TupleField.(name: "len", ty: n))
+        }
+        growable(elem: check.TyId) {
+            let p: check.TyId = try check.intern(inout g.types, check.Ty.pointer.(elem: elem))
+            let q: check.TyId = try check.intern(inout g.types, check.Ty.optional.(elem: p))
+            let n: check.TyId = try check.usize_ty(inout g.types)
+            let a: check.TyId = try check.named_ty(inout g.types, check.NamedId.builtin.(which: check.BuiltinNamed.allocator))
+            try push(inout fields, check.TupleField.(name: "ptr", ty: q))
+            try push(inout fields, check.TupleField.(name: "len", ty: n))
+            try push(inout fields, check.TupleField.(name: "cap", ty: n))
+            try push(inout fields, check.TupleField.(name: "alloc", ty: a))
+        }
+        named(id: check.NamedId) {
+            match check.named_info(g.types, id) {
+                some(value as info: check.NamedInfo) {
+                    match info.def {
+                        plain(underlying: check.TyId, pub_fields: _) {
+                            match check.get(g.types, underlying) {
+                                tuple(fields as r: check.Range) {
+                                    try append(inout fields, check.tuple_fields(g.types, r))
+                                }
+                                _ {
+                                    return ok.(value: FieldsSlot.absent)
+                                }
+                            }
+                        }
+                        union_def(fields as r: check.Range) {
+                            var members: [..]FieldInfo = make(g.alloc)
+                            for let f: check.TupleField in check.tuple_fields(g.types, r) {
+                                try push(inout members, FieldInfo.(name: f.name, ty: f.ty, offset: 0))
+                            }
+                            return ok.(value: FieldsSlot.found.(fields: members))
+                        }
+                        enum_def(info: _) {
+                            return ok.(value: FieldsSlot.absent)
+                        }
+                    }
+                }
+                none {
+                    return ok.(value: FieldsSlot.absent)
+                }
+            }
+        }
+        _ {
+            return ok.(value: FieldsSlot.absent)
+        }
+    }
+    var layouts: [..]TyLayout = make(g.alloc)
+    for let f: check.TupleField in fields {
+        try push(inout layouts, try ty_layout(inout g, f.ty))
+    }
+    let placed: Placed = try place_fields(g.alloc, layouts)
+    var out: [..]FieldInfo = make(g.alloc)
+    for let i: usize in 0..fields.len {
+        try push(inout out, FieldInfo.(name: fields[i].name, ty: fields[i].ty, offset: placed.offsets[i]))
+    }
+    return ok.(value: FieldsSlot.found.(fields: out))
+}
+
+// The field the checker found.
+fn field_of(g: inout Gen, ty: check.TyId, name: []u8) -> FieldInfo ! OutOfMemory {
+    match try fields_of(inout g, ty) {
+        some(value as fields: []FieldInfo) {
+            for let f: FieldInfo in fields {
+                if same_text(f.name, name) {
+                    return ok.(value: f)
+                }
+            }
+        }
+        none {
+        }
+    }
+    panic("internal error: no field `{name}`")
+}
+
+fn same_text(a: []u8, b: []u8) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for let i: usize in 0..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// A named variant with its declared value, before tags are given.
+type NamedVariant (name: []u8, payload: ?check.TyId, value: ?check.Wide)
+
+pub fn shape_of(g: inout Gen, ty: check.TyId) -> ?EnumShape ! OutOfMemory {
+    let index: usize = usize.(ty)
+    if index < g.shapes.len {
+        match g.shapes[index] {
+            found(shape: EnumShape) {
+                return ok.(value: some.(value: shape))
+            }
+            absent {
+                return ok.(value: none)
+            }
+            unknown {
+            }
+        }
+    }
+    let computed: ShapeSlot = try compute_shape(inout g, ty)
+    for g.shapes.len <= index {
+        try push(inout g.shapes, ShapeSlot.unknown)
+    }
+    g.shapes[index] = computed
+    return match computed {
+        found(shape: EnumShape) { ok.(value: some.(value: shape)) }
+        _ { ok.(value: none) }
+    }
+}
+
+fn is_pointer_like(g: Gen, ty: check.TyId) -> bool {
+    return match check.get(g.types, core_ty(g, ty)) {
+        pointer(elem: _) { true }
+        function(params: _, result: _) { true }
+        _ { false }
+    }
+}
+
+fn compute_shape(g: inout Gen, ty: check.TyId) -> ShapeSlot ! OutOfMemory {
+    var named: [..]NamedVariant = make(g.alloc)
+    var int: ?check.IntTy = none
+    match check.get(g.types, ty) {
+        optional(elem: check.TyId) {
+            let payload: check.TyId = try check.single_field(inout g.types, "value", elem)
+            if is_pointer_like(g, elem) {
+                var variants: [..]VariantShape = make(g.alloc)
+                try push(inout variants, VariantShape.(name: "none", payload: none, tag: 0))
+                try push(inout variants, VariantShape.(name: "some", payload: some.(value: payload), tag: 1))
+                return ok.(value: ShapeSlot.found.(shape: EnumShape.(variants: variants, kind: EnumKind.nullable_pointer)))
+            }
+            try push(inout named, NamedVariant.(name: "none", payload: none, value: none))
+            try push(inout named, NamedVariant.(name: "some", payload: some.(value: payload), value: none))
+        }
+        result(value: ?check.TyId, error: check.TyId) {
+            var ok_payload: ?check.TyId = none
+            match value {
+                some(value as v: check.TyId) {
+                    ok_payload = some.(value: try check.single_field(inout g.types, "value", v))
+                }
+                none {
+                }
+            }
+            let err_payload: check.TyId = try check.single_field(inout g.types, "error", error)
+            try push(inout named, NamedVariant.(name: "ok", payload: ok_payload, value: none))
+            try push(inout named, NamedVariant.(name: "err", payload: some.(value: err_payload), value: none))
+        }
+        named(id: check.NamedId) {
+            match check.named_info(g.types, id) {
+                some(value as info: check.NamedInfo) {
+                    match info.def {
+                        enum_def(info as e: check.EnumInfo) {
+                            for let v: check.Variant in check.enum_variants(g.types, e) {
+                                try push(inout named, NamedVariant.(name: v.name, payload: v.payload, value: v.value))
+                            }
+                            int = e.int
+                        }
+                        _ {
+                            return ok.(value: ShapeSlot.absent)
+                        }
+                    }
+                }
+                none {
+                    return ok.(value: ShapeSlot.absent)
+                }
+            }
+        }
+        _ {
+            return ok.(value: ShapeSlot.absent)
+        }
+    }
+    var next: check.Wide = check.wide(0)
+    var variants: [..]VariantShape = make(g.alloc)
+    for let v: NamedVariant in named {
+        let tag: check.Wide = match v.value {
+            some(value as given: check.Wide) { given }
+            none { next }
+        }
+        next = match check.wide_add(tag, check.wide(1)) {
+            some(value as n: check.Wide) { n }
+            none { tag }
+        }
+        try push(inout variants, VariantShape.(name: v.name, payload: v.payload, tag: wide_i64(tag)))
+    }
+    let tag_ty: keel.Type = match int {
+        some(value as i: check.IntTy) { int_type(check.int_bits(i)) }
+        none {
+            if variants.len <= 256 {
+                keel.Type.int8
+            } else if variants.len <= 65536 {
+                keel.Type.int16
+            } else {
+                keel.Type.int32
+            }
+        }
+    }
+    var payload_align: u64 = 1
+    var has_payload: bool = false
+    for let v: VariantShape in variants {
+        match v.payload {
+            some(value as p: check.TyId) {
+                let l: TyLayout = try ty_layout(inout g, p)
+                if l.size > 0 {
+                    has_payload = true
+                }
+                payload_align = max_u64(payload_align, l.align)
+            }
+            none {
+            }
+        }
+    }
+    var kind: EnumKind = EnumKind.scalar_tag.(tag: tag_ty)
+    if has_payload {
+        kind = EnumKind.tagged.(tag: tag_ty, payload_offset: round_up(type_size(tag_ty), payload_align))
+    }
+    return ok.(value: ShapeSlot.found.(shape: EnumShape.(variants: variants, kind: kind)))
+}
+
+// A value as i64, or 0 if it does not fit, as stage 1 has a tag.
+fn wide_i64(w: check.Wide) -> i64 {
+    let top: bool = w.lo >> 63 == 1
+    if w.hi == 0 && !top {
+        return i64.(w.lo)
+    }
+    if w.hi == ~u64.(0) && top {
+        // -(~lo) - 1, where ~lo fits.
+        return -i64.(~w.lo) - 1
+    }
+    return 0
+}
+
+// A variant the checker found, and its enum's kind.
+type VariantOf (variant: VariantShape, kind: EnumKind)
+
+fn variant_of(g: inout Gen, ty: check.TyId, name: []u8) -> VariantOf ! OutOfMemory {
+    match try shape_of(inout g, ty) {
+        some(value as shape: EnumShape) {
+            for let v: VariantShape in shape.variants {
+                if same_text(v.name, name) {
+                    return ok.(value: VariantOf.(variant: v, kind: shape.kind))
+                }
+            }
+        }
+        none {
+        }
+    }
+    panic("internal error: no variant `{name}`")
+}
+
+// The index of a variant in its shape.
+fn variant_index(shape: EnumShape, name: []u8) -> usize {
+    for let i: usize in 0..shape.variants.len {
+        if same_text(shape.variants[i].name, name) {
+            return i
+        }
+    }
+    panic("internal error: no variant `{name}`")
+}
+
+// The layout keel's calling convention reads, for a type passed in
+// memory.
+fn abi_layout(g: inout Gen, ty: check.TyId) -> keel.Layout ! OutOfMemory {
+    let index: usize = usize.(ty)
+    if index < g.abi_layouts.len {
+        match g.abi_layouts[index] {
+            some(value as known: keel.Layout) {
+                return ok.(value: known)
+            }
+            none {
+            }
+        }
+    }
+    let computed: keel.Layout = try compute_abi_layout(inout g, ty)
+    for g.abi_layouts.len <= index {
+        try push(inout g.abi_layouts, none)
+    }
+    g.abi_layouts[index] = some.(value: computed)
+    return ok.(value: computed)
+}
+
+fn compute_abi_layout(g: inout Gen, ty: check.TyId) -> keel.Layout ! OutOfMemory {
+    let l: TyLayout = try ty_layout(inout g, ty)
+    match l.repr {
+        scalar(ty as t: keel.Type) {
+            return ok.(value: keel.layout_scalar(g.m, t))
+        }
+        _ {
+        }
+    }
+    if !is_union(g, ty) {
+        match try fields_of(inout g, ty) {
+            some(value as fields: []FieldInfo) {
+                var parts: [..]keel.Layout = make(g.alloc)
+                for let f: FieldInfo in fields {
+                    try push(inout parts, try abi_layout(inout g, f.ty))
+                }
+                return ok.(value: keel.layout_struct(g.m, parts))
+            }
+            none {
+            }
+        }
+    }
+    match check.get(g.types, ty) {
+        array(len: u64, elem: check.TyId) {
+            let e: keel.Layout = try abi_layout(inout g, elem)
+            var n: u32 = ~u32.(0)
+            if len <= u64.(n) {
+                n = u32.(len)
+            }
+            return ok.(value: keel.layout_array(g.m, e, n))
+        }
+        _ {
+        }
+    }
+    match try shape_of(inout g, ty) {
+        some(value as shape: EnumShape) {
+            match shape.kind {
+                tagged(tag: keel.Type, payload_offset: u64) {
+                    let parts: [2]keel.Layout = [keel.layout_scalar(g.m, tag), blob(g, l.size - payload_offset, l.align)]
+                    return ok.(value: keel.layout_struct(g.m, parts))
+                }
+                _ {
+                }
+            }
+        }
+        none {
+        }
+    }
+    return ok.(value: blob(g, l.size, l.align))
+}
+
+// Bytes of a union: words of its alignment.
+fn blob(g: Gen, size: u64, align: u64) -> keel.Layout {
+    var a: u64 = align
+    if a > 8 {
+        a = 8
+    }
+    let unit: keel.Type = int_type(u32.(a * 8))
+    let n: u64 = size / type_size(unit)
+    return keel.layout_array(g.m, keel.layout_scalar(g.m, unit), u32.(n))
+}

@@ -1,5 +1,5 @@
-// Hash maps for the checker, one per key and value type, since tern has
-// no generics. Both use open addressing with linear probing and double
+// Hash maps for the compiler, one per key and value type, since tern has
+// no generics. All use open addressing with linear probing and double
 // their table when it is half full. Nothing is ever removed.
 
 // A declaration: its file and its index in that file's declarations.
@@ -162,6 +162,76 @@ fn grow_ints(m: inout IntMap) -> ! OutOfMemory {
     for let slot: IntSlot in old {
         if slot.used {
             try put_int(inout m, slot.key, slot.value)
+        }
+    }
+    return ok
+}
+
+type TextSlot (used: bool, key: []u8, value: u32)
+
+// Byte strings to u32 values, such as a symbol's name to its number. The
+// keys are views the caller keeps alive.
+pub type TextMap (alloc: Allocator, slots: [..]TextSlot, count: usize)
+
+pub fn new_texts(alloc: Allocator) -> TextMap {
+    return TextMap.(alloc: alloc, slots: make(alloc), count: 0)
+}
+
+pub fn get_text(m: TextMap, key: []u8) -> ?u32 {
+    if m.slots.len == 0 {
+        return none
+    }
+    let mask: u64 = u64.(m.slots.len) - 1
+    var at: u64 = hash_bytes(key) & mask
+    for {
+        let slot: TextSlot = m.slots[usize.(at)]
+        if !slot.used {
+            return none
+        }
+        if same_bytes(slot.key, key) {
+            return some.(value: slot.value)
+        }
+        at = (at + 1) & mask
+    }
+}
+
+// Adds key, or replaces its value.
+pub fn put_text(m: inout TextMap, key: []u8, value: u32) -> ! OutOfMemory {
+    if (m.count + 1) * 2 > m.slots.len {
+        try grow_texts(inout m)
+    }
+    let mask: u64 = u64.(m.slots.len) - 1
+    var at: u64 = hash_bytes(key) & mask
+    for {
+        let slot: TextSlot = m.slots[usize.(at)]
+        if !slot.used {
+            m.slots[usize.(at)] = TextSlot.(used: true, key: key, value: value)
+            m.count += 1
+            return ok
+        }
+        if same_bytes(slot.key, key) {
+            m.slots[usize.(at)].value = value
+            return ok
+        }
+        at = (at + 1) & mask
+    }
+}
+
+fn grow_texts(m: inout TextMap) -> ! OutOfMemory {
+    var size: usize = m.slots.len * 2
+    if size < 16 {
+        size = 16
+    }
+    let old: [..]TextSlot = m.slots
+    m.slots = make(m.alloc)
+    let empty: TextSlot = TextSlot.(used: false, key: "", value: 0)
+    for let _: usize in 0..size {
+        try push(inout m.slots, empty)
+    }
+    m.count = 0
+    for let slot: TextSlot in old {
+        if slot.used {
+            try put_text(inout m, slot.key, slot.value)
         }
     }
     return ok

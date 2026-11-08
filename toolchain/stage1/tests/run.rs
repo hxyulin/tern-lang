@@ -5,6 +5,9 @@
 //! directory with `.c` files is linked with a static archive of them, and
 //! with libm.
 //!
+//! Each program is built twice: by stage 1, and by ternc, the compiler in
+//! tern, which stage 1 builds.
+//!
 //! Needs `cc` and `ar` for those archives; on Linux, also `clang` to
 //! assemble and link.
 
@@ -14,13 +17,58 @@ use std::process::Command;
 
 use stage1::build::{Options, build};
 
+mod common;
+use common::ternc_compilers;
+
+/// Builds a program with or without optimization into the given path.
+type Builder<'a> = dyn Fn(bool, &Path) -> Result<(), String> + 'a;
+
 fn std_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../std")
 }
 
-/// Builds `root` with `options` (optimization aside), runs it with `args`,
-/// and returns the failures.
-fn run(name: &str, root: &Path, options: &Options, args: &[&str], expected: &Path) -> Vec<String> {
+/// A builder that uses stage 1 with `options`, optimization aside.
+fn stage1(root: &Path, options: &Options) -> impl Fn(bool, &Path) -> Result<(), String> {
+    move |optimize, out| {
+        let options = Options {
+            optimize,
+            link: options.link.clone(),
+            libraries: options.libraries.clone(),
+            ..Options::new(std_dir())
+        };
+        build(root, out, &options)
+    }
+}
+
+/// A builder that runs ternc's `build` command with `extra` arguments.
+fn ternc<'a>(
+    root: &'a Path,
+    extra: &'a [String],
+) -> impl Fn(bool, &Path) -> Result<(), String> + 'a {
+    move |optimize, out| {
+        let (compiler, _) = &ternc_compilers()[0];
+        let output = Command::new(compiler)
+            .arg("build")
+            .arg(root)
+            .arg("--std")
+            .arg(std_dir())
+            .args(extra)
+            .args(optimize.then_some("-O"))
+            .arg("-o")
+            .arg(out)
+            .output()
+            .expect("can run ternc");
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    }
+}
+
+/// Builds `root` with `builder`, without and with optimization, runs it
+/// with `args`, and returns the failures.
+fn run(name: &str, builder: &Builder, args: &[&str], expected: &Path) -> Vec<String> {
     let mut failures = Vec::new();
     let read = |file: &str| fs::read_to_string(expected.join(file)).ok();
     let want_stdout = read("stdout").unwrap_or_default();
@@ -32,13 +80,7 @@ fn run(name: &str, root: &Path, options: &Options, args: &[&str], expected: &Pat
             .join("run")
             .join(format!("{name}{}", if optimize { "-O" } else { "" }));
         fs::create_dir_all(out.parent().expect("a parent")).expect("can create directory");
-        let options = Options {
-            optimize,
-            link: options.link.clone(),
-            libraries: options.libraries.clone(),
-            ..Options::new(std_dir())
-        };
-        if let Err(e) = build(root, &out, &options) {
+        if let Err(e) = builder(optimize, &out) {
             failures.push(format!("{name} ({label}): build failed:\n{e}"));
             continue;
         }
@@ -110,26 +152,50 @@ fn c_archive(name: &str, root: &Path) -> Option<PathBuf> {
     Some(archive)
 }
 
-#[test]
-fn programs_run() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/run");
-    let mut names: Vec<String> = fs::read_dir(&dir)
+fn run_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/run")
+}
+
+/// The programs in `tests/run`, sorted.
+fn run_names() -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(run_dir())
         .expect("tests/run exists")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
+    assert!(names.len() >= 8, "found only {names:?}");
+    names
+}
+
+#[test]
+fn programs_run() {
     let mut failures = Vec::new();
-    for name in &names {
-        let root = dir.join(name);
+    for name in &run_names() {
+        let root = run_dir().join(name);
         let mut options = Options::new(std_dir());
         if let Some(archive) = c_archive(name, &root) {
             options.link.push(archive);
             options.libraries.push("m".into());
         }
-        failures.extend(run(name, &root, &options, &[], &root));
+        failures.extend(run(name, &stage1(&root, &options), &[], &root));
     }
-    assert!(names.len() >= 8, "found only {names:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn programs_built_by_ternc_run() {
+    let mut failures = Vec::new();
+    for name in &run_names() {
+        let root = run_dir().join(name);
+        let mut extra = Vec::new();
+        if let Some(archive) = c_archive(&format!("{name}-ternc"), &root) {
+            extra.push(archive.to_string_lossy().into_owned());
+            extra.push("-lm".to_owned());
+        }
+        let label = format!("{name}-ternc");
+        failures.extend(run(&label, &ternc(&root, &extra), &[], &root));
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
@@ -165,26 +231,28 @@ fn ini_example_runs() {
     let mut failures = Vec::new();
     let good = good.to_string_lossy().into_owned();
     let bad = bad.to_string_lossy().into_owned();
-    failures.extend(run(
-        "ini-good",
-        &root,
-        &Options::new(std_dir()),
-        &[&good],
-        &good_dir,
-    ));
-    failures.extend(run(
-        "ini-bad",
-        &root,
-        &Options::new(std_dir()),
-        &[&bad],
-        &bad_dir,
-    ));
-    failures.extend(run(
-        "ini-usage",
-        &root,
-        &Options::new(std_dir()),
-        &[],
-        &usage_dir,
-    ));
+    let options = Options::new(std_dir());
+    let by_stage1 = stage1(&root, &options);
+    let by_ternc = ternc(&root, &[]);
+    for (compiler, builder) in [("", &by_stage1 as &Builder), ("-ternc", &by_ternc)] {
+        failures.extend(run(
+            &format!("ini-good{compiler}"),
+            builder,
+            &[&good],
+            &good_dir,
+        ));
+        failures.extend(run(
+            &format!("ini-bad{compiler}"),
+            builder,
+            &[&bad],
+            &bad_dir,
+        ));
+        failures.extend(run(
+            &format!("ini-usage{compiler}"),
+            builder,
+            &[],
+            &usage_dir,
+        ));
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

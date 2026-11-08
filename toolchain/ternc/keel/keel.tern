@@ -1,0 +1,649 @@
+// keel's C API, from keel-ffi's include/keel.h, with a wrapper for each
+// call ternc makes.
+//
+// A failed call means ternc built something keel rejects, which is a bug
+// in ternc, so the wrappers panic with keel's message. Linking is the
+// exception: it can fail on the user's input, so link returns the error.
+//
+// Calling a C function is unsafe; every wrapper keeps the promise the
+// header asks for, that pointers are live for the call.
+
+import std.c
+import std.libc
+
+// A module, owned by the caller until destroy.
+pub type Module (handle: *u8)
+
+pub type Function (owner: u64, pub index: u32)
+pub type Signature (owner: u64, index: u32)
+pub type Symbol (owner: u64, index: u32)
+pub type Slot (owner: u64, function: u32, index: u32)
+pub type Block (owner: u64, function: u32, pub index: u32)
+pub type Value (owner: u64, function: u32, index: u32)
+pub type Layout (owner: u64, index: u32)
+
+pub type Type enum u32 {
+    int8 = 1
+    int16 = 2
+    int32 = 3
+    int64 = 4
+    ptr = 5
+    int128 = 6
+    float32 = 7
+    float64 = 8
+}
+
+pub type BinaryOp enum u32 {
+    iadd = 1
+    isub = 2
+    imul = 3
+    udiv = 4
+    sdiv = 5
+    urem = 6
+    srem = 7
+    and = 8
+    or = 9
+    xor = 10
+    shl = 11
+    ushr = 12
+    sshr = 13
+    fadd = 20
+    fsub = 21
+    fmul = 22
+    fdiv = 23
+}
+
+pub type UnaryOp enum u32 {
+    ineg = 1
+    bnot = 2
+    fneg = 7
+}
+
+pub type IntCC enum u32 {
+    eq = 1
+    ne = 2
+    slt = 3
+    sle = 4
+    sgt = 5
+    sge = 6
+    ult = 7
+    ule = 8
+    ugt = 9
+    uge = 10
+}
+
+pub type FloatCC enum u32 {
+    eq = 1
+    ne = 2
+    lt = 3
+    le = 4
+    gt = 5
+    ge = 6
+}
+
+pub type OverflowOp enum u32 {
+    uadd = 1
+    sadd = 2
+    usub = 3
+    ssub = 4
+    umul = 5
+    smul = 6
+}
+
+pub type ConvertOp enum u32 {
+    sext = 1
+    uext = 2
+    trunc = 3
+    ptr_to_int = 4
+    int_to_ptr = 5
+    fpext = 6
+    fptrunc = 7
+    fptosi = 8
+    fptoui = 9
+    sitofp = 10
+    uitofp = 11
+}
+
+pub type Extension enum u32 {
+    plain = 0
+    sign = 1
+    zero = 2
+}
+
+pub type Purpose enum u32 {
+    normal = 0
+    byval = 1
+    sret = 2
+}
+
+// One parameter or result of a signature. The layout matters only for
+// byval and sret.
+pub type AbiValue (pub ty: Type, pub extension: Extension, pub purpose: Purpose, pub layout: Layout)
+
+type SignatureOptions (convention: u32, flags: u32, x86_vector_abi: u32)
+
+type Memory (align: u32, flags: u32)
+
+// An initializer item: bytes, zeros, an integer or a symbol's address.
+type DataItem (
+    kind: u32,
+    ty: Type,
+    value: i64,
+    bytes: ?*u8,
+    length: usize,
+    symbol: Symbol,
+    addend: u32,
+)
+
+pub type Item enum {
+    bytes(bytes: []u8)
+    zero(size: u32)
+    integer(ty: Type, value: i64)
+    pointer(symbol: Symbol)
+}
+
+pub type CodegenOptions (
+    pub selection: u32,
+    pub allocation: u32,
+    pub goal: u32,
+    pub unwind: u32,
+    pub x86_code_model: u32,
+    pub flags: u32,
+)
+
+pub type LinkInput (pub name: []u8, pub bytes: []u8)
+
+type LinkOptions (sdk_root: []u8, output_path: []u8, flags: u32)
+
+extern fn keel_module_create() -> ?*u8
+extern fn keel_module_destroy(m: *u8)
+extern fn keel_module_error(m: *u8) -> ?*u8
+extern fn keel_signature_create_full(m: *u8, params: ?*AbiValue, count: c.size_t, returns: ?*AbiValue, return_count: c.size_t, options: SignatureOptions, out: *Signature) -> u32
+extern fn keel_layout_scalar(m: *u8, ty: Type, out: *Layout) -> u32
+extern fn keel_layout_struct(m: *u8, fields: ?*Layout, count: c.size_t, out: *Layout) -> u32
+extern fn keel_layout_array(m: *u8, element: Layout, count: u32, out: *Layout) -> u32
+extern fn keel_module_add_function_with_signature(m: *u8, name: *u8, name_len: c.size_t, sig: Signature, out: *Function) -> u32
+extern fn keel_module_declare_function(m: *u8, name: *u8, name_len: c.size_t, sig: Signature, out: *Symbol) -> u32
+extern fn keel_module_define_function(m: *u8, symbol: Symbol, out: *Function) -> u32
+extern fn keel_function_symbol(m: *u8, f: Function, out: *Symbol) -> u32
+extern fn keel_function_set_linkage(m: *u8, f: Function, linkage: u32) -> u32
+extern fn keel_symbol_set_function_attributes(m: *u8, symbol: Symbol, flags: u64, align: u32) -> u32
+extern fn keel_block_create(m: *u8, f: Function, out: *Block) -> u32
+extern fn keel_block_add_parameter(m: *u8, b: Block, ty: Type, out: *Value) -> u32
+extern fn keel_stack_slot_create(m: *u8, f: Function, size: u32, align: u32, out: *Slot) -> u32
+extern fn keel_build_stack_address(m: *u8, b: Block, slot: Slot, out: *Value) -> u32
+extern fn keel_build_iconst(m: *u8, b: Block, ty: Type, imm: i64, out: *Value) -> u32
+extern fn keel_build_fconst(m: *u8, b: Block, ty: Type, bits: u64, out: *Value) -> u32
+extern fn keel_build_binary(m: *u8, b: Block, op: BinaryOp, lhs: Value, rhs: Value, out: *Value) -> u32
+extern fn keel_build_unary(m: *u8, b: Block, op: UnaryOp, v: Value, out: *Value) -> u32
+extern fn keel_build_icmp(m: *u8, b: Block, cc: IntCC, lhs: Value, rhs: Value, out: *Value) -> u32
+extern fn keel_build_fcmp(m: *u8, b: Block, cc: FloatCC, lhs: Value, rhs: Value, out: *Value) -> u32
+extern fn keel_build_select(m: *u8, b: Block, cond: Value, yes: Value, no: Value, out: *Value) -> u32
+extern fn keel_build_overflow(m: *u8, b: Block, op: OverflowOp, lhs: Value, rhs: Value, results: *Value, count: c.size_t) -> u32
+extern fn keel_build_convert(m: *u8, b: Block, op: ConvertOp, ty: Type, v: Value, out: *Value) -> u32
+extern fn keel_build_ptradd(m: *u8, b: Block, addr: Value, offset: Value, out: *Value) -> u32
+extern fn keel_build_load(m: *u8, b: Block, ty: Type, addr: Value, memory: Memory, out: *Value) -> u32
+extern fn keel_build_store(m: *u8, b: Block, v: Value, addr: Value, memory: Memory) -> u32
+extern fn keel_build_symbol_address(m: *u8, b: Block, symbol: Symbol, out: *Value) -> u32
+extern fn keel_build_call(m: *u8, b: Block, symbol: Symbol, args: ?*Value, count: c.size_t, results: ?*Value, result_count: c.size_t) -> u32
+extern fn keel_build_call_indirect(m: *u8, b: Block, sig: Signature, callee: Value, args: ?*Value, count: c.size_t, results: ?*Value, result_count: c.size_t) -> u32
+extern fn keel_build_intrinsic(m: *u8, b: Block, name: *u8, len: c.size_t, args: ?*Value, count: c.size_t, results: ?*Value, result_count: c.size_t) -> u32
+extern fn keel_build_jump(m: *u8, b: Block, dest: Block, args: ?*Value, count: c.size_t) -> u32
+extern fn keel_build_brif(m: *u8, b: Block, cond: Value, then_block: Block, then_args: ?*Value, then_count: c.size_t, else_block: Block, else_args: ?*Value, else_count: c.size_t) -> u32
+extern fn keel_build_return(m: *u8, b: Block, args: ?*Value, count: c.size_t) -> u32
+extern fn keel_build_trap(m: *u8, b: Block) -> u32
+extern fn keel_value_type(m: *u8, v: Value, out: *Type) -> u32
+extern fn keel_module_declare_global(m: *u8, name: *u8, len: c.size_t, out: *Symbol) -> u32
+extern fn keel_module_add_global_items(m: *u8, name: *u8, len: c.size_t, items: *DataItem, count: c.size_t, align: u32, flags: u32, out: *Symbol) -> u32
+extern fn keel_module_verify(m: *u8) -> u32
+extern fn keel_module_optimize_with_tier(m: *u8, tier: u32) -> u32
+extern fn keel_module_emit_ir(m: *u8, out: *?*u8) -> u32
+extern fn keel_module_emit_assembly(m: *u8, target: u32, options: CodegenOptions, out: *?*u8) -> u32
+extern fn keel_module_emit_object_with_options(m: *u8, target: u32, options: CodegenOptions, out: *?*u8) -> u32
+extern fn keel_buffer_data(b: *u8) -> *u8
+extern fn keel_buffer_size(b: *u8) -> c.size_t
+extern fn keel_buffer_destroy(b: *u8)
+extern fn keel_link_signed(inputs: ?*LinkInput, count: c.size_t, tbd_paths: ?*[]u8, tbd_count: c.size_t, options: *LinkOptions, warnings: *?*u8, error: *?*u8) -> u32
+
+let ok_status: u32 = 0
+
+// Flags of keel_symbol_set_function_attributes.
+pub let noinline: u64 = 1 << 9
+pub let noreturn: u64 = 1 << 10
+pub let cold: u64 = 1 << 12
+
+// Flags of a global.
+pub let constant: u32 = 1
+pub let local: u32 = 2
+
+pub let aarch64_apple_darwin: u32 = 1
+
+pub fn create() -> Module {
+    match unsafe { keel_module_create() } {
+        some(value as p: *u8) {
+            return Module.(handle: p)
+        }
+        none {
+            panic("internal error: keel cannot create a module")
+        }
+    }
+}
+
+pub fn destroy(m: Module) {
+    unsafe { keel_module_destroy(m.handle) }
+}
+
+// Panics with keel's message unless status is success.
+fn check(m: Module, status: u32, step: []u8) {
+    if status == ok_status {
+        return
+    }
+    match unsafe { keel_module_error(m.handle) } {
+        some(value as p: *u8) {
+            let text: []u8 = unsafe { libc.text(p) }
+            panic("internal error: keel rejected {step}: {text}")
+        }
+        none {
+            panic("internal error: keel rejected {step}: status {status}")
+        }
+    }
+}
+
+// The address of a list's first item, or none for an empty list.
+fn values_at(vs: []Value) -> ?*Value {
+    if vs.len == 0 {
+        return none
+    }
+    return some.(value: &vs[0])
+}
+
+// A value that names nothing, for a variable assigned before its use.
+pub fn no_value() -> Value {
+    return Value.(owner: 0, function: 0, index: 0)
+}
+
+fn no_layout() -> Layout {
+    return Layout.(owner: 0, index: 0)
+}
+
+// The text of a buffer, copied, and the buffer destroyed.
+fn take_buffer(alloc: Allocator, b: *u8) -> [..]u8 ! OutOfMemory {
+    var out: [..]u8 = make(alloc)
+    let bytes: []u8 = unsafe { from_pointer(keel_buffer_data(b), usize.(keel_buffer_size(b))) }
+    let appended: ! OutOfMemory = append(inout out, bytes)
+    unsafe { keel_buffer_destroy(b) }
+    try appended
+    return ok.(value: out)
+}
+
+// Signatures and layouts.
+
+pub fn abi(ty: Type, extension: Extension) -> AbiValue {
+    return AbiValue.(ty: ty, extension: extension, purpose: Purpose.normal, layout: no_layout())
+}
+
+pub fn abi_memory(purpose: Purpose, layout: Layout) -> AbiValue {
+    return AbiValue.(ty: Type.ptr, extension: Extension.plain, purpose: purpose, layout: layout)
+}
+
+pub fn signature(m: Module, params: []AbiValue, returns: []AbiValue, variadic: bool) -> Signature {
+    let flags: u32 = if variadic { 1 } else { 0 }
+    let options: SignatureOptions = SignatureOptions.(convention: 0, flags: flags, x86_vector_abi: 0)
+    var p: ?*AbiValue = none
+    if params.len > 0 {
+        p = some.(value: &params[0])
+    }
+    var r: ?*AbiValue = none
+    if returns.len > 0 {
+        r = some.(value: &returns[0])
+    }
+    var out: Signature = Signature.(owner: 0, index: 0)
+    check(m, unsafe { keel_signature_create_full(m.handle, p, c.size_t.(params.len), r, c.size_t.(returns.len), options, &out) }, "a signature")
+    return out
+}
+
+pub fn layout_scalar(m: Module, ty: Type) -> Layout {
+    var out: Layout = no_layout()
+    check(m, unsafe { keel_layout_scalar(m.handle, ty, &out) }, "a scalar layout")
+    return out
+}
+
+pub fn layout_struct(m: Module, fields: []Layout) -> Layout {
+    var p: ?*Layout = none
+    if fields.len > 0 {
+        p = some.(value: &fields[0])
+    }
+    var out: Layout = no_layout()
+    check(m, unsafe { keel_layout_struct(m.handle, p, c.size_t.(fields.len), &out) }, "a struct layout")
+    return out
+}
+
+pub fn layout_array(m: Module, element: Layout, count: u32) -> Layout {
+    var out: Layout = no_layout()
+    check(m, unsafe { keel_layout_array(m.handle, element, count, &out) }, "an array layout")
+    return out
+}
+
+// Functions.
+
+pub fn add_function(m: Module, name: []u8, sig: Signature) -> Function {
+    var out: Function = Function.(owner: 0, index: 0)
+    check(m, unsafe { keel_module_add_function_with_signature(m.handle, &name[0], c.size_t.(name.len), sig, &out) }, name)
+    return out
+}
+
+pub fn declare_function(m: Module, name: []u8, sig: Signature) -> Symbol {
+    var out: Symbol = Symbol.(owner: 0, index: 0)
+    check(m, unsafe { keel_module_declare_function(m.handle, &name[0], c.size_t.(name.len), sig, &out) }, name)
+    return out
+}
+
+pub fn define_function(m: Module, symbol: Symbol) -> Function {
+    var out: Function = Function.(owner: 0, index: 0)
+    check(m, unsafe { keel_module_define_function(m.handle, symbol, &out) }, "a definition")
+    return out
+}
+
+pub fn function_symbol(m: Module, f: Function) -> Symbol {
+    var out: Symbol = Symbol.(owner: 0, index: 0)
+    check(m, unsafe { keel_function_symbol(m.handle, f, &out) }, "a function symbol")
+    return out
+}
+
+pub fn set_local(m: Module, f: Function) {
+    check(m, unsafe { keel_function_set_linkage(m.handle, f, 1) }, "local linkage")
+}
+
+pub fn set_attributes(m: Module, symbol: Symbol, flags: u64) {
+    check(m, unsafe { keel_symbol_set_function_attributes(m.handle, symbol, flags, 0) }, "function attributes")
+}
+
+pub fn create_block(m: Module, f: Function) -> Block {
+    var out: Block = Block.(owner: 0, function: 0, index: 0)
+    check(m, unsafe { keel_block_create(m.handle, f, &out) }, "a block")
+    return out
+}
+
+pub fn block_param(m: Module, b: Block, ty: Type) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_block_add_parameter(m.handle, b, ty, &out) }, "a block parameter")
+    return out
+}
+
+pub fn stack_slot(m: Module, f: Function, size: u32, align: u32) -> Slot {
+    var out: Slot = Slot.(owner: 0, function: 0, index: 0)
+    check(m, unsafe { keel_stack_slot_create(m.handle, f, size, align, &out) }, "a stack slot")
+    return out
+}
+
+// Instructions, each appended to block b.
+
+pub fn stack_addr(m: Module, b: Block, slot: Slot) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_stack_address(m.handle, b, slot, &out) }, "stack_addr")
+    return out
+}
+
+pub fn iconst(m: Module, b: Block, ty: Type, n: i64) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_iconst(m.handle, b, ty, n, &out) }, "iconst")
+    return out
+}
+
+// A float constant from its IEEE bits.
+pub fn fconst(m: Module, b: Block, ty: Type, bits: u64) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_fconst(m.handle, b, ty, bits, &out) }, "fconst")
+    return out
+}
+
+pub fn binary(m: Module, b: Block, op: BinaryOp, lhs: Value, rhs: Value) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_binary(m.handle, b, op, lhs, rhs, &out) }, "a binary operation")
+    return out
+}
+
+pub fn unary(m: Module, b: Block, op: UnaryOp, v: Value) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_unary(m.handle, b, op, v, &out) }, "a unary operation")
+    return out
+}
+
+pub fn icmp(m: Module, b: Block, cc: IntCC, lhs: Value, rhs: Value) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_icmp(m.handle, b, cc, lhs, rhs, &out) }, "icmp")
+    return out
+}
+
+pub fn fcmp(m: Module, b: Block, cc: FloatCC, lhs: Value, rhs: Value) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_fcmp(m.handle, b, cc, lhs, rhs, &out) }, "fcmp")
+    return out
+}
+
+pub fn select(m: Module, b: Block, cond: Value, yes: Value, no: Value) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_select(m.handle, b, cond, yes, no, &out) }, "select")
+    return out
+}
+
+// The wrapped result and the overflow flag.
+pub type Overflow (pub result: Value, pub overflow: Value)
+
+pub fn overflow(m: Module, b: Block, op: OverflowOp, lhs: Value, rhs: Value) -> Overflow {
+    var out: [2]Value = [no_value(), no_value()]
+    check(m, unsafe { keel_build_overflow(m.handle, b, op, lhs, rhs, &out[0], c.size_t.(2)) }, "an overflow operation")
+    return Overflow.(result: out[0], overflow: out[1])
+}
+
+pub fn convert(m: Module, b: Block, op: ConvertOp, ty: Type, v: Value) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_convert(m.handle, b, op, ty, v, &out) }, "a conversion")
+    return out
+}
+
+pub fn ptradd(m: Module, b: Block, addr: Value, offset: Value) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_ptradd(m.handle, b, addr, offset, &out) }, "ptradd")
+    return out
+}
+
+pub fn load(m: Module, b: Block, ty: Type, addr: Value) -> Value {
+    var out: Value = no_value()
+    let memory: Memory = Memory.(align: 1, flags: 0)
+    check(m, unsafe { keel_build_load(m.handle, b, ty, addr, memory, &out) }, "load")
+    return out
+}
+
+pub fn store(m: Module, b: Block, v: Value, addr: Value) {
+    let memory: Memory = Memory.(align: 1, flags: 0)
+    check(m, unsafe { keel_build_store(m.handle, b, v, addr, memory) }, "store")
+}
+
+pub fn symbol_addr(m: Module, b: Block, symbol: Symbol) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_symbol_address(m.handle, b, symbol, &out) }, "symbol_addr")
+    return out
+}
+
+// A call of a function that returns nothing.
+pub fn call(m: Module, b: Block, symbol: Symbol, args: []Value) {
+    check(m, unsafe { keel_build_call(m.handle, b, symbol, values_at(args), c.size_t.(args.len), none, c.size_t.(0)) }, "a call")
+}
+
+pub fn call_value(m: Module, b: Block, symbol: Symbol, args: []Value) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_call(m.handle, b, symbol, values_at(args), c.size_t.(args.len), some.(value: &out), c.size_t.(1)) }, "a call")
+    return out
+}
+
+pub fn call_indirect(m: Module, b: Block, sig: Signature, callee: Value, args: []Value) {
+    check(m, unsafe { keel_build_call_indirect(m.handle, b, sig, callee, values_at(args), c.size_t.(args.len), none, c.size_t.(0)) }, "an indirect call")
+}
+
+pub fn call_indirect_value(m: Module, b: Block, sig: Signature, callee: Value, args: []Value) -> Value {
+    var out: Value = no_value()
+    check(m, unsafe { keel_build_call_indirect(m.handle, b, sig, callee, values_at(args), c.size_t.(args.len), some.(value: &out), c.size_t.(1)) }, "an indirect call")
+    return out
+}
+
+// An intrinsic without results, such as memcpy.
+pub fn intrinsic(m: Module, b: Block, name: []u8, args: []Value) {
+    check(m, unsafe { keel_build_intrinsic(m.handle, b, &name[0], c.size_t.(name.len), values_at(args), c.size_t.(args.len), none, c.size_t.(0)) }, name)
+}
+
+pub fn jump(m: Module, b: Block, dest: Block) {
+    check(m, unsafe { keel_build_jump(m.handle, b, dest, none, c.size_t.(0)) }, "jump")
+}
+
+pub fn jump_with(m: Module, b: Block, dest: Block, args: []Value) {
+    check(m, unsafe { keel_build_jump(m.handle, b, dest, values_at(args), c.size_t.(args.len)) }, "jump")
+}
+
+pub fn brif(m: Module, b: Block, cond: Value, then_block: Block, else_block: Block) {
+    check(m, unsafe { keel_build_brif(m.handle, b, cond, then_block, none, c.size_t.(0), else_block, none, c.size_t.(0)) }, "brif")
+}
+
+pub fn ret(m: Module, b: Block, args: []Value) {
+    check(m, unsafe { keel_build_return(m.handle, b, values_at(args), c.size_t.(args.len)) }, "return")
+}
+
+pub fn trap(m: Module, b: Block) {
+    check(m, unsafe { keel_build_trap(m.handle, b) }, "trap")
+}
+
+pub fn value_type(m: Module, v: Value) -> Type {
+    var out: Type = Type.int8
+    check(m, unsafe { keel_value_type(m.handle, v, &out) }, "a value type")
+    return out
+}
+
+// Globals.
+
+pub fn declare_global(m: Module, name: []u8) -> Symbol {
+    var out: Symbol = Symbol.(owner: 0, index: 0)
+    check(m, unsafe { keel_module_declare_global(m.handle, &name[0], c.size_t.(name.len), &out) }, name)
+    return out
+}
+
+pub fn add_global(alloc: Allocator, m: Module, name: []u8, items: []Item, align: u32, flags: u32) -> Symbol ! OutOfMemory {
+    var raw: [..]DataItem = make(alloc)
+    defer free(inout raw)
+    let none_symbol: Symbol = Symbol.(owner: 0, index: 0)
+    for let item: Item in items {
+        let d: DataItem = match item {
+            bytes(bytes as b: []u8) {
+                DataItem.(kind: 0, ty: Type.int8, value: 0, bytes: some.(value: &b[0]), length: b.len, symbol: none_symbol, addend: 0)
+            }
+            zero(size: u32) {
+                DataItem.(kind: 1, ty: Type.int8, value: 0, bytes: none, length: usize.(size), symbol: none_symbol, addend: 0)
+            }
+            integer(ty: Type, value: i64) {
+                DataItem.(kind: 2, ty: ty, value: value, bytes: none, length: 0, symbol: none_symbol, addend: 0)
+            }
+            pointer(symbol: Symbol) {
+                DataItem.(kind: 3, ty: Type.int8, value: 0, bytes: none, length: 0, symbol: symbol, addend: 0)
+            }
+        }
+        try push(inout raw, d)
+    }
+    var out: Symbol = Symbol.(owner: 0, index: 0)
+    check(m, unsafe { keel_module_add_global_items(m.handle, &name[0], c.size_t.(name.len), &raw[0], c.size_t.(raw.len), align, flags, &out) }, name)
+    return ok.(value: out)
+}
+
+// The module as a whole.
+
+pub fn verify(m: Module) {
+    check(m, unsafe { keel_module_verify(m.handle) }, "the module")
+}
+
+// Runs keel's optimizer at a tier: 5 is the full pipeline.
+pub fn optimize(m: Module, tier: u32) {
+    check(m, unsafe { keel_module_optimize_with_tier(m.handle, tier) }, "optimization")
+}
+
+// The module's IR as text.
+pub fn emit_ir(alloc: Allocator, m: Module) -> [..]u8 ! OutOfMemory {
+    var out: ?*u8 = none
+    check(m, unsafe { keel_module_emit_ir(m.handle, &out) }, "printing IR")
+    match out {
+        some(value as b: *u8) {
+            return take_buffer(alloc, b)
+        }
+        none {
+            return ok.(value: make(alloc))
+        }
+    }
+}
+
+// Assembly text for the target.
+pub fn emit_assembly(alloc: Allocator, m: Module, target: u32, options: CodegenOptions) -> [..]u8 ! OutOfMemory {
+    var out: ?*u8 = none
+    check(m, unsafe { keel_module_emit_assembly(m.handle, target, options, &out) }, "code generation")
+    match out {
+        some(value as b: *u8) {
+            return take_buffer(alloc, b)
+        }
+        none {
+            return ok.(value: make(alloc))
+        }
+    }
+}
+
+// An object file for the target.
+pub fn emit_object(alloc: Allocator, m: Module, target: u32, options: CodegenOptions) -> [..]u8 ! OutOfMemory {
+    var out: ?*u8 = none
+    check(m, unsafe { keel_module_emit_object_with_options(m.handle, target, options, &out) }, "code generation")
+    match out {
+        some(value as b: *u8) {
+            return take_buffer(alloc, b)
+        }
+        none {
+            return ok.(value: make(alloc))
+        }
+    }
+}
+
+// What linking reports: its warnings, one per line, or why it failed.
+pub type Linked enum {
+    done(warnings: [..]u8)
+    failed(message: [..]u8)
+}
+
+// Links Mach-O objects and archives with the libraries whose TBD stubs
+// are listed, into the signed executable at path.
+pub fn link_signed(alloc: Allocator, inputs: []LinkInput, tbd_paths: [][]u8, sdk_root: []u8, path: []u8) -> Linked ! OutOfMemory {
+    var i: ?*LinkInput = none
+    if inputs.len > 0 {
+        i = some.(value: &inputs[0])
+    }
+    var t: ?*[]u8 = none
+    if tbd_paths.len > 0 {
+        t = some.(value: &tbd_paths[0])
+    }
+    let options: LinkOptions = LinkOptions.(sdk_root: sdk_root, output_path: path, flags: 0)
+    var warnings: ?*u8 = none
+    var problem: ?*u8 = none
+    let status: u32 = unsafe { keel_link_signed(i, c.size_t.(inputs.len), t, c.size_t.(tbd_paths.len), &options, &warnings, &problem) }
+    match problem {
+        some(value as b: *u8) {
+            return ok.(value: Linked.failed.(message: try take_buffer(alloc, b)))
+        }
+        none {
+        }
+    }
+    match warnings {
+        some(value as b: *u8) {
+            return ok.(value: Linked.done.(warnings: try take_buffer(alloc, b)))
+        }
+        none {
+        }
+    }
+    if status != ok_status {
+        var message: [..]u8 = make(alloc)
+        try append(inout message, "keel's linker failed")
+        return ok.(value: Linked.failed.(message: message))
+    }
+    return ok.(value: Linked.done.(warnings: make(alloc)))
+}

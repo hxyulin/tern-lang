@@ -1,22 +1,39 @@
-// ternc, the tern compiler, written in tern. So far it lexes, parses and
-// checks:
+// ternc, the tern compiler, written in tern:
 //
 //   ternc lex FILE               prints each token as stage 1 does
 //   ternc parse FILE             prints the syntax tree as stage 1 does
 //   ternc check DIR --std DIR    reports errors as stage 1 does
+//   ternc build DIR --std DIR    builds an executable through keel's C API,
+//                                with stage 1's options
+//
+// It links with keel's C API, keel-ffi's static library.
 
+import std.fs
 import std.heap
 import std.io
 import std.os
 import check
+import gen
+import keel
 import program
 import resolve
 import sexp
 import std.utf8
 import syntax
 
+let usage_text: []u8 = "usage: ternc lex FILE\n       ternc parse FILE\n       ternc check DIR --std DIR\n       ternc build DIR --std DIR [FILE.a|FILE.o ...] [-l NAME] [-o OUT] [-O] [-S] [--ir]\n"
+
 fn main() -> u8 {
     let args: [][]u8 = os.args()
+    if args.len >= 2 {
+        match args[1] {
+            "build" {
+                return build_command(args[2..])
+            }
+            _ {
+            }
+        }
+    }
     if args.len == 5 {
         match args[1] {
             "check" {
@@ -44,7 +61,7 @@ fn main() -> u8 {
             }
         }
     }
-    io.eprint("usage: ternc lex FILE\n       ternc parse FILE\n       ternc check DIR --std DIR\n")
+    io.eprint("{usage_text}")
     return 2
 }
 
@@ -82,6 +99,349 @@ fn check_program(alloc: Allocator, root: []u8, std_dir: []u8) -> u8 ! OutOfMemor
     }
     io.print("{p.packages.len} packages, {p.files.len} files\n")
     return ok.(value: 0)
+}
+
+// What `ternc build` was asked for.
+type BuildOptions (
+    root: []u8,
+    std_dir: []u8,
+    out: ?[]u8,
+    optimize: bool,
+    assembly_only: bool,
+    ir_only: bool,
+    // Static archives and object files linked with the program.
+    link: [..][]u8,
+    // System libraries, as in `-l NAME`.
+    libraries: [..][]u8,
+)
+
+fn ends_with(text: []u8, suffix: []u8) -> bool {
+    if text.len < suffix.len {
+        return false
+    }
+    return program.bytes_equal(text[text.len - suffix.len..], suffix)
+}
+
+fn is_link_input(arg: []u8) -> bool {
+    return ends_with(arg, ".a") || ends_with(arg, ".A") || ends_with(arg, ".o") || ends_with(arg, ".O")
+}
+
+// Builds an executable, or the assembly or IR the options ask for.
+fn build_command(args: [][]u8) -> u8 {
+    var arena: heap.Arena = heap.new_arena(heap.c_allocator)
+    defer heap.free_arena(inout arena)
+    let alloc: Allocator = heap.arena_allocator(&arena)
+    var o: BuildOptions = BuildOptions.(root: "", std_dir: "", out: none, optimize: false, assembly_only: false, ir_only: false, link: make(alloc), libraries: make(alloc))
+    var has_root: bool = false
+    var has_std: bool = false
+    var i: usize = 0
+    for i < args.len {
+        let arg: []u8 = args[i]
+        i += 1
+        match arg {
+            "-o", "--std", "-l" {
+                if i >= args.len {
+                    io.eprint("{usage_text}")
+                    return 2
+                }
+                let value: []u8 = args[i]
+                i += 1
+                match arg {
+                    "-o" {
+                        o.out = some.(value: value)
+                    }
+                    "--std" {
+                        o.std_dir = value
+                        has_std = true
+                    }
+                    _ {
+                        if !pushed(inout o.libraries, value) {
+                            return out_of_memory()
+                        }
+                    }
+                }
+                continue
+            }
+            "-O" {
+                o.optimize = true
+                continue
+            }
+            "-S" {
+                o.assembly_only = true
+                continue
+            }
+            "--ir" {
+                o.ir_only = true
+                continue
+            }
+            _ {
+            }
+        }
+        if arg.len > 2 && arg[0] == '-' && arg[1] == 'l' {
+            if !pushed(inout o.libraries, arg[2..]) {
+                return out_of_memory()
+            }
+        } else if is_link_input(arg) {
+            if !pushed(inout o.link, arg) {
+                return out_of_memory()
+            }
+        } else if !has_root {
+            o.root = arg
+            has_root = true
+        } else {
+            io.eprint("{usage_text}")
+            return 2
+        }
+    }
+    if !has_root || !has_std {
+        io.eprint("{usage_text}")
+        return 2
+    }
+    match build_program(alloc, o) {
+        ok(value as code: u8) {
+            return code
+        }
+        err(error: _) {
+            return out_of_memory()
+        }
+    }
+}
+
+fn pushed(list: inout [..][]u8, item: []u8) -> bool {
+    return match push(inout list, item) {
+        ok { true }
+        err(error: _) { false }
+    }
+}
+
+fn out_of_memory() -> u8 {
+    io.eprint("ternc: out of memory\n")
+    return 1
+}
+
+// The last part of a path.
+fn base_name(path: []u8) -> []u8 {
+    var start: usize = path.len
+    for start > 0 && path[start - 1] != '/' {
+        start -= 1
+    }
+    return path[start..]
+}
+
+fn build_program(alloc: Allocator, o: BuildOptions) -> u8 ! OutOfMemory {
+    let p: program.Program = try program.load_hosted(alloc, o.root, o.std_dir)
+    if program.has_errors(p) {
+        render_program(p)
+        return ok.(value: 1)
+    }
+    let names: resolve.Resolution = try resolve.resolve(alloc, p)
+    if names.diagnostics.len > 0 {
+        render_diagnostics(p, names.diagnostics)
+        return ok.(value: 1)
+    }
+    let checked: check.Checked = try check.check(alloc, p, names)
+    if checked.diagnostics.len > 0 {
+        render_diagnostics(p, checked.diagnostics)
+        return ok.(value: 1)
+    }
+    // The root directory's name prefixes the root package's symbols and
+    // names the executable.
+    var root_name: ?[]u8 = none
+    match fs.real_path(alloc, o.root) {
+        ok(value as found: ?[..]u8) {
+            match found {
+                some(value as path: [..]u8) {
+                    root_name = some.(value: base_name(path))
+                }
+                none {
+                }
+            }
+        }
+        err(error: _) {
+        }
+    }
+    let symbol_prefix: []u8 = match root_name {
+        some(value as n: []u8) { n }
+        none { "main" }
+    }
+    var out: []u8 = match root_name {
+        some(value as n: []u8) { n }
+        none { "a.out" }
+    }
+    if o.assembly_only {
+        out = try program.format_text(alloc, "{out}.s")
+    }
+    match o.out {
+        some(value as given: []u8) {
+            out = given
+        }
+        none {
+        }
+    }
+    match try gen.generate(alloc, p, names, checked, symbol_prefix) {
+        unsupported(message: []u8) {
+            io.eprint("{message}\n")
+            return ok.(value: 1)
+        }
+        module(m: keel.Module) {
+            defer keel.destroy(m)
+            return emit(alloc, m, o, out)
+        }
+    }
+}
+
+fn write_file(path: []u8, bytes: []u8) -> u8 {
+    match io.create(path) {
+        ok(value as var f: io.File) {
+            defer io.close(inout f)
+            match io.write_all(f, bytes) {
+                ok {
+                    return 0
+                }
+                err(error: io.Error) {
+                    io.eprint("cannot write {path}: {io.describe(error)}\n")
+                    return 1
+                }
+            }
+        }
+        err(error: io.Error) {
+            io.eprint("cannot write {path}: {io.describe(error)}\n")
+            return 1
+        }
+    }
+}
+
+// Writes the IR, the assembly or the executable.
+fn emit(alloc: Allocator, m: keel.Module, o: BuildOptions, out: []u8) -> u8 ! OutOfMemory {
+    keel.verify(m)
+    if o.ir_only {
+        let text: [..]u8 = try keel.emit_ir(alloc, m)
+        return ok.(value: write_file(out, text))
+    }
+    var options: keel.CodegenOptions = keel.CodegenOptions.(selection: 0, allocation: 0, goal: 0, unwind: 0, x86_code_model: 0, flags: 0)
+    if o.optimize {
+        keel.optimize(m, 5)
+        options.selection = 3
+    }
+    if o.assembly_only {
+        let text: [..]u8 = try keel.emit_assembly(alloc, m, keel.aarch64_apple_darwin, options)
+        return ok.(value: write_file(out, text))
+    }
+    let object: [..]u8 = try keel.emit_object(alloc, m, keel.aarch64_apple_darwin, options)
+    return link(alloc, object, o, out)
+}
+
+// The macOS SDK: SDKROOT, or the Command Line Tools' SDK.
+fn macos_sdk(alloc: Allocator) -> ?[]u8 ! OutOfMemory {
+    match os.env("SDKROOT") {
+        some(value as root: []u8) {
+            if root.len > 0 {
+                return ok.(value: some.(value: root))
+            }
+        }
+        none {
+        }
+    }
+    let tools: []u8 = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+    match fs.real_path(alloc, tools) {
+        ok(value as found: ?[..]u8) {
+            match found {
+                some(value: _) {
+                    return ok.(value: some.(value: tools))
+                }
+                none {
+                }
+            }
+        }
+        err(error: _) {
+        }
+    }
+    return ok.(value: none)
+}
+
+// Links the program's object, the extra archives and objects, libSystem
+// and the `-l` libraries into the signed executable out.
+fn link(alloc: Allocator, object: []u8, o: BuildOptions, out: []u8) -> u8 ! OutOfMemory {
+    var sdk: []u8 = ""
+    match try macos_sdk(alloc) {
+        some(value as found: []u8) {
+            sdk = found
+        }
+        none {
+            io.eprint("cannot find the macOS SDK; set SDKROOT\n")
+            return ok.(value: 1)
+        }
+    }
+    var inputs: [..]keel.LinkInput = make(alloc)
+    try push(inout inputs, keel.LinkInput.(name: "tern.o", bytes: object))
+    for let path: []u8 in o.link {
+        match read_all(alloc, path) {
+            ok(value as bytes: [..]u8) {
+                try push(inout inputs, keel.LinkInput.(name: path, bytes: bytes))
+            }
+            err(error: io.Error) {
+                io.eprint("cannot read {path}: {io.describe(error)}\n")
+                return ok.(value: 1)
+            }
+        }
+    }
+    // libc, libm and others are links to libSystem; load each stub once.
+    var names: [..][]u8 = make(alloc)
+    try push(inout names, "System")
+    try append(inout names, o.libraries)
+    var stubs: [..][]u8 = make(alloc)
+    for let name: []u8 in names {
+        let path: []u8 = try program.format_text(alloc, "{sdk}/usr/lib/lib{name}.tbd")
+        var real: ?[..]u8 = none
+        match fs.real_path(alloc, path) {
+            ok(value as found: ?[..]u8) {
+                real = found
+            }
+            err(error: _) {
+            }
+        }
+        match real {
+            some(value as stub: [..]u8) {
+                var seen: bool = false
+                for let s: []u8 in stubs {
+                    if program.bytes_equal(s, stub) {
+                        seen = true
+                    }
+                }
+                if !seen {
+                    try push(inout stubs, stub)
+                }
+            }
+            none {
+                io.eprint("cannot find library `{name}` in {sdk}\n")
+                return ok.(value: 1)
+            }
+        }
+    }
+    match try keel.link_signed(alloc, inputs, stubs, sdk, out) {
+        failed(message: [..]u8) {
+            let text: []u8 = message
+            io.eprint("cannot link {out}: {text}\n")
+            return ok.(value: 1)
+        }
+        done(warnings: [..]u8) {
+            var start: usize = 0
+            for let i: usize in 0..warnings.len {
+                if warnings[i] == '\n' {
+                    if i > start {
+                        let line: []u8 = warnings[start..i]
+                        io.eprint("warning: {line}\n")
+                    }
+                    start = i + 1
+                }
+            }
+            if warnings.len > start {
+                let line: []u8 = warnings[start..]
+                io.eprint("warning: {line}\n")
+            }
+            return ok.(value: 0)
+        }
+    }
 }
 
 // Every error, rendered with its source line where it has one.

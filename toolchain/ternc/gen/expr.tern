@@ -1,0 +1,1608 @@
+// Lowering expressions. Ported from stage 1's codegen/func.rs.
+
+import check
+import keel
+import maps
+import program
+import resolve
+import syntax
+
+// The data pointer and length of an array, view or growable array.
+type PtrLen (ptr: keel.Value, len: keel.Value)
+
+// An element's address and type.
+type ElemAddr (addr: keel.Value, elem: check.TyId)
+
+// A piece of a `Format` being built.
+type FormatPiece enum {
+    text(bytes: []u8)
+    value(v: V, ty: check.TyId)
+}
+
+fn expr(g: inout Gen, fx: inout Fx, e: syntax.ExprId) -> V ! OutOfMemory {
+    let ty: check.TyId = try expr_ty(inout g, fx, e)
+    if !fx.reachable {
+        return dummy(inout g, fx, ty)
+    }
+    let x: syntax.Expr = expr_at(fx, e)
+    let span: syntax.Span = x.span
+    match x.kind {
+        int {
+            return int_value(inout g, fx, e, ty)
+        }
+        char {
+            return int_value(inout g, fx, e, ty)
+        }
+        float {
+            let value: f64 = try float_value(g, span_text(fx, span))
+            match try scalar_of(inout g, ty) {
+                float32 {
+                    return ok.(value: V.scalar.(value: keel.fconst(fx.m, fx.block, keel.Type.float32, u64.(f32_bits(f32.(value))))))
+                }
+                _ {
+                    return ok.(value: V.scalar.(value: keel.fconst(fx.m, fx.block, keel.Type.float64, f64_bits(value))))
+                }
+            }
+        }
+        str(parts: syntax.List) {
+            return string_lit(inout g, inout fx, parts, ty)
+        }
+        paren(inner: syntax.ExprId) {
+            return expr(inout g, inout fx, inner)
+        }
+        unsafe_expr(body: syntax.ExprId) {
+            return expr(inout g, inout fx, body)
+        }
+        tuple(items: syntax.List) {
+            let addr: keel.Value = try temp(inout g, fx, ty)
+            try tuple_into(inout g, inout fx, addr, ty, items)
+            return ok.(value: V.memory.(addr: addr))
+        }
+        array(elems: syntax.List) {
+            let addr: keel.Value = try temp(inout g, fx, ty)
+            match check.get(g.types, core_ty(g, ty)) {
+                array(len: _, elem: check.TyId) {
+                    let l: TyLayout = try ty_layout(inout g, elem)
+                    var i: u64 = 0
+                    let ast: syntax.Ast = fx.ast
+                    for let el: u32 in syntax.items(ast.extra, elems) {
+                        let v: V = try value_as(inout g, inout fx, syntax.ExprId.(el), elem)
+                        let at: keel.Value = offset_by(fx, addr, l.size * i)
+                        try store_v(inout g, fx, v, elem, at, false)
+                        i += 1
+                    }
+                }
+                _ {
+                }
+            }
+            return ok.(value: V.memory.(addr: addr))
+        }
+        name(name: _) {
+            return name_value(inout g, inout fx, e, ty)
+        }
+        field(value: syntax.ExprId, name: syntax.Span) {
+            return field_value(inout g, inout fx, e, value, name, ty)
+        }
+        construct(ty as target: syntax.ExprId, value: syntax.ExprId) {
+            return construct(inout g, inout fx, target, value, ty, span)
+        }
+        call(callee: syntax.ExprId, args: syntax.List) {
+            return call_expr(inout g, inout fx, callee, args, ty, span)
+        }
+        index(value: syntax.ExprId, index: syntax.Index) {
+            match index {
+                value(value as i: syntax.ExprId) {
+                    let ea: ElemAddr = try elem_addr(inout g, inout fx, value, i, span)
+                    return load_v(inout g, fx, ea.addr, ea.elem)
+                }
+                slice(start: ?syntax.ExprId, end: ?syntax.ExprId) {
+                    return slice(inout g, inout fx, value, start, end, ty, span)
+                }
+                ty(ty: _) {
+                    return ok.(value: V.unit)
+                }
+            }
+        }
+        deref(inner: syntax.ExprId) {
+            let v: V = try expr(inout g, inout fx, inner)
+            let p: keel.Value = scalar_v(fx, v)
+            return load_v(inout g, fx, p, ty)
+        }
+        unary(op: syntax.UnaryOp, operand: syntax.ExprId) {
+            return unary(inout g, inout fx, op, operand, ty, span)
+        }
+        try_expr(operand: syntax.ExprId) {
+            return try_value(inout g, inout fx, operand, ty)
+        }
+        binary(op: syntax.BinaryOp, left: syntax.ExprId, right: syntax.ExprId) {
+            return binary(inout g, inout fx, op, left, right, ty, span)
+        }
+        if_expr(cond: syntax.ExprId, then: syntax.ExprId, otherwise: syntax.IfElse) {
+            let out: ?keel.Value = try result_slot(inout g, fx, ty)
+            let after: keel.Block = try new_block(inout fx)
+            let c: V = try expr(inout g, inout fx, cond)
+            let cv: keel.Value = scalar_v(fx, c)
+            let then_block: keel.Block = try new_block(inout fx)
+            let else_block: keel.Block = try new_block(inout fx)
+            try brif(inout fx, cv, then_block, else_block)
+            switch_to(inout fx, then_block, true)
+            try branch_value(inout g, inout fx, then, ty, out, after)
+            switch_to(inout fx, else_block, true)
+            let other: syntax.ExprId = match otherwise {
+                branch(value as o: syntax.ExprId) { o }
+                if_expr(value as o: syntax.ExprId) { o }
+            }
+            try branch_value(inout g, inout fx, other, ty, out, after)
+            try continue_at(inout fx, after)
+            return result_value(inout g, fx, out, ty)
+        }
+        match_expr(value: syntax.ExprId, arms: syntax.List) {
+            let out: ?keel.Value = try result_slot(inout g, fx, ty)
+            let after: keel.Block = try new_block(inout fx)
+            let sty: check.TyId = try expr_ty(inout g, fx, value)
+            let scrutinee: V = try expr(inout g, inout fx, value)
+            let ast: syntax.Ast = fx.ast
+            for let a: u32 in syntax.items(ast.extra, arms) {
+                let arm: syntax.Arm = ast.arms[usize.(a)]
+                let body: ?keel.Block = try arm_test(inout g, inout fx, scrutinee, sty, arm.patterns)
+                let next: keel.Block = take_pending(inout fx)
+                match body {
+                    some(value as start: keel.Block) {
+                        switch_to(inout fx, start, true)
+                        match arm.body {
+                            branch(value as b: syntax.ExprId) {
+                                try branch_value(inout g, inout fx, b, ty, out, after)
+                            }
+                            block(body as b: syntax.Block) {
+                                try block_stmts(inout g, inout fx, b)
+                                try jump_join(inout fx, after)
+                            }
+                        }
+                        switch_to(inout fx, next, true)
+                    }
+                    none {
+                    }
+                }
+            }
+            try trap_here(inout fx)
+            try continue_at(inout fx, after)
+            return result_value(inout g, fx, out, ty)
+        }
+    }
+}
+
+fn int_value(g: inout Gen, fx: Fx, e: syntax.ExprId, ty: check.TyId) -> V ! OutOfMemory {
+    var n: check.Wide = check.wide(0)
+    match try const_int(inout g, fx.file, e, 0) {
+        some(value as v: check.Wide) {
+            n = v
+        }
+        none {
+        }
+    }
+    let t: keel.Type = try scalar_of(inout g, ty)
+    return ok.(value: V.scalar.(value: iconst(fx, t, low_i64(n))))
+}
+
+fn result_slot(g: inout Gen, fx: Fx, ty: check.TyId) -> ?keel.Value ! OutOfMemory {
+    return match try ty_repr(inout g, ty) {
+        unit { ok.(value: none) }
+        _ { ok.(value: some.(value: try temp(inout g, fx, ty))) }
+    }
+}
+
+fn branch_value(g: inout Gen, fx: inout Fx, e: syntax.ExprId, ty: check.TyId, out: ?keel.Value, after: keel.Block) -> ! OutOfMemory {
+    let v: V = try value_as(inout g, inout fx, e, ty)
+    match out {
+        some(value as addr: keel.Value) {
+            if fx.reachable {
+                try store_v(inout g, fx, v, ty, addr, false)
+            }
+        }
+        none {
+        }
+    }
+    return jump_join(inout fx, after)
+}
+
+fn result_value(g: inout Gen, fx: Fx, out: ?keel.Value, ty: check.TyId) -> V ! OutOfMemory {
+    return match out {
+        some(value as addr: keel.Value) { load_v(inout g, fx, addr, ty) }
+        none { ok.(value: V.unit) }
+    }
+}
+
+// e, converted to ty where the checker allowed a coercion.
+fn value_as(g: inout Gen, fx: inout Fx, e: syntax.ExprId, ty: check.TyId) -> V ! OutOfMemory {
+    let actual: check.TyId = try expr_ty(inout g, fx, e)
+    let v: V = try expr(inout g, inout fx, e)
+    return coerce(inout g, inout fx, v, actual, ty)
+}
+
+fn coerce(g: inout Gen, fx: inout Fx, v: V, from: check.TyId, to: check.TyId) -> V ! OutOfMemory {
+    if check.same_ty(from, to) {
+        return ok.(value: v)
+    }
+    let from_core: check.TyId = core_ty(g, from)
+    let to_core: check.TyId = core_ty(g, to)
+    match check.get(g.types, from_core) {
+        never, error {
+            return dummy(inout g, fx, to)
+        }
+        array(len: u64, elem: _) {
+            match check.get(g.types, to_core) {
+                view(elem: _) {
+                    let addr: keel.Value = scalar_v(fx, v)
+                    let len_v: keel.Value = usize_const(fx, len)
+                    return make_view(inout g, fx, to, addr, len_v)
+                }
+                _ {
+                }
+            }
+        }
+        growable(elem: _) {
+            match check.get(g.types, to_core) {
+                view(elem: _) {
+                    let addr: keel.Value = scalar_v(fx, v)
+                    let p: keel.Value = load_scalar(fx, keel.Type.ptr, addr)
+                    // An empty array's pointer is null; a view's never is.
+                    let null: keel.Value = null_ptr(fx)
+                    let empty: keel.Value = compare_ints(fx, keel.IntCC.eq, p, null)
+                    let chosen: keel.Value = keel.select(fx.m, fx.block, empty, addr, p)
+                    let len_addr: keel.Value = offset_by(fx, addr, 8)
+                    let len: keel.Value = load_scalar(fx, keel.Type.int64, len_addr)
+                    return make_view(inout g, fx, to, chosen, len)
+                }
+                _ {
+                }
+            }
+        }
+        _ {
+        }
+    }
+    return ok.(value: v)
+}
+
+fn make_view(g: inout Gen, fx: Fx, ty: check.TyId, p: keel.Value, len: keel.Value) -> V ! OutOfMemory {
+    let addr: keel.Value = try temp(inout g, fx, ty)
+    store_scalar(fx, p, addr)
+    let len_addr: keel.Value = offset_by(fx, addr, 8)
+    store_scalar(fx, len, len_addr)
+    return ok.(value: V.memory.(addr: addr))
+}
+
+fn ptr_len(g: inout Gen, fx: inout Fx, e: syntax.ExprId, core: check.TyId) -> PtrLen ! OutOfMemory {
+    match check.get(g.types, core) {
+        array(len: u64, elem: _) {
+            let addr: keel.Value = try addr_of(inout g, inout fx, e)
+            return ok.(value: PtrLen.(ptr: addr, len: usize_const(fx, len)))
+        }
+        _ {
+            let addr: keel.Value = try addr_of(inout g, inout fx, e)
+            let p: keel.Value = load_scalar(fx, keel.Type.ptr, addr)
+            let len_addr: keel.Value = offset_by(fx, addr, 8)
+            let len: keel.Value = load_scalar(fx, keel.Type.int64, len_addr)
+            return ok.(value: PtrLen.(ptr: p, len: len))
+        }
+    }
+}
+
+fn is_storage(g: Gen, decl: maps.DeclRef) -> bool {
+    return match decl_of(g, decl).kind {
+        global(is_shared: _, local: _) { true }
+        extern_var(mutable: _, name: _, ty: _) { true }
+        _ { false }
+    }
+}
+
+fn res_decl(res: ?resolve.Res) -> ?maps.DeclRef {
+    return match res {
+        some(value as r: resolve.Res) {
+            match r {
+                decl(decl: maps.DeclRef) { some.(value: decl) }
+                _ { none }
+            }
+        }
+        none { none }
+    }
+}
+
+fn res_local(res: ?resolve.Res) -> ?u32 {
+    return match res {
+        some(value as r: resolve.Res) {
+            match r {
+                local(id: u32) { some.(value: id) }
+                _ { none }
+            }
+        }
+        none { none }
+    }
+}
+
+// The address of an expression's storage: a variable, field or element,
+// or a temporary for any other value.
+fn addr_of(g: inout Gen, fx: inout Fx, e: syntax.ExprId) -> keel.Value ! OutOfMemory {
+    let x: syntax.Expr = expr_at(fx, e)
+    match x.kind {
+        paren(inner: syntax.ExprId) {
+            return addr_of(inout g, inout fx, inner)
+        }
+        name(name: _) {
+            match res_local(res_of(fx, e)) {
+                some(value as id: u32) {
+                    return ok.(value: local_addr(fx, id))
+                }
+                none {
+                }
+            }
+            match res_decl(res_of(fx, e)) {
+                some(value as decl: maps.DeclRef) {
+                    if is_storage(g, decl) {
+                        return decl_addr(inout g, fx, decl)
+                    }
+                }
+                none {
+                }
+            }
+        }
+        field(value: syntax.ExprId, name: syntax.Span) {
+            match res_decl(res_of(fx, e)) {
+                some(value as decl: maps.DeclRef) {
+                    if is_storage(g, decl) {
+                        return decl_addr(inout g, fx, decl)
+                    }
+                }
+                none {
+                    match item_of(fx, value) {
+                        value(ty as base_ty: check.TyId) {
+                            let core: check.TyId = core_ty(g, base_ty)
+                            let name_text: []u8 = span_text(fx, name)
+                            let record: bool = match check.get(g.types, core) {
+                                view(elem: _) { false }
+                                growable(elem: _) { false }
+                                array(len: _, elem: _) { false }
+                                _ { true }
+                            }
+                            if record {
+                                match try fields_of(inout g, core) {
+                                    some(value as fields: []FieldInfo) {
+                                        for let f: FieldInfo in fields {
+                                            if same_text(f.name, name_text) {
+                                                let base: keel.Value = try addr_of(inout g, inout fx, value)
+                                                return ok.(value: offset_by(fx, base, f.offset))
+                                            }
+                                        }
+                                    }
+                                    none {
+                                    }
+                                }
+                            }
+                        }
+                        _ {
+                        }
+                    }
+                }
+            }
+        }
+        index(value: syntax.ExprId, index: syntax.Index) {
+            match index {
+                value(value as i: syntax.ExprId) {
+                    let ea: ElemAddr = try elem_addr(inout g, inout fx, value, i, x.span)
+                    return ok.(value: ea.addr)
+                }
+                _ {
+                }
+            }
+        }
+        deref(inner: syntax.ExprId) {
+            let v: V = try expr(inout g, inout fx, inner)
+            return ok.(value: scalar_v(fx, v))
+        }
+        _ {
+        }
+    }
+    let ty: check.TyId = try expr_ty(inout g, fx, e)
+    let v: V = try expr(inout g, inout fx, e)
+    return spill(inout g, fx, v, ty)
+}
+
+// Leaves the `[..]T` at v empty: no buffer, length and capacity 0. It
+// keeps its allocator, so it can grow again.
+fn empty_growable(fx: Fx, v: keel.Value) {
+    let null: keel.Value = null_ptr(fx)
+    store_scalar(fx, null, v)
+    let zero: keel.Value = iconst(fx, keel.Type.int64, 0)
+    let offsets: [2]u64 = [8, 16]
+    for let off: u64 in offsets {
+        let addr: keel.Value = offset_by(fx, v, off)
+        store_scalar(fx, zero, addr)
+    }
+}
+
+// Whether a `let` argument can pass the address of its storage: a local,
+// or a field or element of one held in the local's own memory or its
+// `[..]T`. A global, or a value reached through a view or a pointer, is
+// copied, since the callee may change it another way.
+fn borrowable(g: inout Gen, fx: Fx, e: syntax.ExprId) -> bool ! OutOfMemory {
+    match expr_at(fx, e).kind {
+        paren(inner: syntax.ExprId) {
+            return borrowable(inout g, fx, inner)
+        }
+        name(name: _) {
+            return match res_local(res_of(fx, e)) {
+                some(value: _) { ok.(value: true) }
+                none { ok.(value: false) }
+            }
+        }
+        field(value: syntax.ExprId, name: _) {
+            match res_decl(res_of(fx, e)) {
+                some(value: _) {
+                    return ok.(value: false)
+                }
+                none {
+                    return borrowable(inout g, fx, value)
+                }
+            }
+        }
+        index(value: syntax.ExprId, index: syntax.Index) {
+            match index {
+                value(value: _) {
+                    let ty: check.TyId = try expr_ty(inout g, fx, value)
+                    let held: bool = match check.get(g.types, core_ty(g, ty)) {
+                        array(len: _, elem: _) { true }
+                        growable(elem: _) { true }
+                        _ { false }
+                    }
+                    if !held {
+                        return ok.(value: false)
+                    }
+                    return borrowable(inout g, fx, value)
+                }
+                _ {
+                    return ok.(value: false)
+                }
+            }
+        }
+        _ {
+            return ok.(value: false)
+        }
+    }
+}
+
+fn decl_addr(g: inout Gen, fx: Fx, decl: maps.DeclRef) -> keel.Value ! OutOfMemory {
+    let name: []u8 = try symbol(inout g, decl)
+    let s: keel.Symbol = try data_symbol(inout g, name)
+    return ok.(value: data_addr(fx, s))
+}
+
+// The address of value[i], after a bounds check, and the element type.
+fn elem_addr(g: inout Gen, fx: inout Fx, value: syntax.ExprId, i: syntax.ExprId, span: syntax.Span) -> ElemAddr ! OutOfMemory {
+    let ty: check.TyId = try expr_ty(inout g, fx, value)
+    let core: check.TyId = core_ty(g, ty)
+    var elem: check.TyId = check.TyId.(0)
+    match check.get(g.types, core) {
+        array(len: _, elem as t: check.TyId) {
+            elem = t
+        }
+        view(elem as t: check.TyId) {
+            elem = t
+        }
+        growable(elem as t: check.TyId) {
+            elem = t
+        }
+        _ {
+            return ok.(value: ElemAddr.(addr: null_ptr(fx), elem: try check.error_ty(inout g.types)))
+        }
+    }
+    let pl: PtrLen = try ptr_len(inout g, inout fx, value, core)
+    let usize_ty: check.TyId = try check.usize_ty(inout g.types)
+    let index_v: V = try value_as(inout g, inout fx, i, usize_ty)
+    let index: keel.Value = scalar_v(fx, index_v)
+    let inside: keel.Value = compare_ints(fx, keel.IntCC.ult, index, pl.len)
+    var pieces: [..]Piece = make(g.alloc)
+    try push(inout pieces, Piece.text.(text: "index "))
+    try push(inout pieces, Piece.unsigned.(value: index))
+    try push(inout pieces, Piece.text.(text: " out of bounds for length "))
+    try push(inout pieces, Piece.unsigned.(value: pl.len))
+    try check_or_panic(inout g, inout fx, inside, pieces, span)
+    let l: TyLayout = try ty_layout(inout g, elem)
+    let size: keel.Value = usize_const(fx, l.size)
+    let off: keel.Value = binop(fx, keel.BinaryOp.imul, index, size)
+    return ok.(value: ElemAddr.(addr: keel.ptradd(fx.m, fx.block, pl.ptr, off), elem: elem))
+}
+
+fn name_value(g: inout Gen, fx: inout Fx, e: syntax.ExprId, ty: check.TyId) -> V ! OutOfMemory {
+    match res_of(fx, e) {
+        some(value as r: resolve.Res) {
+            match r {
+                local(id: u32) {
+                    let addr: keel.Value = local_addr(fx, id)
+                    return load_v(inout g, fx, addr, ty)
+                }
+                decl(decl: maps.DeclRef) {
+                    return decl_value(inout g, inout fx, decl, ty)
+                }
+                builtin(name: []u8) {
+                    return builtin_value(inout g, inout fx, name, ty)
+                }
+                package(id: _) {
+                }
+            }
+        }
+        none {
+        }
+    }
+    return dummy(inout g, fx, ty)
+}
+
+fn decl_value(g: inout Gen, fx: inout Fx, decl: maps.DeclRef, ty: check.TyId) -> V ! OutOfMemory {
+    var is_fn: bool = false
+    match decl_of(g, decl).kind {
+        function(is_unsafe: _, name: _, params: _, result: _, body: _) {
+            is_fn = true
+        }
+        extern_fn(name: _, params: _, variadic: _, result: _) {
+            is_fn = true
+        }
+        _ {
+        }
+    }
+    if !is_fn {
+        let addr: keel.Value = try decl_addr(inout g, fx, decl)
+        return load_v(inout g, fx, addr, ty)
+    }
+    let abi: FnAbi = try decl_abi(inout g, decl)
+    let name: []u8 = try symbol(inout g, decl)
+    var byval: bool = false
+    for let p: Pass in abi.passes {
+        match p {
+            byval {
+                byval = true
+            }
+            _ {
+            }
+        }
+    }
+    if byval && is_extern_fn(g, decl) {
+        try unsupported(inout g, try program.format_text(g.alloc, "`{name}` takes a record by value, as C does, so it cannot be a function value, whose records are passed by pointer"))
+    }
+    let s: keel.Symbol = try function_symbol(inout g, name, abi.sig)
+    return ok.(value: V.scalar.(value: keel.symbol_addr(fx.m, fx.block, s)))
+}
+
+fn builtin_value(g: inout Gen, fx: inout Fx, name: []u8, ty: check.TyId) -> V ! OutOfMemory {
+    match name {
+        "true" {
+            return ok.(value: V.scalar.(value: iconst(fx, keel.Type.int8, 1)))
+        }
+        "false" {
+            return ok.(value: V.scalar.(value: iconst(fx, keel.Type.int8, 0)))
+        }
+        "none", "ok" {
+            return enum_value(inout g, inout fx, ty, name, none)
+        }
+        _ {
+            return dummy(inout g, fx, ty)
+        }
+    }
+}
+
+fn field_value(g: inout Gen, fx: inout Fx, e: syntax.ExprId, value: syntax.ExprId, name: syntax.Span, ty: check.TyId) -> V ! OutOfMemory {
+    match res_decl(res_of(fx, e)) {
+        some(value as decl: maps.DeclRef) {
+            return decl_value(inout g, inout fx, decl, ty)
+        }
+        none {
+        }
+    }
+    let name_text: []u8 = span_text(fx, name)
+    match item_of(fx, value) {
+        type_item(ty as enum_ty: check.TyId) {
+            return enum_value(inout g, inout fx, enum_ty, name_text, none)
+        }
+        value(ty as base_ty: check.TyId) {
+            let core: check.TyId = core_ty(g, base_ty)
+            if same_text(name_text, "len") {
+                match check.get(g.types, core) {
+                    array(len: u64, elem: _) {
+                        return ok.(value: V.scalar.(value: usize_const(fx, len)))
+                    }
+                    view(elem: _) {
+                        return view_len(inout g, inout fx, value)
+                    }
+                    growable(elem: _) {
+                        return view_len(inout g, inout fx, value)
+                    }
+                    _ {
+                    }
+                }
+            }
+            let f: FieldInfo = try field_of(inout g, core, name_text)
+            let base: keel.Value = try addr_of(inout g, inout fx, value)
+            let at: keel.Value = offset_by(fx, base, f.offset)
+            return load_v(inout g, fx, at, f.ty)
+        }
+        _ {
+            return dummy(inout g, fx, ty)
+        }
+    }
+}
+
+fn view_len(g: inout Gen, fx: inout Fx, value: syntax.ExprId) -> V ! OutOfMemory {
+    let addr: keel.Value = try addr_of(inout g, inout fx, value)
+    let at: keel.Value = offset_by(fx, addr, 8)
+    return ok.(value: V.scalar.(value: load_scalar(fx, keel.Type.int64, at)))
+}
+
+// A value of an enum, optional or result. payload is the `(...)`
+// expression after the variant.
+fn enum_value(g: inout Gen, fx: inout Fx, ty: check.TyId, name: []u8, payload: ?syntax.ExprId) -> V ! OutOfMemory {
+    let vo: VariantOf = try variant_of(inout g, ty, name)
+    match vo.kind {
+        scalar_tag(tag: keel.Type) {
+            return ok.(value: V.scalar.(value: iconst(fx, tag, vo.variant.tag)))
+        }
+        nullable_pointer {
+            match payload {
+                some(value as p: syntax.ExprId) {
+                    match vo.variant.payload {
+                        some(value as payload_ty: check.TyId) {
+                            let f: FieldInfo = try field_of(inout g, payload_ty, "value")
+                            let inner: syntax.ExprId = tuple_field_expr(g, fx.file, p, "value")
+                            return value_as(inout g, inout fx, inner, f.ty)
+                        }
+                        none {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            return ok.(value: V.scalar.(value: null_ptr(fx)))
+        }
+        tagged(tag: keel.Type, payload_offset: u64) {
+            let addr: keel.Value = try temp(inout g, fx, ty)
+            let t: keel.Value = iconst(fx, tag, vo.variant.tag)
+            store_scalar(fx, t, addr)
+            match payload {
+                some(value as p: syntax.ExprId) {
+                    match vo.variant.payload {
+                        some(value as payload_ty: check.TyId) {
+                            let at: keel.Value = offset_by(fx, addr, payload_offset)
+                            try write_record(inout g, inout fx, at, payload_ty, p)
+                        }
+                        none {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            return ok.(value: V.memory.(addr: addr))
+        }
+    }
+}
+
+// Writes the record value e of type ty at addr: a tuple literal field by
+// field, or any other expression whole.
+fn write_record(g: inout Gen, fx: inout Fx, addr: keel.Value, ty: check.TyId, e: syntax.ExprId) -> ! OutOfMemory {
+    match expr_at(fx, e).kind {
+        tuple(items: syntax.List) {
+            return tuple_into(inout g, inout fx, addr, ty, items)
+        }
+        _ {
+            let v: V = try value_as(inout g, inout fx, e, ty)
+            return store_v(inout g, fx, v, ty, addr, false)
+        }
+    }
+}
+
+fn tuple_into(g: inout Gen, fx: inout Fx, addr: keel.Value, ty: check.TyId, items: syntax.List) -> ! OutOfMemory {
+    let core: check.TyId = core_ty(g, ty)
+    let ast: syntax.Ast = fx.ast
+    for let i: u32 in syntax.items(ast.extra, items) {
+        let item: syntax.TupleItem = ast.tuple_items[usize.(i)]
+        let f: FieldInfo = try field_of(inout g, core, span_text(fx, item.name))
+        let at: keel.Value = offset_by(fx, addr, f.offset)
+        try write_record(inout g, inout fx, at, f.ty, item.value)
+    }
+    return ok
+}
+
+fn construct(g: inout Gen, fx: inout Fx, target: syntax.ExprId, value: syntax.ExprId, ty: check.TyId, span: syntax.Span) -> V ! OutOfMemory {
+    match res_of(fx, target) {
+        some(value as r: resolve.Res) {
+            match r {
+                builtin(name: []u8) {
+                    match name {
+                        "some", "ok", "err" {
+                            return enum_value(inout g, inout fx, ty, name, some.(value: value))
+                        }
+                        _ {
+                        }
+                    }
+                }
+                _ {
+                }
+            }
+        }
+        none {
+        }
+    }
+    match item_of(fx, target) {
+        variant(ty as enum_ty: check.TyId, index: u32) {
+            var name: []u8 = ""
+            match try shape_of(inout g, enum_ty) {
+                some(value as shape: EnumShape) {
+                    name = shape.variants[usize.(index)].name
+                }
+                none {
+                }
+            }
+            return enum_value(inout g, inout fx, enum_ty, name, some.(value: value))
+        }
+        builtin(name: []u8) {
+            return enum_value(inout g, inout fx, ty, name, some.(value: value))
+        }
+        type_item(ty as target_ty: check.TyId) {
+            let core: check.TyId = core_ty(g, target_ty)
+            match try fields_of(inout g, core) {
+                some(value: _) {
+                    let addr: keel.Value = try temp(inout g, fx, target_ty)
+                    try write_record(inout g, inout fx, addr, core, value)
+                    return ok.(value: V.memory.(addr: addr))
+                }
+                none {
+                }
+            }
+            let inner: syntax.ExprId = match expr_at(fx, value).kind {
+                paren(inner as x: syntax.ExprId) { x }
+                _ { value }
+            }
+            let from: check.TyId = try expr_ty(inout g, fx, inner)
+            let v: V = try expr(inout g, inout fx, inner)
+            return convert(inout g, inout fx, v, from, target_ty, span)
+        }
+        _ {
+            return dummy(inout g, fx, ty)
+        }
+    }
+}
+
+fn shown(g: Gen, ty: check.TyId) -> []u8 ! OutOfMemory {
+    var out: [..]u8 = make(g.alloc)
+    try check.show_into(g.types, ty, inout out)
+    return ok.(value: out)
+}
+
+fn is_float_ty(g: Gen, ty: check.TyId, bits: u32) -> bool {
+    return match check.get(g.types, ty) {
+        float(bits as b: u32) { b == bits }
+        _ { false }
+    }
+}
+
+// `T.(x)`: a conversion between numbers, to or from an integer enum, or
+// into or out of a newtype.
+fn convert(g: inout Gen, fx: inout Fx, v: V, from: check.TyId, to: check.TyId, span: syntax.Span) -> V ! OutOfMemory {
+    let from_core: check.TyId = core_ty(g, from)
+    let to_core: check.TyId = core_ty(g, to)
+    let from_int: ?check.IntTy = try int_like(inout g, from_core)
+    let to_int: ?check.IntTy = try int_like(inout g, to_core)
+    var x: keel.Value = keel.no_value()
+    match v {
+        scalar(value as s: keel.Value) {
+            x = s
+        }
+        _ {
+            return ok.(value: v)
+        }
+    }
+    match from_int {
+        some(value as a: check.IntTy) {
+            match to_int {
+                some(value as b: check.IntTy) {
+                    let converted: keel.Value = try convert_int(inout g, inout fx, x, a, b, to, span)
+                    match try shape_of(inout g, to_core) {
+                        some(value as shape: EnumShape) {
+                            match shape.kind {
+                                scalar_tag(tag: _) {
+                                    if !open_enum(g, to_core) {
+                                        // Only a variant's value is a valid enum.
+                                        let t: keel.Type = try scalar_of(inout g, to_core)
+                                        var valid: keel.Value = iconst(fx, keel.Type.int8, 0)
+                                        for let variant: VariantShape in shape.variants {
+                                            let c: keel.Value = iconst(fx, t, variant.tag)
+                                            let eq: keel.Value = compare_ints(fx, keel.IntCC.eq, converted, c)
+                                            valid = binop(fx, keel.BinaryOp.or, valid, eq)
+                                        }
+                                        let name: []u8 = try shown(g, to)
+                                        let message: []u8 = try program.format_text(g.alloc, "no variant of `{name}` has this value")
+                                        var pieces: [..]Piece = make(g.alloc)
+                                        try push(inout pieces, Piece.text.(text: message))
+                                        try check_or_panic(inout g, inout fx, valid, pieces, span)
+                                    }
+                                }
+                                _ {
+                                }
+                            }
+                        }
+                        none {
+                        }
+                    }
+                    return ok.(value: V.scalar.(value: converted))
+                }
+                none {
+                    let op: keel.ConvertOp = if check.int_signed(a) { keel.ConvertOp.sitofp } else { keel.ConvertOp.uitofp }
+                    let t: keel.Type = try scalar_of(inout g, to_core)
+                    return ok.(value: V.scalar.(value: convert_to(fx, op, t, x)))
+                }
+            }
+        }
+        none {
+            match to_int {
+                some(value as b: check.IntTy) {
+                    let op: keel.ConvertOp = if check.int_signed(b) { keel.ConvertOp.fptosi } else { keel.ConvertOp.fptoui }
+                    let wide: keel.Type = if check.int_bits(b) <= 32 { keel.Type.int32 } else { keel.Type.int64 }
+                    let wide_v: keel.Value = convert_to(fx, op, wide, x)
+                    let t: keel.Type = try scalar_of(inout g, to_core)
+                    if t == wide {
+                        return ok.(value: V.scalar.(value: wide_v))
+                    }
+                    return ok.(value: V.scalar.(value: convert_to(fx, keel.ConvertOp.trunc, t, wide_v)))
+                }
+                none {
+                    if is_float_ty(g, from_core, 32) && is_float_ty(g, to_core, 64) {
+                        return ok.(value: V.scalar.(value: convert_to(fx, keel.ConvertOp.fpext, keel.Type.float64, x)))
+                    }
+                    if is_float_ty(g, from_core, 64) && is_float_ty(g, to_core, 32) {
+                        return ok.(value: V.scalar.(value: convert_to(fx, keel.ConvertOp.fptrunc, keel.Type.float32, x)))
+                    }
+                    return ok.(value: V.scalar.(value: x))
+                }
+            }
+        }
+    }
+}
+
+fn enum_info(g: Gen, ty: check.TyId) -> ?check.EnumInfo {
+    match check.get(g.types, ty) {
+        named(id: check.NamedId) {
+            match check.named_info(g.types, id) {
+                some(value as info: check.NamedInfo) {
+                    match info.def {
+                        enum_def(info as e: check.EnumInfo) {
+                            return some.(value: e)
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        _ {
+        }
+    }
+    return none
+}
+
+fn open_enum(g: Gen, ty: check.TyId) -> bool {
+    return match enum_info(g, ty) {
+        some(value as e: check.EnumInfo) { e.open }
+        none { false }
+    }
+}
+
+// The integer type behind an integer or a payload-free enum.
+fn int_like(g: inout Gen, ty: check.TyId) -> ?check.IntTy ! OutOfMemory {
+    match check.as_int(g.types, ty) {
+        some(value as int: check.IntTy) {
+            return ok.(value: some.(value: int))
+        }
+        none {
+        }
+    }
+    match enum_info(g, ty) {
+        some(value as e: check.EnumInfo) {
+            let int: check.IntTy = match e.int {
+                some(value as i: check.IntTy) { i }
+                none { check.IntTy.u8 }
+            }
+            match try shape_of(inout g, ty) {
+                some(value as shape: EnumShape) {
+                    match shape.kind {
+                        scalar_tag(tag: keel.Type) {
+                            if !check.int_signed(int) {
+                                match tag {
+                                    int16 {
+                                        return ok.(value: some.(value: check.IntTy.u16))
+                                    }
+                                    int32 {
+                                        return ok.(value: some.(value: check.IntTy.u32))
+                                    }
+                                    _ {
+                                    }
+                                }
+                            }
+                            return ok.(value: some.(value: int))
+                        }
+                        _ {
+                            return ok.(value: none)
+                        }
+                    }
+                }
+                none {
+                    return ok.(value: none)
+                }
+            }
+        }
+        none {
+            return ok.(value: none)
+        }
+    }
+}
+
+// Converts between integer types, panicking if the value does not fit.
+fn convert_int(g: inout Gen, fx: inout Fx, x: keel.Value, from: check.IntTy, to: check.IntTy, to_ty: check.TyId, span: syntax.Span) -> keel.Value ! OutOfMemory {
+    let from_bits: u32 = check.int_bits(from)
+    let to_bits: u32 = check.int_bits(to)
+    let from_signed: bool = check.int_signed(from)
+    let to_signed: bool = check.int_signed(to)
+    let ft: keel.Type = int_type(from_bits)
+    let tt: keel.Type = int_type(to_bits)
+    var fits: ?keel.Value = none
+    if from_signed && !to_signed {
+        let zero: keel.Value = iconst(fx, ft, 0)
+        let c: keel.Value = compare_ints(fx, keel.IntCC.sge, x, zero)
+        fits = both(fx, fits, c)
+    }
+    if from_bits > to_bits || (from_bits == to_bits && !from_signed && to_signed) {
+        let max: keel.Value = iconst(fx, ft, low_i64(check.int_max(to)))
+        let cc: keel.IntCC = if from_signed { keel.IntCC.sle } else { keel.IntCC.ule }
+        let c: keel.Value = compare_ints(fx, cc, x, max)
+        fits = both(fx, fits, c)
+    }
+    if from_signed && to_signed && from_bits > to_bits {
+        let min: keel.Value = iconst(fx, ft, low_i64(check.int_min(to)))
+        let c: keel.Value = compare_ints(fx, keel.IntCC.sge, x, min)
+        fits = both(fx, fits, c)
+    }
+    match fits {
+        some(value as all: keel.Value) {
+            let name: []u8 = try shown(g, to_ty)
+            let message: []u8 = try program.format_text(g.alloc, " does not fit in `{name}`")
+            let wide: keel.Value = widen(fx, x, from)
+            var pieces: [..]Piece = make(g.alloc)
+            if from_signed {
+                try push(inout pieces, Piece.signed.(value: wide))
+            } else {
+                try push(inout pieces, Piece.unsigned.(value: wide))
+            }
+            try push(inout pieces, Piece.text.(text: message))
+            try check_or_panic(inout g, inout fx, all, pieces, span)
+        }
+        none {
+        }
+    }
+    if from_bits == to_bits {
+        return ok.(value: x)
+    }
+    if from_bits > to_bits {
+        return ok.(value: convert_to(fx, keel.ConvertOp.trunc, tt, x))
+    }
+    if from_signed {
+        return ok.(value: convert_to(fx, keel.ConvertOp.sext, tt, x))
+    }
+    return ok.(value: convert_to(fx, keel.ConvertOp.uext, tt, x))
+}
+
+// prev && c, or c alone.
+fn both(fx: Fx, prev: ?keel.Value, c: keel.Value) -> ?keel.Value {
+    return match prev {
+        some(value as p: keel.Value) { some.(value: binop(fx, keel.BinaryOp.and, p, c)) }
+        none { some.(value: c) }
+    }
+}
+
+// An integer widened to 64 bits, for a message.
+fn widen(fx: Fx, x: keel.Value, int: check.IntTy) -> keel.Value {
+    if check.int_bits(int) == 64 {
+        return x
+    }
+    if check.int_signed(int) {
+        return convert_to(fx, keel.ConvertOp.sext, keel.Type.int64, x)
+    }
+    return convert_to(fx, keel.ConvertOp.uext, keel.Type.int64, x)
+}
+
+fn slice(g: inout Gen, fx: inout Fx, value: syntax.ExprId, start: ?syntax.ExprId, end: ?syntax.ExprId, ty: check.TyId, span: syntax.Span) -> V ! OutOfMemory {
+    let base_ty: check.TyId = try expr_ty(inout g, fx, value)
+    let core: check.TyId = core_ty(g, base_ty)
+    var elem: check.TyId = check.TyId.(0)
+    match check.get(g.types, core) {
+        array(len: _, elem as t: check.TyId) {
+            elem = t
+        }
+        view(elem as t: check.TyId) {
+            elem = t
+        }
+        growable(elem as t: check.TyId) {
+            elem = t
+        }
+        _ {
+            return dummy(inout g, fx, ty)
+        }
+    }
+    let pl: PtrLen = try ptr_len(inout g, inout fx, value, core)
+    let usize_ty: check.TyId = try check.usize_ty(inout g.types)
+    var start_x: keel.Value = pl.len
+    match start {
+        some(value as s: syntax.ExprId) {
+            let v: V = try value_as(inout g, inout fx, s, usize_ty)
+            start_x = scalar_v(fx, v)
+        }
+        none {
+            start_x = iconst(fx, keel.Type.int64, 0)
+        }
+    }
+    var end_x: keel.Value = pl.len
+    match end {
+        some(value as x: syntax.ExprId) {
+            let v: V = try value_as(inout g, inout fx, x, usize_ty)
+            end_x = scalar_v(fx, v)
+        }
+        none {
+        }
+    }
+    let ordered: keel.Value = compare_ints(fx, keel.IntCC.ule, start_x, end_x)
+    let inside: keel.Value = compare_ints(fx, keel.IntCC.ule, end_x, pl.len)
+    let fine: keel.Value = binop(fx, keel.BinaryOp.and, ordered, inside)
+    var pieces: [..]Piece = make(g.alloc)
+    try push(inout pieces, Piece.text.(text: "range "))
+    try push(inout pieces, Piece.unsigned.(value: start_x))
+    try push(inout pieces, Piece.text.(text: ".."))
+    try push(inout pieces, Piece.unsigned.(value: end_x))
+    try push(inout pieces, Piece.text.(text: " out of bounds for length "))
+    try push(inout pieces, Piece.unsigned.(value: pl.len))
+    try check_or_panic(inout g, inout fx, fine, pieces, span)
+    let l: TyLayout = try ty_layout(inout g, elem)
+    let size: keel.Value = usize_const(fx, l.size)
+    let off: keel.Value = binop(fx, keel.BinaryOp.imul, start_x, size)
+    let p: keel.Value = keel.ptradd(fx.m, fx.block, pl.ptr, off)
+    let n: keel.Value = binop(fx, keel.BinaryOp.isub, end_x, start_x)
+    return make_view(inout g, fx, ty, p, n)
+}
+
+fn is_float_type(t: keel.Type) -> bool {
+    return match t {
+        float32, float64 { true }
+        _ { false }
+    }
+}
+
+fn unary(g: inout Gen, fx: inout Fx, op: syntax.UnaryOp, operand: syntax.ExprId, ty: check.TyId, span: syntax.Span) -> V ! OutOfMemory {
+    match op {
+        neg {
+            match expr_at(fx, operand).kind {
+                int {
+                    var n: check.Wide = check.wide(0)
+                    match try const_int(inout g, fx.file, operand, 0) {
+                        some(value as v: check.Wide) {
+                            n = v
+                        }
+                        none {
+                        }
+                    }
+                    let t: keel.Type = try scalar_of(inout g, ty)
+                    return ok.(value: V.scalar.(value: iconst(fx, t, low_i64(check.wide_neg(n)))))
+                }
+                _ {
+                }
+            }
+            let v: V = try value_as(inout g, inout fx, operand, ty)
+            let x: keel.Value = scalar_v(fx, v)
+            let t: keel.Type = try scalar_of(inout g, ty)
+            if is_float_type(t) {
+                return ok.(value: V.scalar.(value: keel.unary(fx.m, fx.block, keel.UnaryOp.fneg, x)))
+            }
+            let zero: keel.Value = iconst(fx, t, 0)
+            return ok.(value: V.scalar.(value: try arith(inout g, inout fx, syntax.BinaryOp.sub, zero, x, ty, span)))
+        }
+        not {
+            let v: V = try expr(inout g, inout fx, operand)
+            let x: keel.Value = scalar_v(fx, v)
+            let one: keel.Value = iconst(fx, keel.Type.int8, 1)
+            return ok.(value: V.scalar.(value: binop(fx, keel.BinaryOp.xor, x, one)))
+        }
+        bit_not {
+            let v: V = try value_as(inout g, inout fx, operand, ty)
+            let x: keel.Value = scalar_v(fx, v)
+            return ok.(value: V.scalar.(value: keel.unary(fx.m, fx.block, keel.UnaryOp.bnot, x)))
+        }
+        address_of {
+            return ok.(value: V.scalar.(value: try addr_of(inout g, inout fx, operand)))
+        }
+    }
+}
+
+fn is_optional(g: Gen, ty: check.TyId) -> bool {
+    return match check.get(g.types, ty) {
+        optional(elem: _) { true }
+        _ { false }
+    }
+}
+
+fn try_value(g: inout Gen, fx: inout Fx, operand: syntax.ExprId, _: check.TyId) -> V ! OutOfMemory {
+    let oty: check.TyId = try expr_ty(inout g, fx, operand)
+    let v: V = try expr(inout g, inout fx, operand)
+    var shape: EnumShape = EnumShape.(variants: make(g.alloc), kind: EnumKind.nullable_pointer)
+    match try shape_of(inout g, oty) {
+        some(value as s: EnumShape) {
+            shape = s
+        }
+        none {
+            panic("internal error: try on something that is not an optional or result")
+        }
+    }
+    let fail: keel.Block = try new_block(inout fx)
+    let pass: keel.Block = try new_block(inout fx)
+    let success: []u8 = if is_optional(g, oty) { "some" } else { "ok" }
+    let cond: keel.Value = try variant_test(inout g, fx, v, oty, success)
+    try brif(inout fx, cond, pass, fail)
+    // The failure: return `none`, or the same error.
+    switch_to(inout fx, fail, true)
+    var result: check.TyId = check.TyId.(0)
+    match fx.result {
+        some(value as r: check.TyId) {
+            result = r
+        }
+        none {
+            panic("internal error: try in a function without a result")
+        }
+    }
+    var out: V = V.unit
+    if is_optional(g, oty) {
+        out = try enum_value(inout g, inout fx, result, "none", none)
+    } else {
+        let theirs: VariantOf = try variant_of(inout g, oty, "err")
+        let own: VariantOf = try variant_of(inout g, result, "err")
+        let addr: keel.Value = try temp(inout g, fx, result)
+        match theirs.kind {
+            tagged(tag: _, payload_offset: u64) {
+                match own.kind {
+                    tagged(tag as own_tag: keel.Type, payload_offset as own_offset: u64) {
+                        let base: keel.Value = try spill(inout g, fx, v, oty)
+                        let src: keel.Value = offset_by(fx, base, payload_offset)
+                        let t: keel.Value = iconst(fx, own_tag, own.variant.tag)
+                        store_scalar(fx, t, addr)
+                        let dst: keel.Value = offset_by(fx, addr, own_offset)
+                        match theirs.variant.payload {
+                            some(value as payload: check.TyId) {
+                                let l: TyLayout = try ty_layout(inout g, payload)
+                                copy_bytes(fx, dst, src, l.size, false)
+                            }
+                            none {
+                            }
+                        }
+                    }
+                    _ {
+                    }
+                }
+            }
+            _ {
+            }
+        }
+        out = V.memory.(addr: addr)
+    }
+    match fx.sret {
+        some(value as dst: keel.Value) {
+            try store_v(inout g, fx, out, result, dst, false)
+            try run_defers(inout g, inout fx, 0)
+            let none_values: [..]keel.Value = make(g.alloc)
+            try ret_here(inout fx, none_values)
+        }
+        none {
+            let x: keel.Value = scalar_v(fx, out)
+            try run_defers(inout g, inout fx, 0)
+            let values: [1]keel.Value = [x]
+            try ret_here(inout fx, values)
+        }
+    }
+    switch_to(inout fx, pass, true)
+    var payload: ?check.TyId = none
+    for let variant: VariantShape in shape.variants {
+        if same_text(variant.name, success) {
+            payload = variant.payload
+        }
+    }
+    match shape.kind {
+        nullable_pointer {
+            return ok.(value: V.scalar.(value: scalar_v(fx, v)))
+        }
+        tagged(tag: _, payload_offset: u64) {
+            match payload {
+                some(value as p: check.TyId) {
+                    let addr: keel.Value = try spill(inout g, fx, v, oty)
+                    let at: keel.Value = offset_by(fx, addr, payload_offset)
+                    let f: FieldInfo = try field_of(inout g, p, "value")
+                    let field_at: keel.Value = offset_by(fx, at, f.offset)
+                    return load_v(inout g, fx, field_at, f.ty)
+                }
+                none {
+                    return ok.(value: V.unit)
+                }
+            }
+        }
+        scalar_tag(tag: _) {
+            return ok.(value: V.unit)
+        }
+    }
+}
+
+fn binary(g: inout Gen, fx: inout Fx, op: syntax.BinaryOp, left: syntax.ExprId, right: syntax.ExprId, ty: check.TyId, span: syntax.Span) -> V ! OutOfMemory {
+    match op {
+        and, or {
+            let out: keel.Value = try temp(inout g, fx, ty)
+            let lv: V = try expr(inout g, inout fx, left)
+            let l: keel.Value = scalar_v(fx, lv)
+            store_scalar(fx, l, out)
+            let rhs: keel.Block = try new_block(inout fx)
+            let after: keel.Block = try new_block(inout fx)
+            match op {
+                and {
+                    try brif(inout fx, l, rhs, after)
+                }
+                _ {
+                    try brif(inout fx, l, after, rhs)
+                }
+            }
+            fx.joined[usize.(after.index)] = true
+            switch_to(inout fx, rhs, true)
+            let rv: V = try expr(inout g, inout fx, right)
+            let r: keel.Value = scalar_v(fx, rv)
+            if fx.reachable {
+                store_scalar(fx, r, out)
+            }
+            try jump_join(inout fx, after)
+            try continue_at(inout fx, after)
+            return ok.(value: V.scalar.(value: load_scalar(fx, keel.Type.int8, out)))
+        }
+        _ {
+        }
+    }
+    // The operand type: the other side's, for a literal.
+    let lty: check.TyId = try expr_ty(inout g, fx, left)
+    let rty: check.TyId = try expr_ty(inout g, fx, right)
+    var operand_ty: check.TyId = lty
+    if check.is_never(g.types, lty) || check.is_error(g.types, lty) {
+        operand_ty = rty
+    }
+    let lv: V = try value_as(inout g, inout fx, left, operand_ty)
+    let l: keel.Value = scalar_v(fx, lv)
+    var r: keel.Value = l
+    match op {
+        shl, shr {
+            let rv: V = try expr(inout g, inout fx, right)
+            r = scalar_v(fx, rv)
+        }
+        _ {
+            let rv: V = try value_as(inout g, inout fx, right, operand_ty)
+            r = scalar_v(fx, rv)
+        }
+    }
+    match op {
+        eq, ne, lt, le, gt, ge {
+            return ok.(value: V.scalar.(value: try compare(inout g, fx, op, l, r, operand_ty)))
+        }
+        _ {
+            return ok.(value: V.scalar.(value: try arith(inout g, inout fx, op, l, r, ty, span)))
+        }
+    }
+}
+
+fn compare(g: inout Gen, fx: Fx, op: syntax.BinaryOp, l: keel.Value, r: keel.Value, ty: check.TyId) -> keel.Value ! OutOfMemory {
+    let t: keel.Type = try scalar_of(inout g, ty)
+    if is_float_type(t) {
+        let cc: keel.FloatCC = match op {
+            eq { keel.FloatCC.eq }
+            ne { keel.FloatCC.ne }
+            lt { keel.FloatCC.lt }
+            le { keel.FloatCC.le }
+            gt { keel.FloatCC.gt }
+            _ { keel.FloatCC.ge }
+        }
+        return ok.(value: keel.fcmp(fx.m, fx.block, cc, l, r))
+    }
+    let signed: bool = is_signed(g, ty)
+    let cc: keel.IntCC = match op {
+        eq { keel.IntCC.eq }
+        ne { keel.IntCC.ne }
+        lt {
+            if signed { keel.IntCC.slt } else { keel.IntCC.ult }
+        }
+        le {
+            if signed { keel.IntCC.sle } else { keel.IntCC.ule }
+        }
+        gt {
+            if signed { keel.IntCC.sgt } else { keel.IntCC.ugt }
+        }
+        _ {
+            if signed { keel.IntCC.sge } else { keel.IntCC.uge }
+        }
+    }
+    return ok.(value: compare_ints(fx, cc, l, r))
+}
+
+// A check that panics with message unless fine, with one text piece.
+fn check_text(g: inout Gen, fx: inout Fx, fine: keel.Value, message: []u8, span: syntax.Span) -> ! OutOfMemory {
+    var pieces: [..]Piece = make(g.alloc)
+    try push(inout pieces, Piece.text.(text: message))
+    return check_or_panic(inout g, inout fx, fine, pieces, span)
+}
+
+// An arithmetic or bitwise operation, with the checks that make
+// overflow, division by zero and long shifts panic.
+fn arith(g: inout Gen, fx: inout Fx, op: syntax.BinaryOp, l: keel.Value, r: keel.Value, ty: check.TyId, span: syntax.Span) -> keel.Value ! OutOfMemory {
+    let t: keel.Type = try scalar_of(inout g, ty)
+    if is_float_type(t) {
+        let fop: keel.BinaryOp = match op {
+            add { keel.BinaryOp.fadd }
+            sub { keel.BinaryOp.fsub }
+            mul { keel.BinaryOp.fmul }
+            _ { keel.BinaryOp.fdiv }
+        }
+        return ok.(value: binop(fx, fop, l, r))
+    }
+    let int: check.IntTy = match int_of(g, ty) {
+        some(value as i: check.IntTy) { i }
+        none { check.IntTy.u64 }
+    }
+    let signed: bool = check.int_signed(int)
+    let text: []u8 = syntax.op_text(op)
+    match op {
+        add, sub, mul {
+            let oop: keel.OverflowOp = match op {
+                add {
+                    if signed { keel.OverflowOp.sadd } else { keel.OverflowOp.uadd }
+                }
+                sub {
+                    if signed { keel.OverflowOp.ssub } else { keel.OverflowOp.usub }
+                }
+                _ {
+                    if signed { keel.OverflowOp.smul } else { keel.OverflowOp.umul }
+                }
+            }
+            let o: keel.Overflow = keel.overflow(fx.m, fx.block, oop, l, r)
+            let one: keel.Value = iconst(fx, keel.Type.int8, 1)
+            let fine: keel.Value = binop(fx, keel.BinaryOp.xor, o.overflow, one)
+            let message: []u8 = try program.format_text(g.alloc, "`{text}` overflowed")
+            try check_text(inout g, inout fx, fine, message, span)
+            return ok.(value: o.result)
+        }
+        div, rem {
+            let zero: keel.Value = iconst(fx, t, 0)
+            let nonzero: keel.Value = compare_ints(fx, keel.IntCC.ne, r, zero)
+            try check_text(inout g, inout fx, nonzero, "division by zero", span)
+            if signed {
+                let min: keel.Value = iconst(fx, t, low_i64(check.int_min(int)))
+                let minus_one: keel.Value = iconst(fx, t, -1)
+                let is_min: keel.Value = compare_ints(fx, keel.IntCC.eq, l, min)
+                let is_m1: keel.Value = compare_ints(fx, keel.IntCC.eq, r, minus_one)
+                let both_v: keel.Value = binop(fx, keel.BinaryOp.and, is_min, is_m1)
+                let one: keel.Value = iconst(fx, keel.Type.int8, 1)
+                let fine: keel.Value = binop(fx, keel.BinaryOp.xor, both_v, one)
+                let message: []u8 = try program.format_text(g.alloc, "`{text}` overflowed")
+                try check_text(inout g, inout fx, fine, message, span)
+            }
+            let dop: keel.BinaryOp = match op {
+                div {
+                    if signed { keel.BinaryOp.sdiv } else { keel.BinaryOp.udiv }
+                }
+                _ {
+                    if signed { keel.BinaryOp.srem } else { keel.BinaryOp.urem }
+                }
+            }
+            return ok.(value: binop(fx, dop, l, r))
+        }
+        shl, shr {
+            let rt: keel.Type = keel.value_type(fx.m, r)
+            let bits: u32 = check.int_bits(int)
+            let limit: keel.Value = iconst(fx, rt, i64.(bits))
+            let fine: keel.Value = compare_ints(fx, keel.IntCC.ult, r, limit)
+            let message: []u8 = try program.format_text(g.alloc, "shift by at least {bits} bits")
+            try check_text(inout g, inout fx, fine, message, span)
+            let sop: keel.BinaryOp = match op {
+                shl { keel.BinaryOp.shl }
+                _ {
+                    if signed { keel.BinaryOp.sshr } else { keel.BinaryOp.ushr }
+                }
+            }
+            return ok.(value: binop(fx, sop, l, r))
+        }
+        bit_and {
+            return ok.(value: binop(fx, keel.BinaryOp.and, l, r))
+        }
+        bit_or {
+            return ok.(value: binop(fx, keel.BinaryOp.or, l, r))
+        }
+        _ {
+            return ok.(value: binop(fx, keel.BinaryOp.xor, l, r))
+        }
+    }
+}
+
+// Strings and formats.
+
+fn is_format(g: Gen, ty: check.TyId) -> bool {
+    return match check.get(g.types, ty) {
+        named(id: check.NamedId) {
+            match id {
+                builtin(which: check.BuiltinNamed) {
+                    match which {
+                        format { true }
+                        _ { false }
+                    }
+                }
+                _ { false }
+            }
+        }
+        _ { false }
+    }
+}
+
+fn string_lit(g: inout Gen, fx: inout Fx, parts: syntax.List, ty: check.TyId) -> V ! OutOfMemory {
+    if !is_format(g, ty) {
+        let bytes: [..]u8 = try string_bytes(g, fx.file, parts)
+        return string_view(inout g, fx, bytes, ty)
+    }
+    var pieces: [..]FormatPiece = make(g.alloc)
+    let ast: syntax.Ast = fx.ast
+    for let i: u32 in syntax.items(ast.extra, parts) {
+        match ast.str_parts[usize.(i)] {
+            text(span: syntax.Span) {
+                var bytes: [..]u8 = make(g.alloc)
+                try unescape(span_text(fx, span), inout bytes)
+                if bytes.len > 0 {
+                    try push(inout pieces, FormatPiece.text.(bytes: bytes))
+                }
+            }
+            interpolation(value as e: syntax.ExprId) {
+                let ety: check.TyId = try expr_ty(inout g, fx, e)
+                let v: V = try expr(inout g, inout fx, e)
+                try push(inout pieces, FormatPiece.value.(v: v, ty: ety))
+            }
+        }
+    }
+    return format(inout g, inout fx, pieces, ty)
+}
+
+fn string_view(g: inout Gen, fx: Fx, bytes: []u8, ty: check.TyId) -> V ! OutOfMemory {
+    let s: keel.Symbol = try string_symbol(inout g, bytes)
+    let p: keel.Value = data_addr(fx, s)
+    let len: keel.Value = usize_const(fx, u64.(bytes.len))
+    return make_view(inout g, fx, ty, p, len)
+}
+
+// Builds a `Format`: an array of `fmt.Part` on the stack, and the view of
+// it.
+fn format(g: inout Gen, fx: inout Fx, pieces: []FormatPiece, format_ty: check.TyId) -> V ! OutOfMemory {
+    var part_ty: check.TyId = check.TyId.(0)
+    match try fmt_part(inout g) {
+        some(value as p: check.TyId) {
+            part_ty = p
+        }
+        none {
+            return dummy(inout g, fx, format_ty)
+        }
+    }
+    let part_layout: TyLayout = try ty_layout(inout g, part_ty)
+    let part_size: u64 = part_layout.size
+    let count: u64 = u64.(pieces.len)
+    var array_len: u64 = count
+    if array_len < 1 {
+        array_len = 1
+    }
+    let array_ty: check.TyId = try check.intern(inout g.types, check.Ty.array.(len: array_len, elem: part_ty))
+    let parts: keel.Value = try temp(inout g, fx, array_ty)
+    let bytes_ty: check.TyId = try check.bytes_ty(inout g.types)
+    var shape: EnumShape = EnumShape.(variants: make(g.alloc), kind: EnumKind.nullable_pointer)
+    match try shape_of(inout g, part_ty) {
+        some(value as s: EnumShape) {
+            shape = s
+        }
+        none {
+            return dummy(inout g, fx, format_ty)
+        }
+    }
+    var tag: keel.Type = keel.Type.int8
+    var payload_offset: u64 = 0
+    match shape.kind {
+        tagged(tag as t: keel.Type, payload_offset as off: u64) {
+            tag = t
+            payload_offset = off
+        }
+        _ {
+            return dummy(inout g, fx, format_ty)
+        }
+    }
+    for let i: usize in 0..pieces.len {
+        let at: keel.Value = offset_by(fx, parts, part_size * u64.(i))
+        let payload: keel.Value = offset_by(fx, at, payload_offset)
+        var name: []u8 = ""
+        var value: V = V.unit
+        var vty: check.TyId = bytes_ty
+        match pieces[i] {
+            text(bytes: []u8) {
+                value = try string_view(inout g, fx, bytes, bytes_ty)
+                name = "text"
+            }
+            value(v: V, ty as ety: check.TyId) {
+                let core: check.TyId = core_ty(g, ety)
+                match check.get(g.types, core) {
+                    int(int: check.IntTy) {
+                        let x: keel.Value = scalar_v(fx, v)
+                        value = V.scalar.(value: widen(fx, x, int))
+                        if check.int_signed(int) {
+                            name = "signed"
+                            vty = try check.int_ty(inout g.types, check.IntTy.i64)
+                        } else {
+                            name = "unsigned"
+                            vty = try check.int_ty(inout g.types, check.IntTy.u64)
+                        }
+                    }
+                    boolean {
+                        name = "boolean"
+                        value = v
+                        vty = ety
+                    }
+                    view(elem: _) {
+                        name = "text"
+                        value = v
+                    }
+                    _ {
+                        if is_format(g, core) {
+                            // nested(parts): the inner format's parts.
+                            let addr: keel.Value = try spill(inout g, fx, v, ety)
+                            name = "nested"
+                            value = V.memory.(addr: addr)
+                            vty = try check.intern(inout g.types, check.Ty.view.(elem: part_ty))
+                        } else {
+                            // An fmt.Part value: copied whole.
+                            let src: keel.Value = try spill(inout g, fx, v, ety)
+                            copy_bytes(fx, at, src, part_size, false)
+                            continue
+                        }
+                    }
+                }
+            }
+        }
+        let variant: VariantShape = shape.variants[variant_index(shape, name)]
+        let t: keel.Value = iconst(fx, tag, variant.tag)
+        store_scalar(fx, t, at)
+        match variant.payload {
+            some(value as p: check.TyId) {
+                // Every payload's first field holds the value.
+                match try fields_of(inout g, p) {
+                    some(value as fields: []FieldInfo) {
+                        if fields.len > 0 {
+                            let dst: keel.Value = offset_by(fx, payload, fields[0].offset)
+                            try store_v(inout g, fx, value, vty, dst, false)
+                        }
+                    }
+                    none {
+                    }
+                }
+            }
+            none {
+            }
+        }
+    }
+    let out: keel.Value = try temp(inout g, fx, format_ty)
+    store_scalar(fx, parts, out)
+    let len_addr: keel.Value = offset_by(fx, out, 8)
+    let n: keel.Value = usize_const(fx, count)
+    store_scalar(fx, n, len_addr)
+    return ok.(value: V.memory.(addr: out))
+}

@@ -9,6 +9,9 @@ pub extern fn free(p: ?*u8)
 pub extern fn memcpy(to: *u8, from: *u8, n: c.size_t) -> *u8
 
 pub extern fn open(path: *u8, flags: c.int, ...) -> c.int
+// Creates or empties a file for writing. mode_t is narrower than c.uint
+// on macOS, which reads only its low bits.
+pub extern fn creat(path: *u8, mode: c.uint) -> c.int
 pub extern fn close(fd: c.int) -> c.int
 pub extern fn read(fd: c.int, buf: *u8, n: c.size_t) -> c.ssize_t
 pub extern fn write(fd: c.int, buf: *u8, n: c.size_t) -> c.ssize_t
@@ -16,6 +19,8 @@ pub extern fn write(fd: c.int, buf: *u8, n: c.size_t) -> c.ssize_t
 pub extern fn opendir(path: *u8) -> ?*u8
 pub extern fn readdir(dir: *u8) -> ?*u8
 pub extern fn closedir(dir: *u8) -> c.int
+
+pub extern fn realpath(path: *u8, resolved: ?*u8) -> ?*u8
 
 pub extern fn getenv(name: *u8) -> ?*u8
 pub extern fn strlen(s: *u8) -> c.size_t

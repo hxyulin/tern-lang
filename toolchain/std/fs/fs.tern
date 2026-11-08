@@ -105,3 +105,41 @@ fn read_entries(alloc: Allocator, dir: *u8) -> [..]Entry ! Error {
         }
     }
 }
+
+// The absolute path of path, with every symbolic link, `.` and `..`
+// resolved, or none if nothing is there.
+pub fn real_path(alloc: Allocator, path: []u8) -> ?[..]u8 ! Error {
+    var buf: [max_path]u8 = fill[max_path](0)
+    if path.len >= buf.len {
+        return err.(error: Error.path_too_long)
+    }
+    for let i: usize in 0..path.len {
+        buf[i] = path[i]
+    }
+    // SAFETY: buf holds the path and then a 0 byte. With no buffer,
+    // realpath returns one from malloc.
+    let resolved: ?*u8 = unsafe { libc.realpath(&buf[0], none) }
+    match resolved {
+        none {
+            return ok.(value: none)
+        }
+        some(value as p: *u8) {
+            defer free_c(p)
+            var out: [..]u8 = make(alloc)
+            // SAFETY: realpath returns a NUL-terminated string.
+            match append(inout out, unsafe { libc.text(p) }) {
+                ok {
+                    return ok.(value: some.(value: out))
+                }
+                err(error: _) {
+                    return err.(error: Error.out_of_memory)
+                }
+            }
+        }
+    }
+}
+
+fn free_c(p: *u8) {
+    // SAFETY: p came from malloc and is freed once.
+    unsafe { libc.free(some.(value: p)) }
+}

@@ -1,0 +1,1302 @@
+// Lowering one function body: blocks, storage, statements, loops and
+// matching. Ported from stage 1's codegen/func.rs; expressions are in
+// expr.tern, and calls and built-in functions in call.tern.
+//
+// Each expression lowers to a V: a keel value for a scalar, or the
+// address of its bytes. An address may point into a variable, so code
+// that keeps a value (a binding, an assignment, a field of a new record)
+// copies the bytes.
+
+import check
+import keel
+import maps
+import program
+import resolve
+import syntax
+
+type V enum {
+    scalar(value: keel.Value)
+    // The address of the bytes.
+    memory(addr: keel.Value)
+    unit
+}
+
+type Addr enum {
+    slot(slot: keel.Slot)
+    pointer(value: keel.Value)
+}
+
+type Loop (brk: keel.Block, cont: keel.Block, scopes: usize)
+
+// The function being lowered.
+type Fx (
+    m: keel.Module,
+    f: keel.Function,
+    file: u32,
+    ast: syntax.Ast,
+    src: []u8,
+    file_names: resolve.FileNames,
+    file_types: check.FileTypes,
+    fn_name: []u8,
+    block: keel.Block,
+    // Whether code emitted now can run.
+    reachable: bool,
+    // Every block, by number, and whether it has its terminator.
+    blocks: [..]keel.Block,
+    terminated: [..]bool,
+    // Join blocks some reachable code jumps to, by number.
+    joined: [..]bool,
+    // Each local's storage: a number in addrs, by local.
+    locals: maps.IntMap,
+    addrs: [..]Addr,
+    result: ?check.TyId,
+    sret: ?keel.Value,
+    defers: [..][..]syntax.ExprId,
+    loops: [..]Loop,
+    // The block where the next `match` arm's test starts.
+    pending_next: ?keel.Block,
+)
+
+// The function's state, at its entry block.
+fn new_fx(g: Gen, file: u32, f: keel.Function, fn_name: []u8, result: ?check.TyId) -> Fx ! OutOfMemory {
+    let pf: program.File = g.program.files[usize.(file)]
+    let entry: keel.Block = keel.create_block(g.m, f)
+    var fx: Fx = Fx.(
+        m: g.m,
+        f: f,
+        file: file,
+        ast: pf.ast,
+        src: pf.text,
+        file_names: g.names.files[usize.(file)],
+        file_types: g.files[usize.(file)],
+        fn_name: fn_name,
+        block: entry,
+        reachable: true,
+        blocks: make(g.alloc),
+        terminated: make(g.alloc),
+        joined: make(g.alloc),
+        locals: maps.new_ints(g.alloc),
+        addrs: make(g.alloc),
+        result: result,
+        sret: none,
+        defers: make(g.alloc),
+        loops: make(g.alloc),
+        pending_next: none,
+    )
+    try push(inout fx.blocks, entry)
+    try push(inout fx.terminated, false)
+    try push(inout fx.joined, false)
+    return ok.(value: fx)
+}
+
+fn gen_function(g: inout Gen, decl: maps.DeclRef) -> ! OutOfMemory {
+    match decl_of(g, decl).kind {
+        function(is_unsafe: _, name: syntax.Span, params: syntax.List, result: _, body: syntax.Block) {
+            return function_body(inout g, decl, name, params, body)
+        }
+        _ {
+            return ok
+        }
+    }
+}
+
+fn function_body(g: inout Gen, decl: maps.DeclRef, name: syntax.Span, params: syntax.List, body: syntax.Block) -> ! OutOfMemory {
+    let abi: FnAbi = try decl_abi(inout g, decl)
+    let sym_name: []u8 = try symbol(inout g, decl)
+    let f: keel.Function = try define(inout g, sym_name, abi.sig)
+    // The module is the whole program, so everything not exported is
+    // local to it, which lets keel inline it.
+    if !has_attribute(g, decl, "export") {
+        keel.set_local(g.m, f)
+    }
+    var fx: Fx = try new_fx(g, decl.file, f, file_text(g, decl.file, name), abi.result)
+    let entry: keel.Block = fx.block
+    var values: [..]keel.Value = make(g.alloc)
+    for let p: keel.AbiValue in abi.params {
+        try push(inout values, keel.block_param(fx.m, entry, p.ty))
+    }
+    if abi.sret {
+        fx.sret = some.(value: values[0])
+    }
+    var next: usize = if abi.sret { 1 } else { 0 }
+    let ast: syntax.Ast = fx.ast
+    let param_ids: []u32 = syntax.items(ast.extra, params)
+    for let i: usize in 0..param_ids.len {
+        let param: syntax.Param = ast.params[usize.(param_ids[i])]
+        let pass: Pass = abi.passes[i]
+        var value: ?keel.Value = none
+        match pass {
+            skip {
+            }
+            _ {
+                next += 1
+                value = some.(value: values[next - 1])
+            }
+        }
+        var name_span: syntax.Span = syntax.Span.(start: 0, end: 0)
+        match param.name {
+            some(value as n: syntax.Span) {
+                name_span = n
+            }
+            none {
+                continue
+            }
+        }
+        var id: u32 = 0
+        match binding_of(fx, name_span) {
+            some(value as local: u32) {
+                id = local
+            }
+            none {
+                continue
+            }
+        }
+        match value {
+            some(value as v: keel.Value) {
+                match pass {
+                    scalar_arg {
+                        let ty: check.TyId = local_ty(fx, id)
+                        let s: keel.Slot = try new_slot(inout g, fx, ty)
+                        let addr: keel.Value = keel.stack_addr(fx.m, fx.block, s)
+                        keel.store(fx.m, fx.block, v, addr)
+                        try set_local(inout fx, id, Addr.slot.(slot: s))
+                    }
+                    skip {
+                    }
+                    _ {
+                        try set_local(inout fx, id, Addr.pointer.(value: v))
+                    }
+                }
+            }
+            none {
+            }
+        }
+    }
+    try block_stmts(inout g, inout fx, body)
+    if fx.reachable {
+        match abi.result {
+            none {
+                try ret_here(inout fx, values[..0])
+            }
+            some(value: _) {
+                try trap_here(inout fx)
+            }
+        }
+    }
+    finish(fx)
+    return ok
+}
+
+// Blocks and instructions.
+
+fn new_block(fx: inout Fx) -> keel.Block ! OutOfMemory {
+    let b: keel.Block = keel.create_block(fx.m, fx.f)
+    try push(inout fx.blocks, b)
+    try push(inout fx.terminated, false)
+    try push(inout fx.joined, false)
+    return ok.(value: b)
+}
+
+fn switch_to(fx: inout Fx, b: keel.Block, reachable: bool) {
+    fx.block = b
+    fx.reachable = reachable
+}
+
+// After a terminator: code after it goes to a fresh, unreachable block.
+fn end_block(fx: inout Fx) -> ! OutOfMemory {
+    fx.terminated[usize.(fx.block.index)] = true
+    let dead: keel.Block = try new_block(inout fx)
+    switch_to(inout fx, dead, false)
+    return ok
+}
+
+fn jump(fx: inout Fx, to: keel.Block) -> ! OutOfMemory {
+    keel.jump(fx.m, fx.block, to)
+    return end_block(inout fx)
+}
+
+fn brif(fx: inout Fx, cond: keel.Value, then_block: keel.Block, else_block: keel.Block) -> ! OutOfMemory {
+    keel.brif(fx.m, fx.block, cond, then_block, else_block)
+    return end_block(inout fx)
+}
+
+fn trap_here(fx: inout Fx) -> ! OutOfMemory {
+    keel.trap(fx.m, fx.block)
+    return end_block(inout fx)
+}
+
+fn ret_here(fx: inout Fx, values: []keel.Value) -> ! OutOfMemory {
+    keel.ret(fx.m, fx.block, values)
+    return end_block(inout fx)
+}
+
+// Every block that has no terminator is unreachable: give it a trap.
+fn finish(fx: Fx) {
+    for let i: usize in 0..fx.blocks.len {
+        if !fx.terminated[i] {
+            keel.trap(fx.m, fx.blocks[i])
+        }
+    }
+}
+
+fn iconst(fx: Fx, ty: keel.Type, n: i64) -> keel.Value {
+    return keel.iconst(fx.m, fx.block, ty, n)
+}
+
+fn usize_const(fx: Fx, n: u64) -> keel.Value {
+    var v: i64 = 9223372036854775807
+    if n <= 9223372036854775807 {
+        v = i64.(n)
+    }
+    return iconst(fx, keel.Type.int64, v)
+}
+
+fn offset_by(fx: Fx, addr: keel.Value, by: u64) -> keel.Value {
+    if by == 0 {
+        return addr
+    }
+    let n: keel.Value = usize_const(fx, by)
+    return keel.ptradd(fx.m, fx.block, addr, n)
+}
+
+fn null_ptr(fx: Fx) -> keel.Value {
+    let zero: keel.Value = iconst(fx, keel.Type.int64, 0)
+    return keel.convert(fx.m, fx.block, keel.ConvertOp.int_to_ptr, keel.Type.ptr, zero)
+}
+
+fn binop(fx: Fx, op: keel.BinaryOp, a: keel.Value, b: keel.Value) -> keel.Value {
+    return keel.binary(fx.m, fx.block, op, a, b)
+}
+
+fn compare_ints(fx: Fx, cc: keel.IntCC, a: keel.Value, b: keel.Value) -> keel.Value {
+    return keel.icmp(fx.m, fx.block, cc, a, b)
+}
+
+fn load_scalar(fx: Fx, ty: keel.Type, addr: keel.Value) -> keel.Value {
+    return keel.load(fx.m, fx.block, ty, addr)
+}
+
+fn store_scalar(fx: Fx, v: keel.Value, addr: keel.Value) {
+    keel.store(fx.m, fx.block, v, addr)
+}
+
+fn convert_to(fx: Fx, op: keel.ConvertOp, ty: keel.Type, v: keel.Value) -> keel.Value {
+    return keel.convert(fx.m, fx.block, op, ty, v)
+}
+
+fn new_slot(g: inout Gen, fx: Fx, ty: check.TyId) -> keel.Slot ! OutOfMemory {
+    let l: TyLayout = try ty_layout(inout g, ty)
+    var size: u64 = l.size
+    if size < 1 {
+        size = 1
+    }
+    var align: u64 = l.align
+    if align < 1 {
+        align = 1
+    }
+    if align > 16 {
+        align = 16
+    }
+    return ok.(value: keel.stack_slot(fx.m, fx.f, u32.(size), u32.(align)))
+}
+
+fn temp(g: inout Gen, fx: Fx, ty: check.TyId) -> keel.Value ! OutOfMemory {
+    let s: keel.Slot = try new_slot(inout g, fx, ty)
+    return ok.(value: keel.stack_addr(fx.m, fx.block, s))
+}
+
+fn copy_bytes(fx: Fx, dst: keel.Value, src: keel.Value, size: u64, overlap: bool) {
+    if size == 0 {
+        return
+    }
+    let n: keel.Value = usize_const(fx, size)
+    let args: [3]keel.Value = [dst, src, n]
+    if overlap {
+        keel.intrinsic(fx.m, fx.block, "memmove", args)
+    } else {
+        keel.intrinsic(fx.m, fx.block, "memcpy", args)
+    }
+}
+
+// Calls a C library function by name.
+fn libc_call(g: inout Gen, fx: Fx, name: []u8, params: []keel.Type, returns: []keel.Type, args: []keel.Value) -> ?keel.Value ! OutOfMemory {
+    let sig: keel.Signature = try plain_signature(g, params, returns)
+    let s: keel.Symbol = try function_symbol(inout g, name, sig)
+    if returns.len > 0 {
+        return ok.(value: some.(value: keel.call_value(fx.m, fx.block, s, args)))
+    }
+    keel.call(fx.m, fx.block, s, args)
+    return ok.(value: none)
+}
+
+// The address of a data object.
+fn data_addr(fx: Fx, s: keel.Symbol) -> keel.Value {
+    return keel.symbol_addr(fx.m, fx.block, s)
+}
+
+// Names and types.
+
+fn span_text(fx: Fx, s: syntax.Span) -> []u8 {
+    return fx.src[usize.(s.start)..usize.(s.end)]
+}
+
+fn binding_of(fx: Fx, s: syntax.Span) -> ?u32 {
+    return maps.get_int(fx.file_names.bindings, s.start)
+}
+
+fn res_of(fx: Fx, e: syntax.ExprId) -> ?resolve.Res {
+    return fx.file_names.exprs[usize.(e)]
+}
+
+fn item_of(fx: Fx, e: syntax.ExprId) -> check.Item {
+    return match fx.file_types.exprs[usize.(e)] {
+        some(value as i: check.Item) { i }
+        none { check.Item.nothing }
+    }
+}
+
+// The type of a value expression.
+fn expr_ty(g: inout Gen, fx: Fx, e: syntax.ExprId) -> check.TyId ! OutOfMemory {
+    return match item_of(fx, e) {
+        value(ty: check.TyId) { ok.(value: ty) }
+        variant(ty: check.TyId, index: _) { ok.(value: ty) }
+        _ { check.error_ty(inout g.types) }
+    }
+}
+
+fn written_ty(fx: Fx, id: syntax.TypeId) -> check.TyId {
+    match fx.file_types.types[usize.(id)] {
+        some(value as ty: check.TyId) {
+            return ty
+        }
+        none {
+            panic("internal error: a type the checker did not lower")
+        }
+    }
+}
+
+fn local_ty(fx: Fx, id: u32) -> check.TyId {
+    match maps.get_int(fx.file_types.locals, id) {
+        some(value as ty: u32) {
+            return check.TyId.(ty)
+        }
+        none {
+            panic("internal error: a local without a type")
+        }
+    }
+}
+
+fn int_of(g: Gen, ty: check.TyId) -> ?check.IntTy {
+    return check.as_int(g.types, core_ty(g, ty))
+}
+
+fn is_signed(g: Gen, ty: check.TyId) -> bool {
+    return match int_of(g, ty) {
+        some(value as int: check.IntTy) { check.int_signed(int) }
+        none { false }
+    }
+}
+
+fn expr_at(fx: Fx, e: syntax.ExprId) -> syntax.Expr {
+    return fx.ast.exprs[usize.(e)]
+}
+
+// Storage.
+
+fn set_local(fx: inout Fx, id: u32, addr: Addr) -> ! OutOfMemory {
+    let n: u32 = u32.(fx.addrs.len)
+    try push(inout fx.addrs, addr)
+    return maps.put_int(inout fx.locals, id, n)
+}
+
+fn local_addr(fx: Fx, id: u32) -> keel.Value {
+    match maps.get_int(fx.locals, id) {
+        some(value as n: u32) {
+            return match fx.addrs[usize.(n)] {
+                slot(slot as s: keel.Slot) { keel.stack_addr(fx.m, fx.block, s) }
+                pointer(value as p: keel.Value) { p }
+            }
+        }
+        none {
+            return null_ptr(fx)
+        }
+    }
+}
+
+// A new local with its own slot.
+fn bind(g: inout Gen, fx: inout Fx, name: syntax.Span, ty: check.TyId, value: V) -> ! OutOfMemory {
+    var id: u32 = 0
+    match binding_of(fx, name) {
+        some(value as local: u32) {
+            id = local
+        }
+        none {
+            return ok
+        }
+    }
+    let s: keel.Slot = try new_slot(inout g, fx, ty)
+    let addr: keel.Value = keel.stack_addr(fx.m, fx.block, s)
+    try store_v(inout g, fx, value, ty, addr, false)
+    return set_local(inout fx, id, Addr.slot.(slot: s))
+}
+
+fn load_v(g: inout Gen, fx: Fx, addr: keel.Value, ty: check.TyId) -> V ! OutOfMemory {
+    return match try ty_repr(inout g, ty) {
+        scalar(ty as t: keel.Type) { ok.(value: V.scalar.(value: load_scalar(fx, t, addr))) }
+        memory { ok.(value: V.memory.(addr: addr)) }
+        unit { ok.(value: V.unit) }
+    }
+}
+
+fn store_v(g: inout Gen, fx: Fx, value: V, ty: check.TyId, addr: keel.Value, overlap: bool) -> ! OutOfMemory {
+    match value {
+        scalar(value as v: keel.Value) {
+            store_scalar(fx, v, addr)
+        }
+        memory(addr as src: keel.Value) {
+            let l: TyLayout = try ty_layout(inout g, ty)
+            copy_bytes(fx, addr, src, l.size, overlap)
+        }
+        unit {
+        }
+    }
+    return ok
+}
+
+fn scalar_v(fx: Fx, v: V) -> keel.Value {
+    return match v {
+        scalar(value as x: keel.Value) { x }
+        memory(addr as a: keel.Value) { a }
+        unit { iconst(fx, keel.Type.int8, 0) }
+    }
+}
+
+// A value of ty for code that cannot run.
+fn dummy(g: inout Gen, fx: Fx, ty: check.TyId) -> V ! OutOfMemory {
+    match try ty_repr(inout g, ty) {
+        scalar(ty as t: keel.Type) {
+            return match t {
+                ptr { ok.(value: V.scalar.(value: null_ptr(fx))) }
+                float32, float64 { ok.(value: V.scalar.(value: keel.fconst(fx.m, fx.block, t, 0))) }
+                _ { ok.(value: V.scalar.(value: iconst(fx, t, 0))) }
+            }
+        }
+        memory {
+            return ok.(value: V.memory.(addr: try temp(inout g, fx, ty)))
+        }
+        unit {
+            return ok.(value: V.unit)
+        }
+    }
+}
+
+// The address of a value held in memory, spilling a scalar.
+fn spill(g: inout Gen, fx: Fx, v: V, ty: check.TyId) -> keel.Value ! OutOfMemory {
+    match v {
+        memory(addr as a: keel.Value) {
+            return ok.(value: a)
+        }
+        _ {
+            let addr: keel.Value = try temp(inout g, fx, ty)
+            try store_v(inout g, fx, v, ty, addr, false)
+            return ok.(value: addr)
+        }
+    }
+}
+
+// Statements.
+
+fn block_stmts(g: inout Gen, fx: inout Fx, b: syntax.Block) -> ! OutOfMemory {
+    try push(inout fx.defers, make(g.alloc))
+    let ast: syntax.Ast = fx.ast
+    for let s: u32 in syntax.items(ast.extra, b.stmts) {
+        if !fx.reachable {
+            break
+        }
+        try stmt(inout g, inout fx, syntax.StmtId.(s))
+    }
+    var scope: [..]syntax.ExprId = make(g.alloc)
+    match pop(inout fx.defers) {
+        some(value as top: [..]syntax.ExprId) {
+            scope = top
+        }
+        none {
+        }
+    }
+    if fx.reachable {
+        var i: usize = scope.len
+        for i > 0 {
+            i -= 1
+            let _: V = try expr(inout g, inout fx, scope[i])
+        }
+    }
+    return ok
+}
+
+// Runs the `defer`s of scopes from `from` outward, for a jump out.
+fn run_defers(g: inout Gen, fx: inout Fx, from: usize) -> ! OutOfMemory {
+    var pending: [..]syntax.ExprId = make(g.alloc)
+    var s: usize = fx.defers.len
+    for s > from {
+        s -= 1
+        let scope: [..]syntax.ExprId = fx.defers[s]
+        var i: usize = scope.len
+        for i > 0 {
+            i -= 1
+            try push(inout pending, scope[i])
+        }
+    }
+    for let deferred: syntax.ExprId in pending {
+        let _: V = try expr(inout g, inout fx, deferred)
+    }
+    return ok
+}
+
+fn stmt(g: inout Gen, fx: inout Fx, id: syntax.StmtId) -> ! OutOfMemory {
+    let ast: syntax.Ast = fx.ast
+    match ast.stmts[usize.(id)].kind {
+        local(local: syntax.Local) {
+            match local.binding {
+                single(name: ?syntax.Span, ty as written: syntax.TypeId) {
+                    let ty: check.TyId = written_ty(fx, written)
+                    let value: V = try value_as(inout g, inout fx, local.value, ty)
+                    match name {
+                        some(value as n: syntax.Span) {
+                            try bind(inout g, inout fx, n, ty, value)
+                        }
+                        none {
+                        }
+                    }
+                }
+                destructure(fields: syntax.List) {
+                    let ty: check.TyId = try expr_ty(inout g, fx, local.value)
+                    let value: V = try expr(inout g, inout fx, local.value)
+                    let addr: keel.Value = try spill(inout g, fx, value, ty)
+                    try destructure(inout g, inout fx, fields, ty, addr)
+                }
+            }
+        }
+        return_stmt(value: ?syntax.ExprId) {
+            try return_value(inout g, inout fx, value)
+        }
+        if_stmt(cond: syntax.ExprId, then: syntax.Block, otherwise: ?syntax.Else) {
+            let after: keel.Block = try new_block(inout fx)
+            try if_chain(inout g, inout fx, cond, then, otherwise, after)
+            try continue_at(inout fx, after)
+        }
+        match_stmt(value: syntax.ExprId, arms: syntax.List) {
+            let after: keel.Block = try new_block(inout fx)
+            let sty: check.TyId = try expr_ty(inout g, fx, value)
+            let scrutinee: V = try expr(inout g, inout fx, value)
+            for let a: u32 in syntax.items(ast.extra, arms) {
+                let arm: syntax.Arm = ast.arms[usize.(a)]
+                let body: ?keel.Block = try arm_test(inout g, inout fx, scrutinee, sty, arm.patterns)
+                let next: keel.Block = take_pending(inout fx)
+                match body {
+                    some(value as start: keel.Block) {
+                        switch_to(inout fx, start, true)
+                        match arm.body {
+                            block(body as b: syntax.Block) {
+                                try block_stmts(inout g, inout fx, b)
+                            }
+                            branch(value as x: syntax.ExprId) {
+                                let _: V = try expr(inout g, inout fx, x)
+                            }
+                        }
+                        try jump_join(inout fx, after)
+                        switch_to(inout fx, next, true)
+                    }
+                    none {
+                    }
+                }
+            }
+            // No arm matched: the checker proved this cannot happen.
+            try trap_here(inout fx)
+            try continue_at(inout fx, after)
+        }
+        for_stmt(kind: syntax.ForKind, body: syntax.Block) {
+            try for_loop(inout g, inout fx, kind, body)
+        }
+        break_stmt {
+            match last_loop(fx) {
+                some(value as l: Loop) {
+                    try run_defers(inout g, inout fx, l.scopes)
+                    try jump_join(inout fx, l.brk)
+                }
+                none {
+                }
+            }
+        }
+        continue_stmt {
+            match last_loop(fx) {
+                some(value as l: Loop) {
+                    try run_defers(inout g, inout fx, l.scopes)
+                    try jump(inout fx, l.cont)
+                }
+                none {
+                }
+            }
+        }
+        defer_stmt(call: syntax.ExprId) {
+            let top: usize = fx.defers.len - 1
+            try push(inout fx.defers[top], call)
+        }
+        unsafe_stmt(body: syntax.Block) {
+            try block_stmts(inout g, inout fx, body)
+        }
+        lock_stmt(globals: _, body: syntax.Block) {
+            try block_stmts(inout g, inout fx, body)
+        }
+        assign(left: syntax.ExprId, op: syntax.AssignOp, right: syntax.ExprId) {
+            try assign_stmt(inout g, inout fx, left, op, right)
+        }
+        expr(value: syntax.ExprId) {
+            let _: V = try expr(inout g, inout fx, value)
+        }
+    }
+    return ok
+}
+
+fn last_loop(fx: Fx) -> ?Loop {
+    if fx.loops.len == 0 {
+        return none
+    }
+    return some.(value: fx.loops[fx.loops.len - 1])
+}
+
+fn take_pending(fx: inout Fx) -> keel.Block {
+    match fx.pending_next {
+        some(value as b: keel.Block) {
+            fx.pending_next = none
+            return b
+        }
+        none {
+            panic("internal error: an arm test without a next block")
+        }
+    }
+}
+
+// Continues at a join block, which runs if any path reaches it.
+fn continue_at(fx: inout Fx, b: keel.Block) -> ! OutOfMemory {
+    let reached: bool = fx.joined[usize.(b.index)]
+    fx.joined[usize.(b.index)] = false
+    switch_to(inout fx, b, reached)
+    return ok
+}
+
+fn if_chain(g: inout Gen, fx: inout Fx, cond: syntax.ExprId, then: syntax.Block, otherwise: ?syntax.Else, after: keel.Block) -> ! OutOfMemory {
+    let c: V = try expr(inout g, inout fx, cond)
+    let cv: keel.Value = scalar_v(fx, c)
+    let then_block: keel.Block = try new_block(inout fx)
+    let else_block: keel.Block = try new_block(inout fx)
+    try brif(inout fx, cv, then_block, else_block)
+    switch_to(inout fx, then_block, true)
+    try block_stmts(inout g, inout fx, then)
+    try jump_join(inout fx, after)
+    switch_to(inout fx, else_block, true)
+    match otherwise {
+        some(value as e: syntax.Else) {
+            match e {
+                block(body: syntax.Block) {
+                    try block_stmts(inout g, inout fx, body)
+                }
+                if_stmt(stmt as inner: syntax.StmtId) {
+                    match fx.ast.stmts[usize.(inner)].kind {
+                        if_stmt(cond as c2: syntax.ExprId, then as t2: syntax.Block, otherwise as o2: ?syntax.Else) {
+                            try if_chain(inout g, inout fx, c2, t2, o2, after)
+                        }
+                        _ {
+                        }
+                    }
+                }
+            }
+        }
+        none {
+        }
+    }
+    return jump_join(inout fx, after)
+}
+
+// Jumps to a join block if this point can run.
+fn jump_join(fx: inout Fx, to: keel.Block) -> ! OutOfMemory {
+    if fx.reachable {
+        fx.joined[usize.(to.index)] = true
+        try jump(inout fx, to)
+    }
+    return ok
+}
+
+fn return_value(g: inout Gen, fx: inout Fx, value: ?syntax.ExprId) -> ! OutOfMemory {
+    var results: [..]keel.Value = make(g.alloc)
+    match value {
+        some(value as e: syntax.ExprId) {
+            match fx.result {
+                some(value as ty: check.TyId) {
+                    let v: V = try value_as(inout g, inout fx, e, ty)
+                    if !fx.reachable {
+                        return ok
+                    }
+                    match fx.sret {
+                        some(value as out: keel.Value) {
+                            try store_v(inout g, fx, v, ty, out, true)
+                        }
+                        none {
+                            match v {
+                                scalar(value as x: keel.Value) {
+                                    try push(inout results, x)
+                                }
+                                _ {
+                                }
+                            }
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        none {
+        }
+    }
+    try run_defers(inout g, inout fx, 0)
+    if fx.reachable {
+        try ret_here(inout fx, results)
+    }
+    return ok
+}
+
+fn assign_stmt(g: inout Gen, fx: inout Fx, left: syntax.ExprId, op: syntax.AssignOp, right: syntax.ExprId) -> ! OutOfMemory {
+    let ty: check.TyId = try expr_ty(inout g, fx, left)
+    let addr: keel.Value = try addr_of(inout g, inout fx, left)
+    var bop: syntax.BinaryOp = syntax.BinaryOp.add
+    match op {
+        set {
+            let v: V = try value_as(inout g, inout fx, right, ty)
+            return store_v(inout g, fx, v, ty, addr, true)
+        }
+        add {
+            bop = syntax.BinaryOp.add
+        }
+        sub {
+            bop = syntax.BinaryOp.sub
+        }
+        mul {
+            bop = syntax.BinaryOp.mul
+        }
+        div {
+            bop = syntax.BinaryOp.div
+        }
+        rem {
+            bop = syntax.BinaryOp.rem
+        }
+        bit_and {
+            bop = syntax.BinaryOp.bit_and
+        }
+        bit_or {
+            bop = syntax.BinaryOp.bit_or
+        }
+        bit_xor {
+            bop = syntax.BinaryOp.bit_xor
+        }
+        shl {
+            bop = syntax.BinaryOp.shl
+        }
+        shr {
+            bop = syntax.BinaryOp.shr
+        }
+    }
+    let current_v: V = try load_v(inout g, fx, addr, ty)
+    let current: keel.Value = scalar_v(fx, current_v)
+    let operand_v: V = try value_as(inout g, inout fx, right, ty)
+    let operand: keel.Value = scalar_v(fx, operand_v)
+    let span: syntax.Span = expr_at(fx, left).span
+    let result: keel.Value = try arith(inout g, inout fx, bop, current, operand, ty, span)
+    store_scalar(fx, result, addr)
+    return ok
+}
+
+fn destructure(g: inout Gen, fx: inout Fx, fields: syntax.List, ty: check.TyId, addr: keel.Value) -> ! OutOfMemory {
+    let ast: syntax.Ast = fx.ast
+    for let i: u32 in syntax.items(ast.extra, fields) {
+        let d: syntax.DestructField = ast.destructs[usize.(i)]
+        match d.ty {
+            none {
+                continue
+            }
+            some(value: _) {
+            }
+        }
+        let f: FieldInfo = try field_of(inout g, ty, span_text(fx, d.field))
+        let at: keel.Value = offset_by(fx, addr, f.offset)
+        let v: V = try load_v(inout g, fx, at, f.ty)
+        let name: syntax.Span = match d.rename {
+            some(value as r: syntax.Span) { r }
+            none { d.field }
+        }
+        try bind(inout g, inout fx, name, f.ty, v)
+    }
+    return ok
+}
+
+// Loops.
+
+fn for_loop(g: inout Gen, fx: inout Fx, kind: syntax.ForKind, body: syntax.Block) -> ! OutOfMemory {
+    let header: keel.Block = try new_block(inout fx)
+    let body_block: keel.Block = try new_block(inout fx)
+    let cont: keel.Block = try new_block(inout fx)
+    let exit: keel.Block = try new_block(inout fx)
+    let blocks: LoopBlocks = LoopBlocks.(header: header, body: body_block, cont: cont, exit: exit)
+    match kind {
+        forever {
+            try jump(inout fx, header)
+            switch_to(inout fx, header, true)
+            try jump(inout fx, body_block)
+            try loop_body(inout g, inout fx, body, blocks)
+            switch_to(inout fx, cont, true)
+            try jump(inout fx, header)
+        }
+        while_loop(cond: syntax.ExprId) {
+            try jump(inout fx, header)
+            switch_to(inout fx, header, true)
+            let c: V = try expr(inout g, inout fx, cond)
+            let cv: keel.Value = scalar_v(fx, c)
+            fx.joined[usize.(exit.index)] = true
+            try brif(inout fx, cv, body_block, exit)
+            try loop_body(inout g, inout fx, body, blocks)
+            switch_to(inout fx, cont, true)
+            try jump(inout fx, header)
+        }
+        for_in(mutable: _, binding: syntax.Binding, iterable: syntax.Iterable) {
+            try for_in(inout g, inout fx, body, binding, iterable, blocks)
+        }
+    }
+    return continue_at(inout fx, exit)
+}
+
+type LoopBlocks (header: keel.Block, body: keel.Block, cont: keel.Block, exit: keel.Block)
+
+fn loop_body(g: inout Gen, fx: inout Fx, body: syntax.Block, blocks: LoopBlocks) -> ! OutOfMemory {
+    switch_to(inout fx, blocks.body, true)
+    try push(inout fx.loops, Loop.(brk: blocks.exit, cont: blocks.cont, scopes: fx.defers.len))
+    try block_stmts(inout g, inout fx, body)
+    let _: ?Loop = pop(inout fx.loops)
+    if fx.reachable {
+        try jump(inout fx, blocks.cont)
+    }
+    return ok
+}
+
+// counter += 1, at the end of a loop over a range or array.
+fn count_up(fx: inout Fx, t: keel.Type, counter: keel.Value, header: keel.Block) -> ! OutOfMemory {
+    let i: keel.Value = load_scalar(fx, t, counter)
+    let one: keel.Value = iconst(fx, t, 1)
+    let next: keel.Value = binop(fx, keel.BinaryOp.iadd, i, one)
+    store_scalar(fx, next, counter)
+    return jump(inout fx, header)
+}
+
+fn for_in(g: inout Gen, fx: inout Fx, body: syntax.Block, binding: syntax.Binding, iterable: syntax.Iterable, blocks: LoopBlocks) -> ! OutOfMemory {
+    match iterable {
+        range(start: syntax.ExprId, end: syntax.ExprId) {
+            var name: ?syntax.Span = none
+            var written: syntax.TypeId = syntax.TypeId.(0)
+            match binding {
+                single(name as n: ?syntax.Span, ty: syntax.TypeId) {
+                    name = n
+                    written = ty
+                }
+                destructure(fields: _) {
+                    return ok
+                }
+            }
+            let ty: check.TyId = written_ty(fx, written)
+            let signed: bool = is_signed(g, ty)
+            let start_v: V = try value_as(inout g, inout fx, start, ty)
+            let start_x: keel.Value = scalar_v(fx, start_v)
+            let end_v: V = try value_as(inout g, inout fx, end, ty)
+            let end_x: keel.Value = scalar_v(fx, end_v)
+            let counter: keel.Value = try temp(inout g, fx, ty)
+            store_scalar(fx, start_x, counter)
+            try jump(inout fx, blocks.header)
+            switch_to(inout fx, blocks.header, true)
+            let t: keel.Type = try scalar_of(inout g, ty)
+            let i: keel.Value = load_scalar(fx, t, counter)
+            let cc: keel.IntCC = if signed { keel.IntCC.slt } else { keel.IntCC.ult }
+            let more: keel.Value = compare_ints(fx, cc, i, end_x)
+            let bind_block: keel.Block = try new_block(inout fx)
+            fx.joined[usize.(blocks.exit.index)] = true
+            try brif(inout fx, more, bind_block, blocks.exit)
+            switch_to(inout fx, bind_block, true)
+            match name {
+                some(value as n: syntax.Span) {
+                    try bind(inout g, inout fx, n, ty, V.scalar.(value: i))
+                }
+                none {
+                }
+            }
+            try jump(inout fx, blocks.body)
+            try loop_body(inout g, inout fx, body, blocks)
+            switch_to(inout fx, blocks.cont, true)
+            let t2: keel.Type = try scalar_of(inout g, ty)
+            return count_up(inout fx, t2, counter, blocks.header)
+        }
+        value(value as e: syntax.ExprId) {
+            let ty: check.TyId = try expr_ty(inout g, fx, e)
+            let core: check.TyId = core_ty(g, ty)
+            var elem: ?check.TyId = none
+            match check.get(g.types, core) {
+                array(len: _, elem as t: check.TyId) {
+                    elem = some.(value: t)
+                }
+                view(elem as t: check.TyId) {
+                    elem = some.(value: t)
+                }
+                growable(elem as t: check.TyId) {
+                    elem = some.(value: t)
+                }
+                _ {
+                }
+            }
+            match elem {
+                some(value as el: check.TyId) {
+                    let pl: PtrLen = try ptr_len(inout g, inout fx, e, core)
+                    let usize_ty: check.TyId = try check.usize_ty(inout g.types)
+                    let counter: keel.Value = try temp(inout g, fx, usize_ty)
+                    let zero: keel.Value = iconst(fx, keel.Type.int64, 0)
+                    store_scalar(fx, zero, counter)
+                    try jump(inout fx, blocks.header)
+                    switch_to(inout fx, blocks.header, true)
+                    let i: keel.Value = load_scalar(fx, keel.Type.int64, counter)
+                    let more: keel.Value = compare_ints(fx, keel.IntCC.ult, i, pl.len)
+                    let bind_block: keel.Block = try new_block(inout fx)
+                    fx.joined[usize.(blocks.exit.index)] = true
+                    try brif(inout fx, more, bind_block, blocks.exit)
+                    switch_to(inout fx, bind_block, true)
+                    let l: TyLayout = try ty_layout(inout g, el)
+                    let size: keel.Value = usize_const(fx, l.size)
+                    let off: keel.Value = binop(fx, keel.BinaryOp.imul, i, size)
+                    let at: keel.Value = keel.ptradd(fx.m, fx.block, pl.ptr, off)
+                    let v: V = try load_v(inout g, fx, at, el)
+                    try bind_loop(inout g, inout fx, binding, el, v)
+                    try jump(inout fx, blocks.body)
+                    try loop_body(inout g, inout fx, body, blocks)
+                    switch_to(inout fx, blocks.cont, true)
+                    return count_up(inout fx, keel.Type.int64, counter, blocks.header)
+                }
+                none {
+                }
+            }
+            // An iterator: call `next(inout it)` until `none`.
+            var next: maps.DeclRef = maps.DeclRef.(file: 0, index: 0)
+            match next_fn(g, core) {
+                some(value as d: maps.DeclRef) {
+                    next = d
+                }
+                none {
+                    return ok
+                }
+            }
+            let v: V = try expr(inout g, inout fx, e)
+            let it: keel.Value = try temp(inout g, fx, ty)
+            try store_v(inout g, fx, v, ty, it, false)
+            try jump(inout fx, blocks.header)
+            switch_to(inout fx, blocks.header, true)
+            let abi: FnAbi = try decl_abi(inout g, next)
+            var option_ty: check.TyId = check.TyId.(0)
+            match abi.result {
+                some(value as r: check.TyId) {
+                    option_ty = r
+                }
+                none {
+                    panic("internal error: next returns nothing")
+                }
+            }
+            let next_name: []u8 = try symbol(inout g, next)
+            var args: [..]CallArg = make(g.alloc)
+            try push(inout args, CallArg.addr.(value: it))
+            let item: V = try direct_call(inout g, inout fx, next_name, abi, args)
+            fx.joined[usize.(blocks.exit.index)] = true
+            let found: Branch = try option_some(inout g, inout fx, item, option_ty, blocks.exit)
+            switch_to(inout fx, found.block, true)
+            var payload_ty: check.TyId = check.TyId.(0)
+            match try shape_of(inout g, option_ty) {
+                some(value as shape: EnumShape) {
+                    match shape.variants[1].payload {
+                        some(value as p: check.TyId) {
+                            payload_ty = p
+                        }
+                        none {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            let f: FieldInfo = try field_of(inout g, payload_ty, "value")
+            let elem_v: V = match found.value {
+                scalar(value as x: keel.Value) { V.scalar.(value: x) }
+                memory(addr as a: keel.Value) { try load_v(inout g, fx, a, f.ty) }
+                unit { V.unit }
+            }
+            try bind_loop(inout g, inout fx, binding, f.ty, elem_v)
+            try jump(inout fx, blocks.body)
+            try loop_body(inout g, inout fx, body, blocks)
+            switch_to(inout fx, blocks.cont, true)
+            return jump(inout fx, blocks.header)
+        }
+    }
+}
+
+fn bind_loop(g: inout Gen, fx: inout Fx, binding: syntax.Binding, elem: check.TyId, v: V) -> ! OutOfMemory {
+    match binding {
+        single(name: ?syntax.Span, ty as written: syntax.TypeId) {
+            let declared: check.TyId = written_ty(fx, written)
+            let cv: V = try coerce(inout g, inout fx, v, elem, declared)
+            match name {
+                some(value as n: syntax.Span) {
+                    try bind(inout g, inout fx, n, declared, cv)
+                }
+                none {
+                }
+            }
+        }
+        destructure(fields: syntax.List) {
+            let addr: keel.Value = try spill(inout g, fx, v, elem)
+            try destructure(inout g, inout fx, fields, elem, addr)
+        }
+    }
+    return ok
+}
+
+// Where a branch goes, and the value it carries.
+type Branch (block: keel.Block, value: V)
+
+// Branches on an optional: to the returned block when it is `some`, with
+// the address or value of its payload record, and to none_block
+// otherwise.
+fn option_some(g: inout Gen, fx: inout Fx, v: V, ty: check.TyId, none_block: keel.Block) -> Branch ! OutOfMemory {
+    var kind: EnumKind = EnumKind.nullable_pointer
+    match try shape_of(inout g, ty) {
+        some(value as shape: EnumShape) {
+            kind = shape.kind
+        }
+        none {
+        }
+    }
+    let some_block: keel.Block = try new_block(inout fx)
+    match kind {
+        nullable_pointer {
+            let p: keel.Value = scalar_v(fx, v)
+            let null: keel.Value = null_ptr(fx)
+            let is_some: keel.Value = compare_ints(fx, keel.IntCC.ne, p, null)
+            try brif(inout fx, is_some, some_block, none_block)
+            return ok.(value: Branch.(block: some_block, value: V.scalar.(value: p)))
+        }
+        tagged(tag: keel.Type, payload_offset: u64) {
+            let addr: keel.Value = try spill(inout g, fx, v, ty)
+            let t: keel.Value = load_scalar(fx, tag, addr)
+            let one: keel.Value = iconst(fx, tag, 1)
+            let is_some: keel.Value = compare_ints(fx, keel.IntCC.eq, t, one)
+            try brif(inout fx, is_some, some_block, none_block)
+            switch_to(inout fx, some_block, true)
+            let payload: keel.Value = offset_by(fx, addr, payload_offset)
+            return ok.(value: Branch.(block: some_block, value: V.memory.(addr: payload)))
+        }
+        scalar_tag(tag: _) {
+            try jump(inout fx, none_block)
+            return ok.(value: Branch.(block: some_block, value: V.unit))
+        }
+    }
+}
+
+fn next_fn(g: Gen, ty: check.TyId) -> ?maps.DeclRef {
+    match check.get(g.types, ty) {
+        named(id: check.NamedId) {
+            match id {
+                decl(decl: maps.DeclRef) {
+                    let package: u32 = g.program.files[usize.(decl.file)].package
+                    return maps.get_name(g.names.scopes[usize.(package)], "next")
+                }
+                builtin(which: _) {
+                    return none
+                }
+            }
+        }
+        _ {
+            return none
+        }
+    }
+}
+
+// Matching.
+
+// A variant pattern with fields to bind, and its variant's name.
+type PayloadBinding (fields: syntax.List, name: []u8)
+
+// Tests one arm's patterns. Returns the block the arm's body starts in,
+// with its payload bound, and leaves the block for the next arm in
+// pending_next.
+fn arm_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, pats: syntax.List) -> ?keel.Block ! OutOfMemory {
+    let body: keel.Block = try new_block(inout fx)
+    let next: keel.Block = try new_block(inout fx)
+    if !fx.reachable {
+        fx.pending_next = some.(value: next)
+        return ok.(value: none)
+    }
+    var bindings: ?PayloadBinding = none
+    let ast: syntax.Ast = fx.ast
+    let pat_ids: []u32 = syntax.items(ast.extra, pats)
+    for let i: usize in 0..pat_ids.len {
+        let last: bool = i + 1 == pat_ids.len
+        var fail: keel.Block = next
+        if !last {
+            fail = try new_block(inout fx)
+        }
+        match ast.pats[usize.(pat_ids[i])].kind {
+            discard {
+                try jump(inout fx, body)
+            }
+            variant(name: syntax.Span, payload: ?syntax.List) {
+                let name_text: []u8 = span_text(fx, name)
+                let cond: keel.Value = try variant_test(inout g, fx, scrutinee, sty, name_text)
+                try brif(inout fx, cond, body, fail)
+                match payload {
+                    some(value as fields: syntax.List) {
+                        bindings = some.(value: PayloadBinding.(fields: fields, name: name_text))
+                    }
+                    none {
+                    }
+                }
+            }
+            literal(value as e: syntax.ExprId) {
+                let cond: keel.Value = try literal_test(inout g, inout fx, scrutinee, sty, e, false)
+                try brif(inout fx, cond, body, fail)
+            }
+            negative(value as e: syntax.ExprId) {
+                let cond: keel.Value = try literal_test(inout g, inout fx, scrutinee, sty, e, true)
+                try brif(inout fx, cond, body, fail)
+            }
+        }
+        if !last {
+            switch_to(inout fx, fail, true)
+        }
+    }
+    fx.pending_next = some.(value: next)
+    switch_to(inout fx, body, true)
+    match bindings {
+        some(value as pb: PayloadBinding) {
+            let vo: VariantOf = try variant_of(inout g, sty, pb.name)
+            match vo.variant.payload {
+                some(value as payload_ty: check.TyId) {
+                    match vo.kind {
+                        nullable_pointer {
+                            let p: keel.Value = scalar_v(fx, scrutinee)
+                            let addr: keel.Value = try spill(inout g, fx, V.scalar.(value: p), payload_ty)
+                            try destructure(inout g, inout fx, pb.fields, payload_ty, addr)
+                        }
+                        tagged(tag: _, payload_offset: u64) {
+                            let base: keel.Value = try spill(inout g, fx, scrutinee, sty)
+                            let addr: keel.Value = offset_by(fx, base, payload_offset)
+                            try destructure(inout g, inout fx, pb.fields, payload_ty, addr)
+                        }
+                        scalar_tag(tag: _) {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        none {
+        }
+    }
+    let start: keel.Block = try new_block(inout fx)
+    try jump(inout fx, start)
+    return ok.(value: some.(value: start))
+}
+
+fn variant_test(g: inout Gen, fx: Fx, scrutinee: V, sty: check.TyId, name: []u8) -> keel.Value ! OutOfMemory {
+    let vo: VariantOf = try variant_of(inout g, sty, name)
+    match vo.kind {
+        scalar_tag(tag: keel.Type) {
+            let v: keel.Value = scalar_v(fx, scrutinee)
+            let t: keel.Value = iconst(fx, tag, vo.variant.tag)
+            return ok.(value: compare_ints(fx, keel.IntCC.eq, v, t))
+        }
+        nullable_pointer {
+            let p: keel.Value = scalar_v(fx, scrutinee)
+            let null: keel.Value = null_ptr(fx)
+            let cc: keel.IntCC = if vo.variant.tag == 0 { keel.IntCC.eq } else { keel.IntCC.ne }
+            return ok.(value: compare_ints(fx, cc, p, null))
+        }
+        tagged(tag: keel.Type, payload_offset: _) {
+            let addr: keel.Value = try spill(inout g, fx, scrutinee, sty)
+            let v: keel.Value = load_scalar(fx, tag, addr)
+            let t: keel.Value = iconst(fx, tag, vo.variant.tag)
+            return ok.(value: compare_ints(fx, keel.IntCC.eq, v, t))
+        }
+    }
+}
+
+fn literal_test(g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.TyId, e: syntax.ExprId, negative: bool) -> keel.Value ! OutOfMemory {
+    match expr_at(fx, e).kind {
+        str(parts: syntax.List) {
+            let bytes: [..]u8 = try string_bytes(g, fx.file, parts)
+            let view: keel.Value = try spill(inout g, fx, scrutinee, sty)
+            return bytes_equal(inout g, inout fx, view, bytes)
+        }
+        _ {
+        }
+    }
+    let v: keel.Value = scalar_v(fx, scrutinee)
+    let t: keel.Type = try scalar_of(inout g, sty)
+    var n: check.Wide = check.wide(0)
+    match try const_int(inout g, fx.file, e, 0) {
+        some(value as x: check.Wide) {
+            n = x
+        }
+        none {
+        }
+    }
+    if negative {
+        n = check.wide_neg(n)
+    }
+    let c: keel.Value = iconst(fx, t, low_i64(n))
+    return ok.(value: compare_ints(fx, keel.IntCC.eq, v, c))
+}
+
+// Whether the view at view holds exactly bytes.
+fn bytes_equal(g: inout Gen, fx: inout Fx, view: keel.Value, bytes: []u8) -> keel.Value ! OutOfMemory {
+    let len_addr: keel.Value = offset_by(fx, view, 8)
+    let len: keel.Value = load_scalar(fx, keel.Type.int64, len_addr)
+    let want: keel.Value = usize_const(fx, u64.(bytes.len))
+    let same_len: keel.Value = compare_ints(fx, keel.IntCC.eq, len, want)
+    let compare_block: keel.Block = try new_block(inout fx)
+    let done: keel.Block = try new_block(inout fx)
+    let bool_ty: check.TyId = try check.bool_ty(inout g.types)
+    let result: keel.Value = try temp(inout g, fx, bool_ty)
+    let zero: keel.Value = iconst(fx, keel.Type.int8, 0)
+    store_scalar(fx, zero, result)
+    try brif(inout fx, same_len, compare_block, done)
+    switch_to(inout fx, compare_block, true)
+    let p: keel.Value = load_scalar(fx, keel.Type.ptr, view)
+    let s: keel.Symbol = try string_symbol(inout g, bytes)
+    let lit: keel.Value = data_addr(fx, s)
+    let params: [3]keel.Type = [keel.Type.ptr, keel.Type.ptr, keel.Type.int64]
+    let returns: [1]keel.Type = [keel.Type.int32]
+    let args: [3]keel.Value = [p, lit, want]
+    var diff: keel.Value = zero
+    match try libc_call(inout g, fx, "memcmp", params, returns, args) {
+        some(value as d: keel.Value) {
+            diff = d
+        }
+        none {
+        }
+    }
+    let zero32: keel.Value = iconst(fx, keel.Type.int32, 0)
+    let eq: keel.Value = compare_ints(fx, keel.IntCC.eq, diff, zero32)
+    store_scalar(fx, eq, result)
+    try jump(inout fx, done)
+    switch_to(inout fx, done, true)
+    return ok.(value: load_scalar(fx, keel.Type.int8, result))
+}

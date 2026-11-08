@@ -11,12 +11,15 @@
 //! the run tests, on `tests/check/malformed`, which triggers every checker
 //! error the checker's tests do not, and on the loader's fixtures. The
 //! resolver's and checker's tests compare it on each program they write.
+//!
+//! `build --ir` must write the same keel IR as stage 1 for each run test,
+//! the ini example and ternc itself. `tests/run.rs` runs what ternc builds.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 mod common;
-use common::{check_differences, corpus_cases, differences, repo};
+use common::{check_differences, corpus_cases, differences, repo, run, ternc_compilers};
 
 fn tmp() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -146,4 +149,52 @@ fn checker_matches_stage1() {
         failures.extend(check_differences(&d, &fixture_std));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn code_generator_matches_stage1() {
+    let std_dir = repo().join("toolchain/std");
+    let mut roots = Vec::new();
+    package_dirs(&repo().join("toolchain/stage1/tests/run"), &mut roots);
+    roots.sort();
+    roots.push(repo().join("examples/ini"));
+    roots.push(repo().join("toolchain/ternc"));
+    let dir = tmp().join("ir");
+    fs::create_dir_all(&dir).expect("can create the IR directory");
+    let mut failures = Vec::new();
+    for root in &roots {
+        let name = root
+            .file_name()
+            .expect("a package has a name")
+            .to_string_lossy();
+        let ir = |compiler: &Path, label: &str| {
+            let out = dir.join(format!("{name}{label}.ir"));
+            let args = [
+                "build".as_ref(),
+                root.as_os_str(),
+                "--std".as_ref(),
+                std_dir.as_os_str(),
+                "--ir".as_ref(),
+                "-o".as_ref(),
+                out.as_os_str(),
+            ];
+            let output = run(compiler, &args);
+            assert!(
+                output.status.success(),
+                "{name} ({label}): build --ir failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::read(&out).expect("build --ir writes the IR")
+        };
+        let want = ir(stage1(), "-stage1");
+        for (compiler, label) in ternc_compilers() {
+            if ir(compiler, label) != want {
+                failures.push(format!(
+                    "{name}: ternc ({label}) writes different IR; compare the files in {}",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

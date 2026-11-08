@@ -26,6 +26,7 @@ pub fn ternc_compilers() -> &'static [(PathBuf, &'static str); 2] {
             let out = dir.join(if optimize { "ternc-O" } else { "ternc" });
             let options = Options {
                 optimize,
+                link: vec![keel_archive()],
                 ..Options::new(repo().join("toolchain/std"))
             };
             build(&repo().join("toolchain/ternc"), &out, &options)
@@ -33,6 +34,25 @@ pub fn ternc_compilers() -> &'static [(PathBuf, &'static str); 2] {
             (out, label)
         })
     })
+}
+
+/// keel's C API as a static library, which ternc links. Cargo builds it
+/// next to the test binaries because keel-ffi is a dev-dependency; after a
+/// keel update the newest one is current.
+pub fn keel_archive() -> PathBuf {
+    let exe = std::env::current_exe().expect("a test binary has a path");
+    let deps = exe.parent().expect("a test binary has a directory");
+    std::fs::read_dir(deps)
+        .expect("can read the deps directory")
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("libkeel_ffi-") && name.ends_with(".a")
+        })
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+        .expect("cargo builds libkeel_ffi.a for the tests")
 }
 
 pub fn run<S: AsRef<OsStr>>(exe: &Path, args: &[S]) -> Output {

@@ -59,14 +59,19 @@ build and run the programs in `toolchain/stage1/tests/run` and
 microcontroller keel does not support, so it is only checked.
 
 [toolchain/ternc](toolchain/ternc) is the compiler written in tern,
-built by stage 1. So far it lexes: `ternc lex FILE` prints the same
-tokens and errors as stage 1, and a stage 1 test checks that on every
-tern file in the repository.
+built by stage 1. Its `lex`, `parse` and `check` commands print what
+stage 1's do, and `build` writes the same keel IR, through keel's C API.
+Stage 1's tests compare the two on every tern file in the repository
+and build and run the run tests with ternc.
+
+ternc links `libkeel_ffi.a`, which Cargo builds for the tests:
 
 ```
 cd toolchain
-cargo run -- build ternc -o ternc2
-./ternc2 lex std/io/io.tern
+cargo test --no-run
+cargo run -- build ternc --std std target/debug/deps/libkeel_ffi-*.a -o ternc2
+./ternc2 build stage1/tests/run/hello --std std -o hello
+./hello
 ```
 
 [toolchain/std](toolchain/std) is the standard library, written in tern

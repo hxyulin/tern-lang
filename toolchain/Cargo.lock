@@ -154,6 +154,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "keel-ffi"
+version = "0.1.0"
+source = "git+https://github.com/hxyulin/keel#d2a67501479643b60511e5824fff2ec6afa7e13c"
+dependencies = [
+ "keel-asm",
+ "keel-codegen",
+ "keel-ir",
+ "keel-link",
+ "keel-opt",
+]
+
+[[package]]
 name = "keel-frontend"
 version = "0.1.0"
 source = "git+https://github.com/hxyulin/keel#d2a67501479643b60511e5824fff2ec6afa7e13c"
@@ -325,6 +337,7 @@ version = "0.1.0"
 dependencies = [
  "keel-asm",
  "keel-codegen",
+ "keel-ffi",
  "keel-frontend",
  "keel-ir",
  "keel-link",

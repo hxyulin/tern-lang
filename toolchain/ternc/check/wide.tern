@@ -4,7 +4,7 @@
 //
 // A Wide is two's complement in two halves.
 
-pub type Wide (hi: u64, lo: u64)
+pub type Wide (pub hi: u64, pub lo: u64)
 
 pub fn wide(v: u64) -> Wide {
     return Wide.(hi: 0, lo: v)
@@ -23,7 +23,7 @@ fn wide_add_wrapping(a: Wide, b: Wide) -> Wide {
     return Wide.(hi: hi, lo: lo)
 }
 
-fn wide_not(a: Wide) -> Wide {
+pub fn wide_not(a: Wide) -> Wide {
     return Wide.(hi: ~a.hi, lo: ~a.lo)
 }
 

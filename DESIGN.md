@@ -1998,16 +1998,16 @@ detected.
 
 **Decided (2026-11-08).** From here on the compiler is developed in tern,
 in `toolchain/ternc`, and stage 1 builds it. Stage 1 stays as the
-bootstrap. Keel will gain a C ABI, so ternc can call it later; until
-then ternc is built one front-end part at a time, starting with the
-lexer and then the parser.
+bootstrap. ternc was built one part at a time: the lexer, the parser,
+the checker, and then code generation through keel's C API.
 
 - **Layout.** `main.tern` is the driver. The `syntax` package holds the
   tokens, the lexer, line lookup, the syntax tree and the parser. The
   `sexp` package prints a tree as stage 1's `ternc parse` does.
   `program` loads a program's packages, `resolve` resolves names,
   `check` checks types and the safety rules, and `maps` holds the hash
-  maps they use, one per key and value type.
+  maps they use, one per key and value type. `gen` generates code and
+  `keel` binds keel's C API.
 - **`ternc check DIR --std DIR`** reports what stage 1's `check` does.
   It loads, resolves and checks the whole program in one `heap.Arena`.
   Messages other than the lexer's and parser's are built as text with
@@ -2060,6 +2060,26 @@ lexer and then the parser.
   directories only on macOS until tern has target-specific code (the
   user chose to wait, 2026-11-09). Without errno, ternc reports an
   unreadable root as `cannot read DIR`, with no reason.
+- **`ternc build`** (2026-11-09) is a port of stage 1's code generator
+  in the `gen` package. It builds the module through keel's C API, which
+  the `keel` package binds; its wrappers turn a rejected call into an
+  internal-error panic. ternc links `libkeel_ffi.a`, the static library
+  Cargo builds next to the tests, since keel-ffi is a dev-dependency of
+  stage 1. Signed executables come from the C API's linker on macOS.
+- **The IR must match stage 1's byte for byte.** keel numbers values,
+  blocks and slots in creation order, so ternc creates everything in
+  stage 1's order. To make that order something ternc can reproduce
+  through the C API, stage 1 now reserves a function's place when it
+  starts lowering it, and lists declarations and data in the order they
+  are first referenced. A test compares `build --ir` for every run test,
+  the ini example and ternc itself, and builds and runs every run test
+  and the ini example with ternc. ternc built by ternc builds a
+  byte-identical ternc.
+- **Two differences from stage 1 below the IR.** With `-O`, the C API
+  optimizes without the host's vector context and selects instructions
+  with its own tier, so machine code can differ. ternc finds the macOS
+  SDK through `SDKROOT` or the Command Line Tools path and does not run
+  `xcrun`.
 
 Friction found while porting the lexer, and what became of it:
 
@@ -2103,6 +2123,18 @@ Friction found while porting the checker:
 - A function's name blocks that name for locals in the whole package,
   which the checker hit often: `decl`, `shift_amount` and
   `variant_payload` all clashed and were renamed.
+
+Friction found while porting the code generator:
+
+- A union cannot be built, so reading a float's bits casts a pointer to
+  it: `cast[*u64](&held).*`.
+- The checker rejects extra arguments to a variadic `extern` function,
+  so `std.io.create` calls `creat` instead of `open` with a mode.
+- `return` cannot appear in a `match` used as an expression, so such
+  matches became statements.
+- A value-returning helper needs a value before a `match` assigns it.
+  `keel.no_value()` gives one without emitting an instruction; a dummy
+  `iconst` there shifted every later value number.
 
 ## Deferred
 

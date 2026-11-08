@@ -19,6 +19,8 @@ pub type Checked (
     pub diagnostics: [..]program.Diagnostic,
     // What the checker found, per file, for code generation.
     pub files: [..]FileTypes,
+    // Each function's type, by declaration number.
+    pub fn_tys: [..]?TyId,
 )
 
 // The checker's results for one file, indexed like its syntax tree.
@@ -120,7 +122,7 @@ pub fn check(alloc: Allocator, p: program.Program, names: resolve.Resolution) ->
         let message: program.Message = program.Message.text.(start: d.start, message: d.message)
         try push(inout diagnostics, program.Diagnostic.(file: d.file, message: message))
     }
-    return ok.(value: Checked.(types: c.types, diagnostics: diagnostics, files: c.files))
+    return ok.(value: Checked.(types: c.types, diagnostics: diagnostics, files: c.files, fn_tys: c.fn_tys))
 }
 
 fn found_before(a: Found, b: Found) -> bool {

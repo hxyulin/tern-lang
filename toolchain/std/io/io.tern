@@ -10,6 +10,7 @@ import std.libc
 pub type Error enum {
     open_failed
     read_failed
+    write_failed
     path_too_long
     out_of_memory
 }
@@ -18,6 +19,7 @@ pub fn describe(e: Error) -> []u8 {
     return match e {
         open_failed { "cannot open the file" }
         read_failed { "cannot read the file" }
+        write_failed { "cannot write the file" }
         path_too_long { "the path is longer than 1023 bytes" }
         out_of_memory { "out of memory" }
     }
@@ -42,6 +44,41 @@ pub fn open(path: []u8) -> File ! Error {
         return err.(error: Error.open_failed)
     }
     return ok.(value: File.(fd: fd))
+}
+
+// Read and write for the owner, read for everyone else.
+let mode_rw_r_r: c.uint = c.uint.(0o644)
+
+// Creates a file for writing, or empties an existing one.
+pub fn create(path: []u8) -> File ! Error {
+    var buf: [max_path]u8 = fill[max_path](0)
+    if path.len >= buf.len {
+        return err.(error: Error.path_too_long)
+    }
+    for let i: usize in 0..path.len {
+        buf[i] = path[i]
+    }
+    // SAFETY: buf holds the path and then a 0 byte.
+    let fd: c.int = unsafe { libc.creat(&buf[0], mode_rw_r_r) }
+    if i32.(fd) < 0 {
+        return err.(error: Error.open_failed)
+    }
+    return ok.(value: File.(fd: fd))
+}
+
+// Writes all of bytes to a file.
+pub fn write_all(f: File, bytes: []u8) -> ! Error {
+    var rest: []u8 = bytes
+    for rest.len > 0 {
+        // SAFETY: rest has rest.len readable bytes.
+        let n: c.ssize_t = unsafe { libc.write(f.fd, &rest[0], c.size_t.(rest.len)) }
+        let count: isize = isize.(n)
+        if count <= 0 {
+            return err.(error: Error.write_failed)
+        }
+        rest = rest[usize.(count)..]
+    }
+    return ok
 }
 
 pub fn close(f: inout File) {
