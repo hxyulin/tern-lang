@@ -2,10 +2,10 @@
 //! For every input, its `lex` and `parse` commands must print exactly what
 //! stage 1's do, errors included.
 //!
-//! The lexer runs on every tern file in the repository, the tree-sitter
-//! corpus files and `tests/lex`. The parser runs on every tern file and
-//! every corpus case. While the parser port is unfinished, an input on which
-//! ternc reports "not parsed yet" is skipped.
+//! The lexer runs on every tern file in the repository and the tree-sitter
+//! corpus files. The parser runs on every tern file and every corpus case.
+//! Among the tern files, `tests/lex/malformed.tern` and
+//! `tests/parse/malformed.tern` trigger every lexer and parser error.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,19 +85,14 @@ fn same(a: &Output, b: &Output) -> bool {
     a.stdout == b.stdout && a.stderr == b.stderr && a.status.code() == b.status.code()
 }
 
-/// Runs `command` with both compilers on every file. Returns the failures
-/// and how many inputs ternc skipped.
-fn compare(command: &str, files: &[PathBuf]) -> (Vec<String>, usize) {
+/// Runs `command` with both compilers on every file and returns the
+/// differences.
+fn compare(command: &str, files: &[PathBuf]) -> Vec<String> {
     let mut failures = Vec::new();
-    let mut skipped = 0;
     for (compiler, label) in compilers() {
         for file in files {
             let want = run(Path::new(env!("CARGO_BIN_EXE_ternc")), command, file);
             let got = run(compiler, command, file);
-            if String::from_utf8_lossy(&got.stderr).contains("not parsed yet") {
-                skipped += 1;
-                continue;
-            }
             if !same(&want, &got) {
                 failures.push(format!(
                     "{} ({label}): exit {:?}, want {:?}\n--- stdout\n{}\n--- stderr\n{}\n--- want stderr\n{}",
@@ -111,7 +106,7 @@ fn compare(command: &str, files: &[PathBuf]) -> (Vec<String>, usize) {
             }
         }
     }
-    (failures, skipped)
+    failures
 }
 
 #[test]
@@ -127,7 +122,7 @@ fn lexer_matches_stage1() {
         "the malformed input is missing"
     );
     assert!(files.len() >= 40, "found only {} inputs", files.len());
-    let (failures, _) = compare("lex", &files);
+    let failures = compare("lex", &files);
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
@@ -148,8 +143,12 @@ fn parser_matches_stage1() {
     }
     files.sort();
     assert!(files.len() >= 160, "found only {} inputs", files.len());
-    let (failures, skipped) = compare("parse", &files);
-    let compared = 2 * files.len() - skipped;
-    eprintln!("parser: compared {compared} runs, skipped {skipped}");
+    assert!(
+        files
+            .iter()
+            .any(|f| f.ends_with("tests/parse/malformed.tern")),
+        "the malformed input is missing"
+    );
+    let failures = compare("parse", &files);
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

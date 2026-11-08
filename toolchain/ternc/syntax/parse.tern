@@ -15,8 +15,6 @@
 
 pub type ParseProblem enum {
     expected(what: []u8, found: Found)
-    // Syntax the port does not handle yet.
-    not_parsed_yet(what: []u8)
     imports_first
     variadic_first
     empty_tuple_type
@@ -225,10 +223,6 @@ fn name(p: inout Parser) -> Span ! Stop {
     let span: Span = current_span(p)
     advance(inout p)
     return ok.(value: span)
-}
-
-fn not_parsed_yet(p: inout Parser, what: []u8) -> Stop {
-    return fail_here(inout p, ParseProblem.not_parsed_yet.(what: what))
 }
 
 // Skips to the end of the current line item: past a `;`, or up to a `}`
@@ -1131,20 +1125,496 @@ fn pattern_kind(p: inout Parser) -> PatternKind ! Stop {
     }
 }
 
-// Expressions.
+// Expressions, from loosest to tightest.
 
-fn expression(p: inout Parser) -> ExprId ! Stop {
-    return err.(error: not_parsed_yet(inout p, "expressions"))
+fn add_expr(p: inout Parser, k: ExprKind, from: u32) -> ExprId ! Stop {
+    let e: Expr = Expr.(kind: k, span: span_from(p, from))
+    try memory(push(inout p.ast.exprs, e))
+    return ok.(value: ExprId.(u32.(p.ast.exprs.len - 1)))
 }
 
-fn postfix(p: inout Parser) -> ExprId ! Stop {
-    return err.(error: not_parsed_yet(inout p, "expressions"))
+// A full expression. `if`, `match`, `unsafe` and array literals appear
+// only here, never as operands.
+fn expression(p: inout Parser) -> ExprId ! Stop {
+    let from: u32 = token_start(p)
+    match next_kind(p) {
+        kw_if {
+            return if_expression(inout p)
+        }
+        kw_match {
+            advance(inout p)
+            let value: ExprId = try expression(inout p)
+            try expect(inout p, TokenKind.l_brace, "`\{`")
+            let arms: List = try lines(inout p, expression_arm)
+            return add_expr(inout p, ExprKind.match_expr.(value: value, arms: arms), from)
+        }
+        kw_unsafe {
+            advance(inout p)
+            let body: ExprId = try branch(inout p)
+            return add_expr(inout p, ExprKind.unsafe_expr.(body: body), from)
+        }
+        l_bracket {
+            advance(inout p)
+            let first: ExprId = try expression(inout p)
+            return array_literal(inout p, first, from)
+        }
+        _ {
+            return logical(inout p)
+        }
+    }
+}
+
+fn expression_arm(p: inout Parser) -> u32 ! Stop {
+    let pats: List = try patterns(inout p)
+    let value: ExprId = try branch(inout p)
+    try memory(push(inout p.ast.arms, Arm.(patterns: pats, body: ArmBody.branch.(value: value))))
+    return ok.(value: u32.(p.ast.arms.len - 1))
+}
+
+// The rest of an array literal after its first element.
+fn array_literal(p: inout Parser, first: ExprId, from: u32) -> ExprId ! Stop {
+    let mark: usize = p.scratch.len
+    try gather(inout p, u32.(first))
+    for eat(inout p, TokenKind.comma) {
+        if next_kind(p) == TokenKind.r_bracket {
+            break
+        }
+        let elem: ExprId = try expression(inout p)
+        try gather(inout p, u32.(elem))
+    }
+    try expect(inout p, TokenKind.r_bracket, "`,` or `]`")
+    let elems: List = try finish(inout p, mark)
+    return add_expr(inout p, ExprKind.array.(elems: elems), from)
+}
+
+fn if_expression(p: inout Parser) -> ExprId ! Stop {
+    let from: u32 = token_start(p)
+    advance(inout p)
+    let cond: ExprId = try expression(inout p)
+    let then: ExprId = try branch(inout p)
+    if !eat(inout p, TokenKind.kw_else) {
+        return err.(error: expected(inout p, "`else`; an `if` expression needs both branches"))
+    }
+    var otherwise: IfElse = IfElse.branch.(value: then)
+    if next_kind(p) == TokenKind.kw_if {
+        let nested: ExprId = try if_expression(inout p)
+        otherwise = IfElse.if_expr.(value: nested)
+    } else {
+        let value: ExprId = try branch(inout p)
+        otherwise = IfElse.branch.(value: value)
+    }
+    let k: ExprKind = ExprKind.if_expr.(cond: cond, then: then, otherwise: otherwise)
+    return add_expr(inout p, k, from)
+}
+
+// `{ expr }`: one expression in braces.
+fn branch(p: inout Parser) -> ExprId ! Stop {
+    try expect(inout p, TokenKind.l_brace, "`\{`")
+    let value: ExprId = try expression(inout p)
+    let _: bool = eat(inout p, TokenKind.semicolon)
+    try expect(inout p, TokenKind.r_brace, "`}`; a branch holds one expression")
+    return ok.(value: value)
+}
+
+fn binary(p: inout Parser, op: BinaryOp, left: ExprId, right: ExprId) -> ExprId ! Stop {
+    let from: u32 = p.ast.exprs[usize.(left)].span.start
+    return add_expr(inout p, ExprKind.binary.(op: op, left: left, right: right), from)
+}
+
+// The operator group of the next token, if it is a binary operator.
+fn next_group(p: Parser) -> ?OpGroup {
+    match binary_op(next_kind(p)) {
+        some(value as op: BinaryOp) {
+            return some.(value: op_group(op))
+        }
+        none {
+            return none
+        }
+    }
+}
+
+fn next_is(p: Parser, group: OpGroup) -> bool {
+    match next_group(p) {
+        some(value: OpGroup) {
+            return value == group
+        }
+        none {
+            return false
+        }
+    }
+}
+
+fn next_is_op(p: Parser, op: BinaryOp) -> bool {
+    match binary_op(next_kind(p)) {
+        some(value: BinaryOp) {
+            return value == op
+        }
+        none {
+            return false
+        }
+    }
+}
+
+// The next token's binary operator. The caller has checked it is one.
+fn next_op(p: Parser) -> BinaryOp {
+    match binary_op(next_kind(p)) {
+        some(value: BinaryOp) {
+            return value
+        }
+        none {
+            panic("no binary operator next")
+        }
+    }
+}
+
+// `a && b && c` or `a || b || c`. The two do not mix.
+fn logical(p: inout Parser) -> ExprId ! Stop {
+    var left: ExprId = try comparison(inout p)
+    var group: OpGroup = OpGroup.and
+    if next_is(p, OpGroup.or) {
+        group = OpGroup.or
+    } else if !next_is(p, OpGroup.and) {
+        return ok.(value: left)
+    }
+    let op: BinaryOp = next_op(p)
+    for next_is(p, group) {
+        advance(inout p)
+        let right: ExprId = try comparison(inout p)
+        left = try binary(inout p, op, left, right)
+    }
+    if next_is(p, OpGroup.and) || next_is(p, OpGroup.or) {
+        return err.(error: fail_here(inout p, ParseProblem.logic_mix))
+    }
+    return ok.(value: left)
+}
+
+// `a < b`. Comparisons do not chain.
+fn comparison(p: inout Parser) -> ExprId ! Stop {
+    let left: ExprId = try comparison_operand(inout p)
+    if !next_is(p, OpGroup.comparison) {
+        return ok.(value: left)
+    }
+    let op: BinaryOp = next_op(p)
+    advance(inout p)
+    let right: ExprId = try comparison_operand(inout p)
+    let e: ExprId = try binary(inout p, op, left, right)
+    if next_is(p, OpGroup.comparison) {
+        return err.(error: fail_here(inout p, ParseProblem.comparison_chain))
+    }
+    return ok.(value: e)
+}
+
+// An operand of a comparison: arithmetic, or one kind of bitwise
+// operator, or one shift.
+fn comparison_operand(p: inout Parser) -> ExprId ! Stop {
+    var left: ExprId = try unary(inout p)
+    var group: OpGroup = OpGroup.or
+    match next_group(p) {
+        some(value: OpGroup) {
+            group = value
+        }
+        none {
+            return ok.(value: left)
+        }
+    }
+    let first: BinaryOp = next_op(p)
+    match group {
+        additive, multiplicative {
+            left = try multiplicative_tail(inout p, left)
+            for next_is(p, OpGroup.additive) {
+                let op: BinaryOp = next_op(p)
+                advance(inout p)
+                var right: ExprId = try unary(inout p)
+                right = try multiplicative_tail(inout p, right)
+                left = try binary(inout p, op, left, right)
+            }
+        }
+        bit_and, bit_or, bit_xor {
+            for next_is_op(p, first) {
+                advance(inout p)
+                let right: ExprId = try unary(inout p)
+                left = try binary(inout p, first, left, right)
+            }
+        }
+        shift {
+            advance(inout p)
+            let right: ExprId = try unary(inout p)
+            left = try binary(inout p, first, left, right)
+            if next_is(p, OpGroup.shift) {
+                return err.(error: fail_here(inout p, ParseProblem.shift_chain))
+            }
+        }
+        or, and, comparison {
+            return ok.(value: left)
+        }
+    }
+    match next_group(p) {
+        some(value: OpGroup) {
+            if value != OpGroup.or && value != OpGroup.and && value != OpGroup.comparison {
+                let problem: ParseProblem = ParseProblem.operator_mix.(first: first, next: next_op(p))
+                return err.(error: fail_here(inout p, problem))
+            }
+        }
+        none {
+        }
+    }
+    return ok.(value: left)
+}
+
+fn multiplicative_tail(p: inout Parser, start_with: ExprId) -> ExprId ! Stop {
+    var left: ExprId = start_with
+    for next_is(p, OpGroup.multiplicative) {
+        let op: BinaryOp = next_op(p)
+        advance(inout p)
+        let right: ExprId = try unary(inout p)
+        left = try binary(inout p, op, left, right)
+    }
+    return ok.(value: left)
 }
 
 fn unary(p: inout Parser) -> ExprId ! Stop {
-    return err.(error: not_parsed_yet(inout p, "expressions"))
+    let from: u32 = token_start(p)
+    var op: UnaryOp = UnaryOp.neg
+    match next_kind(p) {
+        minus {
+            op = UnaryOp.neg
+        }
+        bang {
+            op = UnaryOp.not
+        }
+        tilde {
+            op = UnaryOp.bit_not
+        }
+        amp {
+            op = UnaryOp.address_of
+        }
+        kw_try {
+            advance(inout p)
+            let inner: ExprId = try unary(inout p)
+            return add_expr(inout p, ExprKind.try_expr.(operand: inner), from)
+        }
+        _ {
+            return postfix(inout p)
+        }
+    }
+    advance(inout p)
+    let inner: ExprId = try unary(inout p)
+    return add_expr(inout p, ExprKind.unary.(op: op, operand: inner), from)
+}
+
+fn postfix(p: inout Parser) -> ExprId ! Stop {
+    let from: u32 = token_start(p)
+    var e: ExprId = try primary(inout p)
+    for {
+        match next_kind(p) {
+            l_paren {
+                advance(inout p)
+                let args: List = try comma_list(inout p, argument)
+                e = try add_expr(inout p, ExprKind.call.(callee: e, args: args), from)
+            }
+            dot {
+                advance(inout p)
+                match next_kind(p) {
+                    ident {
+                        let n: Span = try name(inout p)
+                        e = try add_expr(inout p, ExprKind.field.(value: e, name: n), from)
+                    }
+                    l_paren {
+                        let value: ExprId = try paren_or_tuple(inout p)
+                        e = try add_expr(inout p, ExprKind.construct.(ty: e, value: value), from)
+                    }
+                    _ {
+                        return err.(error: expected(inout p, "a field name or `(` after `.`"))
+                    }
+                }
+            }
+            dot_star {
+                advance(inout p)
+                e = try add_expr(inout p, ExprKind.deref.(inner: e), from)
+            }
+            l_bracket {
+                advance(inout p)
+                let i: Index = try subscript(inout p)
+                try expect(inout p, TokenKind.r_bracket, "`]`")
+                e = try add_expr(inout p, ExprKind.index.(value: e, index: i), from)
+            }
+            _ {
+                return ok.(value: e)
+            }
+        }
+    }
+}
+
+fn argument(p: inout Parser) -> u32 ! Stop {
+    let m: Mode = mode(inout p)
+    let value: ExprId = try expression(inout p)
+    try memory(push(inout p.ast.args, Arg.(mode: m, value: value)))
+    return ok.(value: u32.(p.ast.args.len - 1))
+}
+
+// What goes between `[` and `]` after a value: an index, a slice, or a
+// type argument.
+fn subscript(p: inout Parser) -> Index ! Stop {
+    match next_kind(p) {
+        star, question, kw_fn {
+            let t: TypeId = try type_expr(inout p)
+            return ok.(value: Index.ty.(ty: t))
+        }
+        dot_dot {
+            advance(inout p)
+            let end: ExprId = try expression(inout p)
+            try require_additive(inout p, end)
+            return ok.(value: Index.slice.(start: none, end: some.(value: end)))
+        }
+        l_bracket {
+            let after: TokenKind = kind_at(p, 1)
+            if after == TokenKind.r_bracket || after == TokenKind.dot_dot {
+                let t: TypeId = try type_expr(inout p)
+                return ok.(value: Index.ty.(ty: t))
+            }
+            let from: u32 = token_start(p)
+            advance(inout p)
+            let first: ExprId = try expression(inout p)
+            if next_kind(p) == TokenKind.r_bracket && kind_at(p, 1) != TokenKind.r_bracket {
+                // `[n]T`: an array type.
+                advance(inout p)
+                let elem: TypeId = try simple_type(inout p)
+                let t: TypeId = try add_type(inout p, TypeKind.array.(len: first, elem: elem), from)
+                return ok.(value: Index.ty.(ty: t))
+            }
+            let array: ExprId = try array_literal(inout p, first, from)
+            return ok.(value: Index.value.(value: array))
+        }
+        _ {
+        }
+    }
+    let first: ExprId = try expression(inout p)
+    if !eat(inout p, TokenKind.dot_dot) {
+        return ok.(value: Index.value.(value: first))
+    }
+    try require_additive(inout p, first)
+    var end: ?ExprId = none
+    if next_kind(p) != TokenKind.r_bracket {
+        let e: ExprId = try expression(inout p)
+        try require_additive(inout p, e)
+        end = some.(value: e)
+    }
+    return ok.(value: Index.slice.(start: some.(value: first), end: end))
 }
 
 fn primary(p: inout Parser) -> ExprId ! Stop {
-    return err.(error: not_parsed_yet(inout p, "expressions"))
+    let from: u32 = token_start(p)
+    match next_kind(p) {
+        ident {
+            let n: Span = try name(inout p)
+            return add_expr(inout p, ExprKind.name.(name: n), from)
+        }
+        int {
+            advance(inout p)
+            return add_expr(inout p, ExprKind.int, from)
+        }
+        float {
+            advance(inout p)
+            return add_expr(inout p, ExprKind.float, from)
+        }
+        char {
+            advance(inout p)
+            return add_expr(inout p, ExprKind.char, from)
+        }
+        str, str_start {
+            let parts: List = try string(inout p)
+            return add_expr(inout p, ExprKind.str.(parts: parts), from)
+        }
+        l_paren {
+            return paren_or_tuple(inout p)
+        }
+        _ {
+            return err.(error: expected(inout p, "an expression"))
+        }
+    }
+}
+
+// A string literal: one `str` token, or `str_start`, then expressions
+// separated by `str_mid`, then `str_end`.
+fn string(p: inout Parser) -> List ! Stop {
+    let mark: usize = p.scratch.len
+    for {
+        let t: Token = current(p)
+        advance(inout p)
+        try text_part(inout p, t)
+        if t.kind == TokenKind.str || t.kind == TokenKind.str_end {
+            return finish(inout p, mark)
+        }
+        let value: ExprId = try expression(inout p)
+        try add_part(inout p, StrPart.interpolation.(value: value))
+        let k: TokenKind = next_kind(p)
+        if k != TokenKind.str_mid && k != TokenKind.str_end {
+            return err.(error: expected(inout p, "`}` to close the interpolation"))
+        }
+    }
+}
+
+// The text of a string token without its delimiters, if there is any.
+fn text_part(p: inout Parser, t: Token) -> ! Stop {
+    let bytes: []u8 = p.text[usize.(t.start)..usize.(t.end)]
+    let from: u32 = t.start + 1
+    var to: u32 = t.end
+    let last: u8 = bytes[bytes.len - 1]
+    if bytes.len >= 2 && (last == '"' || last == '{') {
+        to -= 1
+    }
+    if to > from {
+        try add_part(inout p, StrPart.text.(span: Span.(start: from, end: to)))
+    }
+    return ok
+}
+
+fn add_part(p: inout Parser, part: StrPart) -> ! Stop {
+    try memory(push(inout p.ast.str_parts, part))
+    return gather(inout p, u32.(p.ast.str_parts.len - 1))
+}
+
+// `(expr)`, or a tuple literal `(name: expr, ...)`.
+fn paren_or_tuple(p: inout Parser) -> ExprId ! Stop {
+    let from: u32 = token_start(p)
+    advance(inout p)
+    if next_kind(p) == TokenKind.ident && kind_at(p, 1) == TokenKind.colon {
+        let list: List = try comma_list(inout p, tuple_item)
+        return add_expr(inout p, ExprKind.tuple.(items: list), from)
+    }
+    let inner: ExprId = try expression(inout p)
+    try expect(inout p, TokenKind.r_paren, "`)`")
+    return add_expr(inout p, ExprKind.paren.(inner: inner), from)
+}
+
+fn tuple_item(p: inout Parser) -> u32 ! Stop {
+    let n: Span = try name(inout p)
+    try expect(inout p, TokenKind.colon, "`:`")
+    let value: ExprId = try expression(inout p)
+    try memory(push(inout p.ast.tuple_items, TupleItem.(name: n, value: value)))
+    return ok.(value: u32.(p.ast.tuple_items.len - 1))
+}
+
+fn binary_op(k: TokenKind) -> ?BinaryOp {
+    return match k {
+        pipe_pipe { some.(value: BinaryOp.or) }
+        amp_amp { some.(value: BinaryOp.and) }
+        eq_eq { some.(value: BinaryOp.eq) }
+        bang_eq { some.(value: BinaryOp.ne) }
+        lt { some.(value: BinaryOp.lt) }
+        lt_eq { some.(value: BinaryOp.le) }
+        gt { some.(value: BinaryOp.gt) }
+        gt_eq { some.(value: BinaryOp.ge) }
+        plus { some.(value: BinaryOp.add) }
+        minus { some.(value: BinaryOp.sub) }
+        star { some.(value: BinaryOp.mul) }
+        slash { some.(value: BinaryOp.div) }
+        percent { some.(value: BinaryOp.rem) }
+        amp { some.(value: BinaryOp.bit_and) }
+        pipe { some.(value: BinaryOp.bit_or) }
+        caret { some.(value: BinaryOp.bit_xor) }
+        shl { some.(value: BinaryOp.shl) }
+        shr { some.(value: BinaryOp.shr) }
+        _ { none }
+    }
 }

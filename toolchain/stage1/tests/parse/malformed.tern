@@ -1,0 +1,61 @@
+// Every parser error, one per line item, for the ternc comparison test.
+// Each error is followed by recovery, so the parser reports them all.
+
+import std.io
+fn early() {}
+import std.os
+type Empty ()
+extern fn bad(...)
+fn split(a: u8
+    b: u8) {}
+fn body() {
+    let (): u8 = 1
+    defer x
+    x + 1
+    for let i: u32 in 0..a & b {}
+    let a: bool = x && y || z
+    let b: bool = x < y < z
+    let c: u32 = x << 1 << 2
+    let d: u32 = x + y & z
+    let e: u32 = if x { 1 }
+    let f: u32 = "a{x"
+    let k = 1
+    let h: u32
+    let g: u32 = x.
+    break
+    match x {
+        -y {}
+    }
+    @
+}
+@align(x) fn attr() {}
+fn params(a u8) {}
+fn params2(a: u8 b: u8) {}
+extern fn v(a: u8, ..., b: u8)
+type Bad []
+type Grow [..u8
+fn more() {
+    = 1
+    match x {
+        +
+    }
+    let a: u8 = ()
+    for let i: u8 0..3 {}
+    let b: u8 = [1 2]
+    let c: u8 = x[1
+    let d: u8 = if x { 1 2 } else { 3 }
+    let e: u8 = (x 1)
+    let f: u8 = T.(a: 1, b 2)
+    let g: u8 = T.(a: 1 2)
+}
+fn () {}
+fn paren {}
+fn brace() u8
+extern let errno u8
+unsafe type T u8
+move fn f() {}
+extern type T u8
+shared let x: u8 = 1
+}
+pub
+fn last() {

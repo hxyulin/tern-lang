@@ -1927,10 +1927,9 @@ lexer and then the parser.
 - **The parser is tested like the lexer.** `ternc parse FILE` prints
   what stage 1's prints: the S-expression tree, or the diagnostics. The
   test compares the two on every tern file and every tree-sitter corpus
-  case, which it writes to its own file. The parser is ported in four
-  parts (declarations and types, statements, expressions, error
-  recovery); until the last, an input on which ternc reports "not
-  parsed yet" is skipped.
+  case, which it writes to its own file.
+  `toolchain/stage1/tests/parse/malformed.tern` triggers every parser
+  error. The two parsers agree on every input, plain and with `-O`.
 - **Diagnostics are enums.** A `Format` cannot be stored, so the lexer
   records a `Problem` with its values, such as
   `bad_digit(digit: u8, base: u32)`, and the driver turns it into text
@@ -1949,6 +1948,18 @@ Friction found while porting the lexer, and what became of it:
 - Every `push` can fail, so every lexer function that adds a token
   returns `! OutOfMemory` and each call takes a `try`. The user judged
   this acceptable.
+
+Friction found while porting the parser, not yet acted on:
+
+- A function's name cannot name a local anywhere in its package, so
+  the parser's helpers took names such as `next_kind` and `subscript`
+  to leave `kind` and `index` free for locals in the lexer.
+- A `let` parameter of a record type is passed `byval`, so it is copied
+  on every call. The parser reads tokens through `next_kind(p: Parser)`,
+  which copies the 600-byte `Parser` twice; parsing a 32,000-line file
+  takes 96 ms against stage 1's 9 ms, and the copies lead the profile.
+- `==` does not apply to optionals, so comparing the next operator with
+  a known one takes a `match`.
 
 ## Deferred
 

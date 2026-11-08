@@ -272,9 +272,6 @@ fn print_parse_problem(text: []u8, d: syntax.ParseDiagnostic) {
                 }
             }
         }
-        not_parsed_yet(what: []u8) {
-            io.eprint("not parsed yet: {what}")
-        }
         imports_first {
             io.eprint("imports come before all declarations")
         }
