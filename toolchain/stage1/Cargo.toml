@@ -17,3 +17,5 @@ keel-ir = { git = "https://github.com/hxyulin/keel" }
 keel-frontend = { git = "https://github.com/hxyulin/keel" }
 keel-opt = { git = "https://github.com/hxyulin/keel" }
 keel-codegen = { git = "https://github.com/hxyulin/keel" }
+keel-asm = { git = "https://github.com/hxyulin/keel" }
+keel-link = { git = "https://github.com/hxyulin/keel" }

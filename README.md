@@ -32,7 +32,9 @@ npm test
 [toolchain/](toolchain) is a Cargo workspace. `stage1` is the bootstrap
 compiler, written in Rust. It checks a program and compiles it through
 [keel](https://github.com/hxyulin/keel) for aarch64 macOS or x86-64
-Linux. Linking needs `clang` on the `PATH`.
+Linux. On macOS, keel assembles and links in memory against the SDK's
+libSystem, so a build needs the Command Line Tools but not `clang`. On
+Linux, `clang` on the `PATH` assembles and links.
 
 ```
 cd toolchain

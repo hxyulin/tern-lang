@@ -1840,10 +1840,13 @@ not. The user agreed to each.
 **Decided (2026-11-08).** The user agreed to the plan:
 
 - **One keel module per program.** Every package, std included, is
-  lowered into one module, which keel compiles to one assembly file;
-  `clang` assembles it and links the C library. Keel cannot yet link
-  several of its modules. A hosted build always loads `std.rt`, the
-  runtime with C's `main`.
+  lowered into one module. On macOS, keel's code generator hands each
+  function's instructions to keel's assembler, and keel's linker links
+  the object with the SDK's libSystem, all in memory. On Linux, keel
+  writes assembly and `clang` assembles and links it. A hosted build
+  always loads `std.rt`, the runtime with C's `main`.
+  `keel_ir::merge_modules` can combine several keel modules, which a
+  separately built std could use later.
 - **Scalars are keel values; everything else is memory.** Integers,
   `bool`, floats, pointers, function values, `?*T` and payload-free
   enums are keel values. Records, tuples, views, arrays, `[..]T`, enums

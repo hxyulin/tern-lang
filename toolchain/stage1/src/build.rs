@@ -1,5 +1,6 @@
-//! Building a program: check it, lower it to keel, and link it with the C
-//! library through `clang`.
+//! Building a program: check it, lower it to keel, then assemble and link
+//! it with the C library. On macOS keel does both in memory; elsewhere
+//! `clang` assembles and links keel's assembly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -68,12 +69,94 @@ pub fn build(root: &Path, out: &Path, options: &Options) -> Result<(), String> {
     if options.optimize {
         keel_opt::optimize(&mut module).map_err(|e| format!("internal error: {e}"))?;
     }
-    let assembly = keel_codegen::compile(&module, host())
-        .map_err(|e| format!("internal error: code generation failed: {e}"))?;
     if options.assembly_only {
+        let assembly = keel_codegen::compile(&module, host())
+            .map_err(|e| format!("internal error: code generation failed: {e}"))?;
         return std::fs::write(out, assembly)
             .map_err(|e| format!("cannot write {}: {e}", out.display()));
     }
+    if host() == Target::Aarch64AppleDarwin {
+        let object = assemble(&module)?;
+        return link_darwin(&object, out);
+    }
+    link_with_clang(&module, out)
+}
+
+/// Assembles `module` for Apple arm64 in memory: code generation hands each
+/// function's instructions straight to keel's assembler, with no text.
+fn assemble(module: &keel_ir::Module) -> Result<Vec<u8>, String> {
+    let codegen_error =
+        |e: keel_codegen::CodegenError| format!("internal error: code generation failed: {e}");
+    let selector = keel_codegen::OptionsSelector(keel_codegen::SelectionOptions::default());
+    let pipeline = keel_codegen::CodegenPipeline {
+        selector: &selector,
+        allocator: &keel_codegen::regalloc::AllocationTier::Full,
+    };
+    let request = keel_codegen::Request::new(Target::Aarch64AppleDarwin, pipeline);
+    // Every Apple arm64 CPU has the SHA-256 extension.
+    let features = keel_asm::TargetFeatures::default().with_sha256();
+    let mut assembler = keel_asm::ObjectAssembler::with_features(
+        keel_asm::Target::Aarch64AppleDarwin,
+        features,
+        keel_asm::x86::Features::default(),
+    )
+    .map_err(|e| format!("internal error: {e}"))?;
+    request
+        .program_chunks(module, &mut |program| assembler.push(program))
+        .map_err(codegen_error)?;
+    assembler
+        .finish()
+        .map_err(|e| format!("internal error: assembly failed: {e}"))
+}
+
+/// Links one object with libSystem into the signed executable `out`.
+fn link_darwin(object: &[u8], out: &Path) -> Result<(), String> {
+    let sdk = macos_sdk().ok_or("cannot find the macOS SDK; set SDKROOT")?;
+    let libsystem = keel_link::Dylib::from_tbd(&sdk.join("usr/lib/libSystem.tbd"), &sdk)
+        .map_err(|e| format!("cannot read libSystem from {}: {e}", sdk.display()))?;
+    let inputs = [keel_link::Input {
+        name: "tern.o",
+        bytes: object,
+    }];
+    let link_options = keel_link::Options {
+        dylibs: vec![libsystem],
+        ..keel_link::Options::default()
+    };
+    let warnings = keel_link::link_signed(&inputs, link_options, out)
+        .map_err(|e| format!("cannot link {}: {e}", out.display()))?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+/// The macOS SDK: `SDKROOT`, the Command Line Tools' SDK, or what `xcrun`
+/// reports. Reading the directory first skips running xcrun.
+fn macos_sdk() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("SDKROOT").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(root));
+    }
+    let tools = Path::new("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk");
+    let developer = std::fs::read_link("/var/db/xcode_select_link").ok();
+    if developer.as_deref() == Some(Path::new("/Library/Developer/CommandLineTools"))
+        && tools.is_dir()
+    {
+        return Some(tools.to_path_buf());
+    }
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+/// Writes assembly next to `out` and has clang assemble and link it.
+fn link_with_clang(module: &keel_ir::Module, out: &Path) -> Result<(), String> {
+    let assembly = keel_codegen::compile(module, host())
+        .map_err(|e| format!("internal error: code generation failed: {e}"))?;
     let asm_path = out.with_extension("s");
     std::fs::write(&asm_path, assembly)
         .map_err(|e| format!("cannot write {}: {e}", asm_path.display()))?;
