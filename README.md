@@ -38,7 +38,9 @@ cargo test
 cargo run -- parse ../examples/uart/main.tern
 ```
 
-`parse` prints the tree in tree-sitter's S-expression form. The tests
+`parse` prints the tree in tree-sitter's S-expression form. `check DIR`
+loads the package in `DIR` and every package it imports; so far it
+reports parse and import errors. The tests
 parse every program in `examples/`, compare the tree for every corpus
 input the grammar accepts with tree-sitter's, and check that every input
 the grammar rejects gets an error.

@@ -990,18 +990,18 @@ let f: io.File = try io.open(path)
 - Packages cannot form import cycles (see
   [Compiler design](#compiler-design)).
 
-**Leaning (2026-11-08): import roots.** A project file at the project's
-root names the project and its dependencies. An import path resolves in
-one of three places:
+**Decided (2026-11-08): one root, no project file.** The compiler is
+given one directory, the root package. An import path resolves in one of
+two places:
 
-- `std.` starts a standard library path. The name `std` is reserved.
-- A first segment that names a dependency in the project file starts a
-  path inside that dependency: `import vendor.x.io`.
-- Anything else is a directory under the project root: `import board`
-  is `<root>/board/`.
+- `std.` starts a standard library path, inside the library that ships
+  with the compiler. The name `std` is reserved.
+- Anything else is a directory under the root: `import board` is
+  `<root>/board/`, and `import board.uart` is `<root>/board/uart/`.
 
-This is Go modules without repeating the module name in every import.
-The project file's format is open.
+The root package itself cannot be imported. The user chose this over a
+project file for now; dependencies on other projects are deferred (see
+[Deferred](#dependencies)).
 
 ### Visibility
 
@@ -1653,13 +1653,20 @@ enclosing function, so they suit callbacks (tree walks, comparators) but
 not iteration. Kotlin solves this by inlining lambdas, which brings back
 the code size cost.
 
+### Dependencies
+
+Deferred on 2026-11-08, with the project file. The earlier leaning: a
+project file at the root names the project and its dependencies, and an
+import whose first segment names a dependency resolves inside it, as
+`import vendor.x.io`. This is Go modules without repeating the module
+name in every import.
+
 ### Generics and traits
 
 Not in the first version. `[T]` is reserved for type arguments.
 
 ## Open questions
 
-- The project file's format.
 - Nested functions (see Deferred).
 - The language's name.
 
@@ -1667,8 +1674,8 @@ Raised by the programs in `examples/` on 2026-11-08. They parse, but a
 checker would have to settle these. Dropping temporal safety settled
 views in enum payloads, `uses` across packages, global string constants
 and length. The decisions of the same day settled `str` against `[]u8`,
-payload renames, fallible `defer` calls and constant initializers, and
-gave import roots a leaning.
+payload renames, fallible `defer` calls, constant initializers and
+import roots.
 
 - **Converting an error needs a statement `match`.** A `match`
   expression arm cannot `return`, and there is no `From`, so passing an

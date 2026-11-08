@@ -1,0 +1,7 @@
+import util
+import util.text
+import std.io
+
+fn main() -> u8 {
+    return 0
+}

@@ -1,0 +1,3 @@
+pub fn len(s: []u8) -> usize {
+    return s.len
+}
