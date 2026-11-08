@@ -1220,6 +1220,14 @@ the program it would reject still compiles.
   its state (see [Values and buffers](#values-and-buffers)), and made
   the code generator's enum shapes and signatures ranges into shared
   arrays instead of owning their own.
+- **Rule 4: built (2026-11-09)** in both checkers: write sets are
+  inferred, a call cannot pass a global its callee writes, and a
+  function that writes a global cannot be a function value. A call
+  through a function value writes nothing, by that rule. Not yet: the
+  `uses` clause on function types, so for now no function that writes
+  a global can be a value; `ternc` printing write sets; `noalias` on
+  `inout` parameters and dropping the copy of a `let` argument rooted
+  at a global; and the `shared` checks that need read sets.
 
 ### Bounds checks, no null, no pointer arithmetic
 

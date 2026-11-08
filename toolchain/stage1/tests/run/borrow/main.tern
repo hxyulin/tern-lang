@@ -1,13 +1,15 @@
 // A `let` parameter held in memory is the caller's value, passed by
-// address. The caller copies it when the callee could change it another
-// way: from a global, through a view or a pointer, or in a call within
-// another argument.
+// address. The caller copies it when it is a global, is reached through
+// a view or a pointer, or another argument holds a call that changes it.
+// A callee cannot write a global that is also its argument.
 
 import std.io
 
 type Big (a: u64, b: u64, c: u64, d: u64)
 
 var global: Big = Big.(a: 1, b: 2, c: 3, d: 4)
+
+var other: Big = Big.(a: 1, b: 2, c: 3, d: 4)
 
 fn sum(x: Big) -> u64 {
     return x.a + x.b + x.c + x.d
@@ -36,8 +38,8 @@ fn forward(x: Big) -> u64 {
 fn main() -> u8 {
     var local: Big = Big.(a: 5, b: 6, c: 7, d: 8)
     io.print("{sum(local)} {forward(local)}\n")
-    // From a global: copied, so x keeps its value.
-    io.print("{read_twice(global)} {global.a}\n")
+    // From a global the callee does not write.
+    io.print("{read_twice(other)} {global.a}\n")
     // A call in a later argument changes local: x was copied first.
     io.print("{first_then(local, bump(inout local))} {local.a}\n")
     let arr: [2]Big = [local, global]

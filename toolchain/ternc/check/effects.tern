@@ -1,0 +1,296 @@
+// Which globals each function writes, and the two rules that use it: no
+// argument of a call aliases a global the callee writes, and a function
+// used as a value writes no globals, since a function type writes none.
+//
+// The checker records what each function does directly while it checks
+// the body. After every body is checked, the write sets are closed over
+// the call graph and the rules are checked.
+
+import maps
+import program
+import resolve
+import syntax
+
+// A global a function assigns, or passes `inout`.
+type DirectWrite (caller: maps.DeclRef, global: maps.DeclRef)
+
+// An argument that starts at a global: the argument, the global, and the
+// part of the argument that names the global.
+type GlobalArg (span: syntax.Span, global: maps.DeclRef, named: syntax.Span)
+
+// A call to a function declaration. Its arguments that start at a global
+// are count entries of the checker's call_args from first.
+type CallSite (caller: maps.DeclRef, callee: maps.DeclRef, callee_span: syntax.Span, first: u32, count: u32)
+
+// A function declaration used as a value, not called.
+type ValueUse (file: u32, span: syntax.Span, decl: maps.DeclRef)
+
+fn same_decl(a: maps.DeclRef, b: maps.DeclRef) -> bool {
+    return a.file == b.file && a.index == b.index
+}
+
+fn is_function(input: Input, d: maps.DeclRef) -> bool {
+    return match decl_of(input, d).kind {
+        function(is_unsafe: _, name: _, params: _, result: _, body: _) { true }
+        _ { false }
+    }
+}
+
+// The global a place starts at, with the expression that names it, unless
+// a dereference leaves the global's own storage.
+fn global_of(input: Input, c: Checker, fx: Fx, e: syntax.ExprId) -> ?GlobalArg ! OutOfMemory {
+    match try access_path(input, c, fx, e) {
+        some(value as path: AccessPath) {
+            match path.root {
+                global(decl as g: maps.DeclRef) {
+                    for let s: Step in path.steps {
+                        match s {
+                            deref {
+                                return ok.(value: none)
+                            }
+                            _ {
+                            }
+                        }
+                    }
+                    let parts: []syntax.ExprId = try spine(c.alloc, input, fx, e)
+                    var i: usize = parts.len
+                    for i > 0 {
+                        i -= 1
+                        match expr_res(input, fx.file, parts[i]) {
+                            some(value as r: resolve.Res) {
+                                match r {
+                                    decl(decl as d: maps.DeclRef) {
+                                        if same_decl(d, g) {
+                                            return ok.(value: some.(value: GlobalArg.(span: expr_span(input, fx, e), global: g, named: expr_span(input, fx, parts[i]))))
+                                        }
+                                    }
+                                    _ {
+                                    }
+                                }
+                            }
+                            none {
+                            }
+                        }
+                    }
+                    return ok.(value: none)
+                }
+                local(id: _) {
+                    return ok.(value: none)
+                }
+            }
+        }
+        none {
+            return ok.(value: none)
+        }
+    }
+}
+
+// The function being checked changes the place e.
+fn writes(input: Input, c: inout Checker, fx: Fx, e: syntax.ExprId) -> ! OutOfMemory {
+    match fx.decl {
+        some(value as caller: maps.DeclRef) {
+            match try global_of(input, c, fx, e) {
+                some(value as found: GlobalArg) {
+                    try push(inout c.direct_writes, DirectWrite.(caller: caller, global: found.global))
+                }
+                none {
+                }
+            }
+        }
+        none {
+        }
+    }
+    return ok
+}
+
+// Records a call whose callee is the expression callee, if that names a
+// function declaration.
+fn direct_call(input: Input, c: inout Checker, fx: Fx, callee: syntax.ExprId, args: []syntax.ExprId) -> ! OutOfMemory {
+    var caller: maps.DeclRef = maps.DeclRef.(file: 0, index: 0)
+    match fx.decl {
+        some(value as d: maps.DeclRef) {
+            caller = d
+        }
+        none {
+            return ok
+        }
+    }
+    var target: maps.DeclRef = maps.DeclRef.(file: 0, index: 0)
+    match expr_res(input, fx.file, callee) {
+        some(value as r: resolve.Res) {
+            match r {
+                decl(decl as d: maps.DeclRef) {
+                    target = d
+                }
+                _ {
+                    return ok
+                }
+            }
+        }
+        none {
+            return ok
+        }
+    }
+    if !is_function(input, target) {
+        return ok
+    }
+    let first: u32 = u32.(c.call_args.len)
+    for let a: syntax.ExprId in args {
+        match try global_of(input, c, fx, a) {
+            some(value as found: GlobalArg) {
+                try push(inout c.call_args, found)
+            }
+            none {
+            }
+        }
+    }
+    let count: u32 = u32.(c.call_args.len) - first
+    try push(inout c.call_sites, CallSite.(caller: caller, callee: target, callee_span: expr_span(input, fx, callee), first: first, count: count))
+    return ok
+}
+
+// A use of a top-level name that is not a call's callee: a function used
+// as a value.
+fn maybe_value_use(input: Input, c: inout Checker, fx: Fx, e: syntax.ExprId, d: maps.DeclRef, span: syntax.Span) -> ! OutOfMemory {
+    match maps.get_int(fx.callees, u32.(e)) {
+        some(value: _) {
+            return ok
+        }
+        none {
+        }
+    }
+    if is_function(input, d) {
+        try push(inout c.values, ValueUse.(file: fx.file, span: span, decl: d))
+    }
+    return ok
+}
+
+fn has_decl(set: []maps.DeclRef, d: maps.DeclRef) -> bool {
+    for let x: maps.DeclRef in set {
+        if same_decl(x, d) {
+            return true
+        }
+    }
+    return false
+}
+
+fn decl_before(a: maps.DeclRef, b: maps.DeclRef) -> bool {
+    return a.file < b.file || (a.file == b.file && a.index < b.index)
+}
+
+// Closes the write sets over the call graph, then checks calls and
+// function values against them.
+fn check_effects(input: Input, c: inout Checker) -> ! OutOfMemory {
+    // Each function's write set, by declaration number.
+    var sets: [..][..]maps.DeclRef = make(c.alloc)
+    for let _: usize in 0..c.types.decl_infos.len {
+        try push(inout sets, make(c.alloc))
+    }
+    for let w: DirectWrite in c.direct_writes {
+        let n: usize = usize.(decl_number(c.types, w.caller))
+        if !has_decl(sets[n], w.global) {
+            try push(inout sets[n], w.global)
+        }
+    }
+    var changed: bool = true
+    for changed {
+        changed = false
+        for let call: CallSite in c.call_sites {
+            let from: usize = usize.(decl_number(c.types, call.callee))
+            let to: usize = usize.(decl_number(c.types, call.caller))
+            for let i: usize in 0..sets[from].len {
+                let g: maps.DeclRef = sets[from][i]
+                if !has_decl(sets[to], g) {
+                    try push(inout sets[to], g)
+                    changed = true
+                }
+            }
+        }
+    }
+    // Sorted, so the first global of a set is the same in every run.
+    for let n: usize in 0..sets.len {
+        for let i: usize in 1..sets[n].len {
+            var j: usize = i
+            for j > 0 && decl_before(sets[n][j], sets[n][j - 1]) {
+                let held: maps.DeclRef = sets[n][j]
+                sets[n][j] = sets[n][j - 1]
+                sets[n][j - 1] = held
+                j -= 1
+            }
+        }
+    }
+    for let call: CallSite in c.call_sites {
+        let set: []maps.DeclRef = sets[usize.(decl_number(c.types, call.callee))]
+        for let k: u32 in 0..call.count {
+            let a: GlobalArg = c.call_args[usize.(call.first + k)]
+            if has_decl(set, a.global) {
+                let f: []u8 = file_text(input, call.caller.file, call.callee_span)
+                let g: []u8 = file_text(input, call.caller.file, a.named)
+                let arg: []u8 = file_text(input, call.caller.file, a.span)
+                try report(inout c, call.caller.file, a.span.start, try program.format_text(c.alloc, "`{f}` writes `{g}`, so `{arg}` cannot also be its argument: an argument must not alias a global the function writes"))
+            }
+        }
+    }
+    for let v: ValueUse in c.values {
+        let set: []maps.DeclRef = sets[usize.(decl_number(c.types, v.decl))]
+        if set.len > 0 {
+            let f: []u8 = file_text(input, v.file, v.span)
+            let g: []u8 = try global_shown(input, c, set[0], v.file)
+            try report(inout c, v.file, v.span.start, try program.format_text(c.alloc, "`{f}` writes {g}, so it cannot be a function value: a function type writes no globals"))
+        }
+    }
+    return ok
+}
+
+// A global as a message names it from file: by name in its own package,
+// by its package and name if it is `pub`, and otherwise as its package's
+// state, which keeps private globals private.
+fn global_shown(input: Input, c: Checker, global: maps.DeclRef, file: u32) -> []u8 ! OutOfMemory {
+    let decl: syntax.Decl = decl_of(input, global)
+    let ast: syntax.Ast = input.program.files[usize.(global.file)].ast
+    var span: syntax.Span = decl.span
+    match decl.kind {
+        global(is_shared: _, local: syntax.Local) {
+            match local.binding {
+                single(name: ?syntax.Span, ty: _) {
+                    match name {
+                        some(value as n: syntax.Span) {
+                            span = n
+                        }
+                        none {
+                        }
+                    }
+                }
+                destructure(fields: syntax.List) {
+                    let items: []u32 = syntax.items(ast.extra, fields)
+                    if items.len > 0 {
+                        let f: syntax.DestructField = ast.destructs[usize.(items[0])]
+                        span = f.field
+                        match f.rename {
+                            some(value as r: syntax.Span) {
+                                span = r
+                            }
+                            none {
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        extern_var(mutable: _, name: syntax.Span, ty: _) {
+            span = name
+        }
+        _ {
+        }
+    }
+    let name: []u8 = file_text(input, global.file, span)
+    let package: u32 = input.program.files[usize.(global.file)].package
+    let path: []u8 = input.program.packages[usize.(package)].path
+    if package == input.program.files[usize.(file)].package {
+        return program.format_text(c.alloc, "`{name}`")
+    }
+    if decl.public {
+        return program.format_text(c.alloc, "`{path}.{name}`")
+    }
+    return program.format_text(c.alloc, "the state of `{path}`")
+}

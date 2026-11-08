@@ -7,8 +7,11 @@
 //!
 //! The same pass checks the local safety rules: `unsafe`, `shared`
 //! globals, and exclusivity, the `Format` rule and constant initializers
-//! (in [`rules`]).
+//! (in [`rules`]). It also records which globals each function writes,
+//! which a last step closes over the call graph and checks (in
+//! [`effects`]).
 
+mod effects;
 mod rules;
 
 use std::collections::{HashMap, HashSet};
@@ -53,6 +56,8 @@ pub fn check(program: &Program, names: &Resolution) -> Checked {
         types: Types::new(),
         fn_tys: HashMap::new(),
         owning: HashMap::new(),
+        direct: HashMap::new(),
+        values: Vec::new(),
         diagnostics: Vec::new(),
         files: program
             .files
@@ -77,6 +82,7 @@ pub fn check(program: &Program, names: &Resolution) -> Checked {
             );
         }
     }
+    checker.check_effects();
     let mut diagnostics = checker.diagnostics;
     diagnostics.sort_by_key(|(file, d)| (file.0, d.span.start));
     Checked {
@@ -132,6 +138,9 @@ struct Fx<'a> {
     defers: Vec<Vec<LocalId>>,
     /// While checking a `defer`'s call: the locals it mentions.
     mentioned: Option<Vec<LocalId>>,
+    /// The function being checked, and the callees of its calls.
+    decl: Option<DeclRef>,
+    callees: HashSet<ExprId>,
 }
 
 impl<'a> Fx<'a> {
@@ -149,6 +158,8 @@ impl<'a> Fx<'a> {
             returning: None,
             defers: Vec::new(),
             mentioned: None,
+            decl: None,
+            callees: HashSet::new(),
         }
     }
 }
@@ -171,6 +182,10 @@ struct Checker<'a> {
     fn_tys: HashMap<DeclRef, TyId>,
     /// Which types hold a `[..]T`; see `owning`.
     owning: HashMap<TyId, bool>,
+    /// What each function writes and calls directly, and the functions
+    /// used as values; see [`effects`].
+    direct: HashMap<DeclRef, effects::Direct>,
+    values: Vec<effects::ValueUse>,
     diagnostics: Vec<(FileId, Diagnostic)>,
     files: Vec<FileTypes>,
 }
@@ -744,6 +759,7 @@ impl<'a> Checker<'a> {
         let mut fx = Fx::new(file, ast);
         match kind {
             DeclKind::Fn(f) => {
+                fx.decl = Some(decl);
                 self.decl_fn_ty(decl);
                 fx.result = f.result.map(|r| self.lower(file, r));
                 if let (Some(result), Some(ty)) = (fx.result, f.result) {
@@ -1079,6 +1095,7 @@ impl<'a> Checker<'a> {
             fx.written.remove(e);
         }
         self.require_mutable(fx, left, "assign to");
+        self.writes(fx, left);
         if op == AssignOp::Set {
             self.check(fx, right, ty);
             self.fresh(fx, right, ty);
@@ -1547,6 +1564,7 @@ impl<'a> Checker<'a> {
             }
             Some(Res::Decl(decl)) => {
                 self.use_decl(fx, e, decl, name.span);
+                self.maybe_value_use(fx, e, decl, name.span);
                 let text = self.text(fx.file, name.span);
                 self.decl_item(decl, text)
             }
@@ -1758,6 +1776,7 @@ impl<'a> Checker<'a> {
         if let Some(Res::Decl(decl)) = self.names.files[fx.file.0 as usize].exprs[e.index()] {
             let span = fx.ast.expr(e).span;
             self.use_decl(fx, e, decl, span);
+            self.maybe_value_use(fx, e, decl, span);
             return self.decl_item(decl, text);
         }
         let base = match self.expr(fx, value, None) {
@@ -2292,10 +2311,13 @@ impl<'a> Checker<'a> {
             return self.builtin_call(fx, span, name, Some(index), args, expected);
         }
         self.unsafe_callee(fx, callee);
+        fx.callees.insert(callee);
         match self.expr(fx, callee, None) {
             Item::Builtin(name) => self.builtin_call(fx, span, name, None, args, expected),
             Item::Value(ty) => match self.types.get(self.fn_underlying(ty).unwrap_or(ty)).clone() {
                 Ty::Fn(f) => {
+                    let values: Vec<ExprId> = args.iter().map(|a| a.value).collect();
+                    self.direct_call(fx, callee, &values);
                     let modes: Vec<(ExprId, Mode)> = args
                         .iter()
                         .zip(&f.params)
@@ -2360,6 +2382,7 @@ impl<'a> Checker<'a> {
                 self.error(fx.file, span, message);
             }
             self.require_mutable(fx, arg.value, "pass `inout`");
+            self.writes(fx, arg.value);
         } else {
             self.check(fx, arg.value, param);
         }
@@ -2490,6 +2513,7 @@ impl<'a> Checker<'a> {
                 self.exclusive(fx, &[(a, Mode::Inout), (args[1].value, Mode::Let)]);
                 let v = self.value(fx, a, None);
                 self.require_mutable(fx, a, "pass `inout`");
+                self.writes(fx, a);
                 match self.types.get(v).clone() {
                     Ty::Growable(elem) => {
                         if name == "push" {
@@ -2512,6 +2536,7 @@ impl<'a> Checker<'a> {
             "pop" | "clear" => {
                 let v = self.value(fx, a, None);
                 self.require_mutable(fx, a, "pass `inout`");
+                self.writes(fx, a);
                 let elem = match self.types.get(v).clone() {
                     Ty::Growable(elem) => elem,
                     Ty::Error => return Item::Value(self.types.error()),
@@ -2530,6 +2555,7 @@ impl<'a> Checker<'a> {
             "free" | "take" => {
                 let v = self.value(fx, a, None);
                 self.require_mutable(fx, a, "pass `inout`");
+                self.writes(fx, a);
                 if name == "free" {
                     if !matches!(self.types.get(v), Ty::Growable(_) | Ty::Error) {
                         let message = format!("`free` takes a `[..]T`, not `{}`", self.show(v));

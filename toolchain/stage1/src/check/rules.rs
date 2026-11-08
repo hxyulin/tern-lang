@@ -117,7 +117,7 @@ impl Checker<'_> {
     }
 
     /// The storage a place expression names, as a root and steps.
-    fn access_path(&self, fx: &Fx, e: ExprId) -> Option<(Root, Vec<Step>)> {
+    pub(super) fn access_path(&self, fx: &Fx, e: ExprId) -> Option<(Root, Vec<Step>)> {
         let res = self.names.files[fx.file.0 as usize].exprs[e.index()];
         match &fx.ast.expr(e).kind {
             ExprKind::Paren(inner) => self.access_path(fx, *inner),

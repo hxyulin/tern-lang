@@ -575,6 +575,95 @@ fn f(alloc: Allocator, b: inout Bag, s: Shape, opt: inout ?[..]u8) -> ! OutOfMem
 }
 
 #[test]
+fn calls_do_not_alias_the_globals_they_write() {
+    let main = "import counter
+
+type Pair (a: u32, b: u32)
+
+var pair: Pair = Pair.(a: 1, b: 2)
+
+var count: u32 = 0
+
+fn set_a(n: u32) {
+    pair.a = n
+}
+
+// Writes pair through a callee, two calls away.
+fn reset() {
+    set_a(0)
+}
+
+fn bump(p: inout u32) {
+    p += 1
+}
+
+fn read_pair(p: Pair) -> u32 {
+    reset()
+    return p.a
+}
+
+fn grow_count() {
+    bump(inout count)
+}
+
+// Calls itself: the write set still closes.
+fn countdown(n: u32) {
+    if n > 0 {
+        count += 1
+        countdown(n - 1)
+    }
+}
+
+fn apply(f: fn(u32), n: u32) {
+    f(n)
+}
+
+fn pure(_: u32) {
+}
+
+fn run() -> u32 {
+    let a: u32 = read_pair(pair)
+    countdown(count)
+    bump(inout pair.b)
+    apply(pure, 1)
+    apply(set_a, 1)
+    apply(countdown, 1)
+    apply(counter.add, 1)
+    let hit: fn() = counter.hit
+    hit()
+    grow_count()
+    return a
+}
+";
+    let counter = "var hits: u32 = 0
+
+pub var total: u32 = 0
+
+pub fn hit() {
+    hits += 1
+}
+
+pub fn add(n: u32) {
+    total += n
+}
+";
+    assert_eq!(
+        messages(
+            "global_writes",
+            &[("main.tern", main), ("counter/counter.tern", counter)]
+        ),
+        [
+            "`read_pair` writes `pair`, so `pair` cannot also be its argument: an argument must not alias a global the function writes",
+            "`countdown` writes `count`, so `count` cannot also be its argument: an argument must not alias a global the function writes",
+            "`set_a` writes `pair`, so it cannot be a function value: a function type writes no globals",
+            "`countdown` writes `count`, so it cannot be a function value: a function type writes no globals",
+            "`counter.add` writes `counter.total`, so it cannot be a function value: a function type writes no globals",
+            "`counter.hit` writes the state of `counter`, so it cannot be a function value: a function type writes no globals",
+        ]
+    );
+}
+
+#[test]
 fn globals_are_constant() {
     let source = "type Color enum {
     red

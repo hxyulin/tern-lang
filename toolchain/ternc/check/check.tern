@@ -7,7 +7,9 @@
 //
 // The same pass checks the local safety rules: `unsafe`, `shared`
 // globals, exclusivity, the `Format` rule and constant initializers (in
-// rules.tern). Expressions are in expr.tern.
+// rules.tern). It also records which globals each function writes, which
+// a last step closes over the call graph and checks (in effects.tern).
+// Expressions are in expr.tern.
 
 import maps
 import program
@@ -61,6 +63,12 @@ type Checker (
     files: [..]FileTypes,
     // Which types hold a `[..]T`, as 1 or 0; see owning.
     owning: maps.IntMap,
+    // What each function writes and calls directly, and the functions used
+    // as values; see effects.tern.
+    direct_writes: [..]DirectWrite,
+    call_sites: [..]CallSite,
+    call_args: [..]GlobalArg,
+    values: [..]ValueUse,
 )
 
 // A local: its type, whether it can change, and whether it holds its own
@@ -94,6 +102,10 @@ type Fx (
     // While checking a `defer`'s call: the locals it mentions.
     collecting: bool,
     mentioned: [..]u32,
+    // The function being checked, and the callees of its calls, by
+    // expression.
+    decl: ?maps.DeclRef,
+    callees: maps.IntMap,
 )
 
 // Which arms a `match` has covered.
@@ -110,6 +122,10 @@ pub fn check(alloc: Allocator, p: inout program.Program, names: inout resolve.Re
         found: make(alloc),
         files: make(alloc),
         owning: maps.new_ints(alloc),
+        direct_writes: make(alloc),
+        call_sites: make(alloc),
+        call_args: make(alloc),
+        values: make(alloc),
     )
     for let _: usize in 0..c.types.decl_infos.len {
         try push(inout c.fn_tys, none)
@@ -131,6 +147,7 @@ pub fn check(alloc: Allocator, p: inout program.Program, names: inout resolve.Re
             try check_decl(input, inout c, d, decls[index].kind)
         }
     }
+    try check_effects(input, inout c)
     // Stable: problems at one place keep the order they were found.
     let sorted: []Found = try sort_found(alloc, c.found)
     var diagnostics: [..]program.Diagnostic = make(alloc)
@@ -1057,6 +1074,8 @@ fn new_fx(c: Checker, file: u32) -> Fx {
         defers: make(c.alloc),
         collecting: false,
         mentioned: make(c.alloc),
+        decl: none,
+        callees: maps.new_ints(c.alloc),
     )
 }
 
@@ -1066,6 +1085,7 @@ fn check_decl(input: Input, c: inout Checker, decl: maps.DeclRef, kind: syntax.D
     let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     match kind {
         function(is_unsafe: _, name: syntax.Span, params: syntax.List, result: ?syntax.TypeId, body: syntax.Block) {
+            fx.decl = some.(value: decl)
             let _: TyId = try decl_fn_ty(input, inout c, decl)
             fx.result = try lower_opt(input, inout c, file, result)
             match result {
@@ -1604,6 +1624,7 @@ fn assign_stmt(input: Input, c: inout Checker, fx: inout Fx, left: syntax.ExprId
         try mark(inout fx.written, u32.(e), -1)
     }
     try require_mutable(input, inout c, fx, left, "assign to")
+    try writes(input, inout c, fx, left)
     if op == syntax.AssignOp.set {
         let _: TyId = try check_expect(input, inout c, inout fx, right, ty)
         try fresh(input, inout c, inout fx, right, ty)
