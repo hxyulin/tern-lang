@@ -77,10 +77,12 @@ pub fn write_byte(b: u8) {
     }
 }
 
-// Prints an interpolated string. Nothing is allocated: fmt calls
-// write_byte for each byte of the text.
+// Prints an interpolated string. Nothing is allocated: fmt.chunks
+// formats each integer into a buffer inside the iterator.
 pub fn print(f: Format) {
-    fmt.each_byte(f, write_byte)
+    for let chunk: []u8 in fmt.chunks(f) {
+        write_str(chunk)
+    }
 }
 
 pub fn write_str(s: []u8) {

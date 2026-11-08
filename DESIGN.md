@@ -635,9 +635,7 @@ let k: Kind = match op {
 - The user asked for a "bail" function. `panic` is used because `bail`
   means an early error return in Rust's anyhow crate.
 
-**Open, with the runtime:** what stopping does on each target. Likely a
-message with the source location and an abort on hosted targets, and a
-handler the program provides on bare metal.
+What a panic reports and what happens next is in [Runtime](#runtime).
 
 ### No user generics; built-in generic types
 
@@ -797,7 +795,7 @@ pub fn reset() { ... }
 - `@name` is one token, so a highlighter needs only the lexer.
 
 Attributes so far: `@packed`, `@align(N)`, `@export`, `@export("name")`,
-`@section("name")`, `@interrupt`.
+`@section("name")`, `@interrupt`, `@panic_handler`.
 
 ### C layout for every record
 
@@ -1424,8 +1422,32 @@ let s: [..]u8 = try format(alloc, "x={x}")   // owned text, explicitly
 - Rejected: interpolation that returns an allocated string. Every literal
   would hide an allocation, and targets without a heap could not use it.
 
-**Open:** the API for consuming a `Format`, and how helpers such as
-`hex(a, 8)` produce text.
+**Decided (2026-11-08):** how code uses a `Format`.
+
+- A `Format` can only be a parameter. It cannot be stored in a variable
+  or field, or returned, because it points at values in the frame where
+  the literal was written. Rust's `fmt::Arguments` has the same limit.
+  The check is local. It is the one place where a quiet dangle would be
+  easy to write and hard to see in review, so the rule stays although
+  temporal safety is otherwise unchecked.
+- Code reads one with an iterator. Literal parts come out as views of
+  the literal; integers are formatted into a small buffer inside the
+  iterator. A `for` loop can use any local state, such as a file
+  handle, where a function value could not capture it.
+
+  ```
+  pub fn print(f: Format) {
+      for let chunk: []u8 in fmt.chunks(f) {
+          write_str(chunk)
+      }
+  }
+  ```
+
+- `{}` accepts integers, `bool`, `[]u8`, a `Format` parameter passed on,
+  and a small closed set of built-in formatters such as `hex(n, digits)`.
+- User types are not interpolated. Code interpolates their fields, or
+  writes a function such as `show(p: Point, out: inout [..]u8)`.
+  Interpolating user types needs traits or generics.
 
 ### No built-in map
 
@@ -1495,6 +1517,75 @@ Rejected on 2026-11-08:
 - **Second-class views with `uses` lists** (this design until
   2026-11-08): see [Temporal safety](#temporal-safety-not-checked).
 
+## Runtime
+
+**Decided (2026-11-08).** The runtime is small: a panic path and, on
+hosted targets, an entry point. Everything else is library code.
+
+### What a panic reports
+
+The message, the file, line and column, and the enclosing function. The
+user proposed reporting where the panic was called from.
+
+```
+panic: unknown operator
+  at parse_op (calc/parse.tern:42:15)
+```
+
+- The location is a constant the compiler fills in at each call site.
+  The caller passes nothing and nothing is computed at runtime.
+- Traps carry the values: `index 5 out of bounds for length 3`. The
+  compiler builds the message as a `Format`, so no heap is needed.
+- No backtrace in the first version. It needs unwind tables or frame
+  pointers, and can be added on hosted targets without language changes.
+- Each panic site stores its file and function name as static data. A
+  build setting may later shorten this to an address on small chips; that
+  is a toolchain choice.
+
+### After the report
+
+- The program aborts. Nothing unwinds and pending `defer`s do not run,
+  as in Zig and Rust's `panic = abort`. Unwinding would give every
+  `defer` a second cleanup path and cost code size everywhere.
+- On a hosted target the operating system reclaims memory and files, and
+  a core dump stays possible.
+- A panic inside the panic handler halts at once without printing.
+
+### The panic handler
+
+On a hosted target the report goes to stderr. A bare-metal program says
+where it goes:
+
+```
+@panic_handler
+fn on_panic(info: PanicInfo) {
+    board.print("panic: {info.message}\r\n")
+}
+```
+
+- `PanicInfo` is a built-in record:
+  `(message: Format, file: []u8, line: u32, column: u32, function: []u8)`.
+- `@panic_handler` picks the function the runtime calls. That is a
+  linking choice, so it fits the rule that attributes never change
+  meaning.
+- Hosted targets have a default handler, which a program may replace. A
+  bare-metal program must provide one; a missing handler is a link error.
+- If the handler returns, the runtime halts: an abort on hosted targets,
+  a loop on bare metal. The language needs no "never returns" type.
+
+### Entry point
+
+- Hosted: `fn main() -> u8`, whose result is the exit status. It is the
+  only form: no `main()` without a result, and no `main() -> ! E`, since
+  printing an arbitrary error type needs formatting the language lacks.
+- Bare metal: the language defines no entry point. Startup code calls
+  what it exports, such as `@export("main")`. The reset handler, clearing
+  `.bss` and the vector table are board code; `extern let` covers the
+  linker symbols they need.
+- Arguments and environment are library functions: `os.args() -> [][]u8`
+  and `os.env(name) -> ?[]u8`. They return views of memory the operating
+  system set up, which lives as long as the program.
+
 ## Compiler design
 
 **Leaning**, all from the compile-time goal:
@@ -1543,9 +1634,7 @@ Not in the first version. `[T]` is reserved for type arguments.
 
 ## Open questions
 
-- The API for consuming a `Format`, and how helpers such as `hex`
-  produce text.
-- What `panic` does on each target.
+- The project file's format.
 - Nested functions (see Deferred).
 - The language's name.
 

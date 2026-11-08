@@ -21,6 +21,13 @@ let prompt: []u8 = "> "
 // 115200 baud from a 48 MHz clock.
 let baud_divisor: u32 = 26
 
+// The board has no stderr, so a panic is reported on the serial port.
+// The runtime halts when this returns.
+@panic_handler
+fn on_panic(info: PanicInfo) {
+    board.print("\r\npanic: {info.message}\r\n  at {info.function} ({info.file}:{info.line})\r\n")
+}
+
 @export("main")
 fn main() {
     board.init(baud_divisor)
