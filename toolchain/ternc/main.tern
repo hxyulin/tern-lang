@@ -5,6 +5,7 @@
 import std.heap
 import std.io
 import std.os
+import std.utf8
 import syntax
 
 fn main() -> u8 {
@@ -52,6 +53,17 @@ fn read_all(alloc: Allocator, path: []u8) -> [..]u8 ! io.Error {
 // Prints the tokens to stdout and the problems to stderr. The status is 1
 // if there are problems.
 fn lex_text(path: []u8, text: []u8) -> u8 ! OutOfMemory {
+    let valid: usize = utf8.valid_up_to(text)
+    if valid < text.len {
+        // Report the encoding alone, against the text before it.
+        let before: []u8 = text[..valid]
+        var starts: [..]u32 = try syntax.line_starts(heap.c_allocator, before)
+        defer free(sink starts)
+        render_head(path, starts, u32.(valid))
+        io.eprint("the file is not UTF-8 from here on; source files are UTF-8")
+        render_tail(before, starts, u32.(valid))
+        return ok.(value: 1)
+    }
     var starts: [..]u32 = try syntax.line_starts(heap.c_allocator, text)
     defer free(sink starts)
     let lexed: syntax.Lexed = try syntax.lex(heap.c_allocator, text)
@@ -80,9 +92,18 @@ fn lex_text(path: []u8, text: []u8) -> u8 ! OutOfMemory {
 // Prints path:line:column: error: message, then the source line with a
 // caret under the start of the problem.
 fn render(path: []u8, text: []u8, starts: []u32, d: syntax.Diagnostic) {
-    let pos: syntax.Position = syntax.position(starts, d.start)
-    io.eprint("{path}:{pos.line}:{pos.column}: error: ")
+    render_head(path, starts, d.start)
     print_problem(d.problem)
+    render_tail(text, starts, d.start)
+}
+
+fn render_head(path: []u8, starts: []u32, at: u32) {
+    let pos: syntax.Position = syntax.position(starts, at)
+    io.eprint("{path}:{pos.line}:{pos.column}: error: ")
+}
+
+fn render_tail(text: []u8, starts: []u32, at: u32) {
+    let pos: syntax.Position = syntax.position(starts, at)
     let line: []u8 = syntax.line_text(text, starts, pos.line)
     io.eprint("\n    {line}\n    ")
     var pad: usize = usize.(pos.column) - 1

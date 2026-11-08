@@ -47,18 +47,19 @@ pub const BUILTIN_TYPES: &[&str] = &[
     "OutOfMemory",
 ];
 
-/// The built-in names that are values or functions.
-pub const BUILTIN_VALUES: &[&str] = &[
-    "true",
-    "false",
-    "none",
-    "some",
-    "ok",
-    "err",
+/// The built-in values. Like the types, no local may take their names.
+pub const BUILTIN_VALUES: &[&str] = &["true", "false", "none", "some", "ok", "err"];
+
+/// The built-in functions. They are only ever called, so a local may take
+/// one of their names: a bare name means the local, and a call means the
+/// built-in unless the package declares that name.
+pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "panic",
     "make",
     "push",
+    "pop",
     "append",
+    "clear",
     "free",
     "copy",
     "fill",
@@ -85,6 +86,7 @@ fn builtin(name: &str) -> Option<&'static str> {
     BUILTIN_TYPES
         .iter()
         .chain(BUILTIN_VALUES)
+        .chain(BUILTIN_FUNCTIONS)
         .find(|b| **b == name)
         .copied()
 }
@@ -125,6 +127,11 @@ pub struct FileNames {
     /// The `shared` global each name in a `lock` takes, keyed by the start
     /// of the name.
     pub locks: HashMap<u32, DeclRef>,
+    /// A call to a built-in function made while a local has its name,
+    /// keyed by the start of the callee's name. The checker rejects the
+    /// call if that local is a function value, which the reader might
+    /// take it to call.
+    pub hidden_locals: HashMap<u32, LocalId>,
 }
 
 pub struct Resolution {
@@ -175,6 +182,7 @@ pub fn resolve(program: &Program) -> Resolution {
                 locals: Vec::new(),
                 bindings: HashMap::new(),
                 locks: HashMap::new(),
+                hidden_locals: HashMap::new(),
             },
             diagnostics: Vec::new(),
         };
@@ -374,7 +382,7 @@ impl<'a> FileResolver<'a> {
                 name.span,
                 format!("`{text}` is an imported package; pick another name"),
             );
-        } else if builtin(text).is_some() {
+        } else if BUILTIN_TYPES.contains(&text) || BUILTIN_VALUES.contains(&text) {
             self.error(
                 name.span,
                 format!("`{text}` is a built-in name; pick another name"),
@@ -417,6 +425,49 @@ impl<'a> FileResolver<'a> {
             return import.package.map(Res::Package);
         }
         builtin(text).map(Res::Builtin)
+    }
+
+    /// A call's callee. A built-in function's name, bare or with an
+    /// argument in brackets as in `fill[4](0)`, skips the locals: a local
+    /// of that name does not hide the built-in.
+    fn callee(&mut self, id: ExprId) {
+        let (name, bracketed) = match &self.ast.expr(id).kind {
+            ExprKind::Name(name) => (*name, None),
+            ExprKind::Index {
+                value,
+                index: index @ (Index::Type(_) | Index::Expr(_)),
+            } => match self.ast.expr(*value).kind {
+                ExprKind::Name(name) => (name, Some((*value, index))),
+                _ => return self.expr(id),
+            },
+            _ => return self.expr(id),
+        };
+        let text = self.name_text(name);
+        let Some(&builtin) = BUILTIN_FUNCTIONS.iter().find(|b| **b == text) else {
+            return self.expr(id);
+        };
+        let res = match self.package_scope().get(text) {
+            Some(decl) => Res::Decl(*decl),
+            None => {
+                let local = self.locals.iter().flatten().find(|l| l.name == text);
+                if let Some(local) = local {
+                    let id = local.id;
+                    self.out.hidden_locals.insert(name.span.start, id);
+                }
+                Res::Builtin(builtin)
+            }
+        };
+        match bracketed {
+            None => self.out.exprs[id.index()] = Some(res),
+            Some((value, index)) => {
+                self.out.exprs[value.index()] = Some(res);
+                match index {
+                    Index::Type(ty) => self.ty(*ty),
+                    Index::Expr(e) => self.expr(*e),
+                    Index::Slice { .. } => unreachable!("matched above"),
+                }
+            }
+        }
     }
 
     /// `pkg.name`: a member of an imported package.
@@ -797,7 +848,7 @@ impl<'a> FileResolver<'a> {
                 }
             }
             ExprKind::Call { callee, args } => {
-                self.expr(*callee);
+                self.callee(*callee);
                 for arg in args {
                     self.expr(arg.value);
                 }

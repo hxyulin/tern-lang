@@ -277,6 +277,10 @@ now. UTF-8 and UTF-16 handling goes in the standard library until a need
 for language support shows up. ASCII is a subset of UTF-8, so every literal
 stays valid if UTF-8 moves into the language later.
 
+- **Source files are UTF-8** (decided 2026-11-08). The compiler checks
+  before lexing and reports the first byte that breaks UTF-8 as the
+  file's only error. Outside comments, the lexer still accepts ASCII
+  only.
 - A string literal is a `[]u8`, a view of static bytes, with no encoding
   guarantee. There is no separate `str` type (decided 2026-11-08, the
   user's proposal): one byte view type covers text and binary data, and
@@ -779,10 +783,19 @@ innermost first, then the package's top-level declarations, the file's
 imports, and the built-in names.
 
 - **No shadowing.** A local never reuses a name already in scope: an
-  outer local, a parameter, a top-level declaration, an import or a
-  built-in. A reader never has to work out which `x` a line means; `as`
-  covers the nested `match` case. A top-level declaration may reuse a
-  built-in name, as in Go, so `std.libc` can declare C's `free`.
+  outer local, a parameter, a top-level declaration, an import, a
+  built-in type or a built-in value. A reader never has to work out
+  which `x` a line means; `as` covers the nested `match` case. A
+  top-level declaration may reuse a built-in name, as in Go, so
+  `std.libc` can declare C's `free`.
+- **Built-in functions are names only in call position.** Decided on
+  2026-11-08, after `offset` could not name a parameter. A local may
+  take a built-in function's name: bare `offset` means the local, and
+  `offset(...)` means the built-in unless the package declares its own
+  `offset`. Calling a local function value that has a built-in's name
+  is an error, since the call would not reach it. Rejected: Go's rule,
+  where a local hides the built-in in its scope, which breaks the rule
+  against shadowing.
 - **Unused names are errors**, as in Go: imports, locals, parameters and
   payload bindings. `_` discards on purpose: `fn f(_: u8)`,
   `err(error: _)`. Parameters are included because the user-chosen
@@ -799,7 +812,7 @@ predeclared, none keywords.
 | Types | `i8` `i16` `i32` `i64` `isize` `u8` `u16` `u32` `u64` `usize` `f32` `f64` `bool` `Allocator` `Format` `PanicInfo` `OutOfMemory` |
 | Values | `true` `false` `none` `some` `ok` `err` |
 | Control | `panic` |
-| Growable arrays | `make` `push` `append` `free` `copy` |
+| Growable arrays | `make` `push` `pop` `append` `clear` `free` `copy` |
 | Arrays | `fill` |
 | Pointers | `from_address` `from_pointer` `offset` `cast` `volatile_load` `volatile_store` |
 | Conversions | `truncate` `c_string` |
@@ -1496,6 +1509,10 @@ Jai's. `[..]u8` is the owned string; there is no separate `String`.
 - It has `.len`, and passing it where a `[]T` is expected makes a view.
 - It needs no generic type syntax such as `List[T]`, which the grammar
   does not have.
+- `pop(inout v)` removes the last element and returns it as a `?T`,
+  moving it out if it moves. `clear(inout v)` sets the length to 0 and
+  keeps the memory; it is an error when the elements own memory, since
+  they would leak. Added on 2026-11-08 for the lexer's stack.
 - `push` can move the elements, which leaves earlier views of them
   dangling. Nothing checks this (see
   [Temporal safety](#temporal-safety-not-checked)); a debug allocator
@@ -1796,17 +1813,22 @@ not. The user agreed to each.
 - **What moves.** A `move type` moves, and so does a type that holds a
   `[..]T` or a `move type`, directly or through a record, tuple, array,
   enum payload, optional or result. `io.File` is a `move type`.
-- **A move takes a whole local.** Moving a moving type out of a field,
-  element, pointer or global is an error; code destructures the record
-  instead, or passes the whole record `sink`. A parameter passed
-  without `sink`, an `inout` parameter and a `for` binding do not own
-  their value, so they cannot be moved either.
+- **A move takes a local, or a field of one.** Changed on 2026-11-08
+  from whole locals only, after the lexer port had to destructure a
+  record to free its `[..]T` fields. `free(sink l.tokens)` moves one
+  field of a local the function owns: using `l.tokens`, or `l` as a
+  whole, is then an error, while `l`'s other fields stay usable, and
+  `l.tokens = ...` restores it. Moving out of an element, a pointer or
+  a global is still an error. A parameter passed without `sink`, an
+  `inout` parameter and a `for` binding do not own their value, so
+  neither they nor their fields can be moved.
 - **Where values move.** Binding, returning, assigning, storing in a
   construction or array literal, `push`, and passing `sink`. Passing to
   a plain parameter, interpolating and comparing do not move. `sink`
   moves a local of any type; the others move only a moving type.
-- **Flow.** A local moved on any path that reaches a point counts as
-  moved there; `x = ...` gives it a value again. A local declared
+- **Flow.** A local or field moved on any path that reaches a point
+  counts as moved there; `x = ...` or `x.f = ...` gives it a value
+  again. A local declared
   outside a loop and moved on a path back to the loop's top is an
   error. A `defer` moves what it passes `sink` when its block ends, so
   the value stays usable until then.
@@ -1888,25 +1910,27 @@ lexer and then the parser.
   `ternc lex FILE` prints, errors included. A stage 1 test builds ternc,
   plain and with `-O`, and requires identical stdout, stderr and exit
   status on every tern file in the repository, every tree-sitter corpus
-  file, and `toolchain/stage1/tests/lex/malformed.tern`, which triggers
-  every lexer error.
+  file, and the files in `toolchain/stage1/tests/lex`: `malformed.tern`
+  triggers every lexer error, and the `utf8-*` files each break UTF-8 a
+  different way.
 - **Diagnostics are enums.** A `Format` cannot be stored, so the lexer
   records a `Problem` with its values, such as
   `bad_digit(digit: u8, base: u32)`, and the driver turns it into text
   when it prints it.
-- **Std grows as needed.** The lexer needed no new std functions.
+- **Std grows as needed.** The UTF-8 check added `std.utf8`, with
+  `valid_up_to`.
 
-Friction found while porting the lexer:
+Friction found while porting the lexer, and what became of it:
 
-- `[..]T` has no `pop` or `clear`. The lexer's interpolation stack keeps
-  its own depth count instead.
+- `[..]T` had no `pop` or `clear`: both are now built-ins.
+- Freeing a record that holds `[..]T` fields took destructuring every
+  field: a field of a local can now be moved out.
+- `offset` could not name a parameter: built-in functions are now names
+  only in call position.
+- Input was not checked to be UTF-8: both compilers now check it.
 - Every `push` can fail, so every lexer function that adds a token
-  returns `! OutOfMemory` and each call takes a `try`.
-- Freeing a record that holds `[..]T` fields takes destructuring every
-  field, because a field cannot be moved out.
-- `offset` is a built-in name, so it cannot name a parameter.
-- Input is not checked to be UTF-8, as stage 1's `read_to_string` does.
-  A non-ASCII byte outside a literal is decoded leniently.
+  returns `! OutOfMemory` and each call takes a `try`. The user judged
+  this acceptable.
 
 ## Deferred
 

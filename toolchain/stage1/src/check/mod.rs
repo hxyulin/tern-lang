@@ -26,7 +26,7 @@ use crate::source::Span;
 use crate::types::{
     BuiltinNamed, EnumInfo, FnTy, IntTy, NamedDef, NamedId, NamedInfo, Ty, TyId, Types, Variant,
 };
-use moves::{LoopFlow, Moved};
+use moves::{LoopFlow, Moved, Place};
 
 pub struct Checked {
     pub types: Types,
@@ -142,12 +142,15 @@ struct Fx<'a> {
     /// union member or C global here is not read.
     written: HashSet<ExprId>,
     addressed: HashSet<ExprId>,
-    /// The local that `x = ...` gives a new value, which may have been
-    /// moved.
+    /// The name at the root of the place `x = ...` or `x.f = ...` gives
+    /// a new value, which may have been moved.
     assign_target: Option<ExprId>,
-    /// The locals moved on the way to the current point.
+    /// For a local's name at the root of `x.a.b`, the fields read, so a
+    /// read of one field is not a read of a moved sibling.
+    field_uses: HashMap<ExprId, Vec<String>>,
+    /// The places moved on the way to the current point.
     moved: Moved,
-    /// The locals a `defer` in an enclosing block passes `sink`.
+    /// The places a `defer` in an enclosing block passes `sink`.
     deferred: Moved,
 }
 
@@ -164,6 +167,7 @@ impl<'a> Fx<'a> {
             written: HashSet::new(),
             addressed: HashSet::new(),
             assign_target: None,
+            field_uses: HashMap::new(),
             moved: Moved::new(),
             deferred: Moved::new(),
         }
@@ -909,22 +913,22 @@ impl<'a> Checker<'a> {
     // Statements. Each returns whether it never finishes normally.
 
     fn block(&mut self, fx: &mut Fx, block: &Block) -> bool {
-        let deferred_before: HashSet<LocalId> = fx.deferred.keys().copied().collect();
+        let deferred_before: HashSet<Place> = fx.deferred.keys().cloned().collect();
         let mut diverges = false;
         for &stmt in &block.stmts {
             diverges |= self.stmt(fx, stmt);
         }
         // This block's `defer`s run at its end, and move what they sink.
-        let ended: Vec<LocalId> = fx
+        let ended: Vec<Place> = fx
             .deferred
             .keys()
-            .filter(|id| !deferred_before.contains(id))
-            .copied()
+            .filter(|place| !deferred_before.contains(place))
+            .cloned()
             .collect();
-        for id in ended {
-            let span = fx.deferred.remove(&id).expect("listed above");
+        for place in ended {
+            let span = fx.deferred.remove(&place).expect("listed above");
             if !diverges {
-                fx.moved.entry(id).or_insert(span);
+                fx.moved.entry(place).or_insert(span);
             }
         }
         diverges
@@ -1118,20 +1122,14 @@ impl<'a> Checker<'a> {
     }
 
     fn assign(&mut self, fx: &mut Fx, left: ExprId, op: AssignOp, right: ExprId) {
-        // `x = ...` gives a moved local a value again; any other
-        // assignment reads it first.
-        let whole = paren_inner(fx, left);
-        let local = match (op, &fx.ast.expr(whole).kind) {
-            (AssignOp::Set, ExprKind::Name(_)) => {
-                match self.names.files[fx.file.0 as usize].exprs[whole.index()] {
-                    Some(Res::Local(id)) => Some(id),
-                    _ => None,
-                }
-            }
+        // `x = ...` and `x.f = ...` give a moved place a value again; any
+        // other assignment reads it first.
+        let target = match op {
+            AssignOp::Set => self.local_place(fx, left),
             _ => None,
         };
-        if local.is_some() {
-            fx.assign_target = Some(whole);
+        if let Some((root, _)) = &target {
+            fx.assign_target = Some(*root);
         }
         let spine = rules::spine(fx, left);
         fx.written.extend(&spine);
@@ -1144,8 +1142,10 @@ impl<'a> Checker<'a> {
         if op == AssignOp::Set {
             self.check(fx, right, ty);
             self.consume(fx, right, ty);
-            if let Some(id) = local {
-                fx.moved.remove(&id);
+            if let Some((_, place)) = target {
+                fx.moved.retain(|moved, _| {
+                    moved.local != place.local || !moved.fields.starts_with(&place.fields)
+                });
             }
             return;
         }
@@ -1822,6 +1822,10 @@ impl<'a> Checker<'a> {
             self.use_decl(fx, e, decl, span);
             return self.decl_item(decl, text);
         }
+        // The outermost field of `x.a.b` records the path for `x`'s use.
+        if let Some((root, place)) = self.local_place(fx, e) {
+            fx.field_uses.entry(root).or_insert(place.fields);
+        }
         let base = match self.expr(fx, value, None) {
             Item::Type(ty) => return self.variant(fx, ty, name),
             Item::Value(ty) => ty,
@@ -2344,6 +2348,7 @@ impl<'a> Checker<'a> {
         args: &[Arg],
         expected: Option<TyId>,
     ) -> Item {
+        self.hidden_local(fx, callee);
         // A built-in with a type argument: truncate[u8](x).
         if let ExprKind::Index { value, index } = &fx.ast.expr(callee).kind
             && let Some(Res::Builtin(name)) =
@@ -2447,6 +2452,33 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// A call to a built-in function while a local function value has its
+    /// name: the call means the built-in, which a reader could miss.
+    fn hidden_local(&mut self, fx: &Fx, callee: ExprId) {
+        let name = match &fx.ast.expr(callee).kind {
+            ExprKind::Index { value, .. } => *value,
+            _ => callee,
+        };
+        let ExprKind::Name(n) = fx.ast.expr(name).kind else {
+            return;
+        };
+        let file = &self.names.files[fx.file.0 as usize];
+        let Some(id) = file.hidden_locals.get(&n.span.start) else {
+            return;
+        };
+        let Some(info) = fx.locals.get(id) else {
+            return;
+        };
+        let ty = info.ty;
+        if matches!(self.types.get(ty), Ty::Fn(_)) || self.fn_underlying(ty).is_some() {
+            let text = self.text(fx.file, n.span);
+            let message = format!(
+                "this calls the built-in `{text}`, not the local function value `{text}`; rename the local"
+            );
+            self.error(fx.file, n.span, message);
+        }
+    }
+
     fn builtin_call(
         &mut self,
         fx: &mut Fx,
@@ -2474,7 +2506,7 @@ impl<'a> Checker<'a> {
         }
         let arity = match name {
             "make" | "panic" | "from_address" | "cast" | "truncate" | "c_string"
-            | "volatile_load" | "fill" | "free" => 1,
+            | "volatile_load" | "fill" | "free" | "pop" | "clear" => 1,
             _ => 2,
         };
         if args.len() != arity {
@@ -2487,6 +2519,7 @@ impl<'a> Checker<'a> {
         }
         let modes: &[Mode] = match name {
             "push" | "append" => &[Mode::Inout, Mode::Let],
+            "pop" | "clear" => &[Mode::Inout],
             "free" => &[Mode::Sink],
             _ => &[Mode::Let, Mode::Let],
         };
@@ -2547,6 +2580,32 @@ impl<'a> Checker<'a> {
                     }
                 }
                 oom_result
+            }
+            "pop" | "clear" => {
+                let v = self.value(fx, a, None);
+                self.require_mutable(fx, a, "pass `inout`");
+                let elem = match self.types.get(v).clone() {
+                    Ty::Growable(elem) => elem,
+                    Ty::Error => return Item::Value(self.types.error()),
+                    _ => {
+                        let message = format!("`{name}` takes a `[..]T`, not `{}`", self.show(v));
+                        self.error(fx.file, fx.ast.expr(a).span, message);
+                        return Item::Value(self.types.error());
+                    }
+                };
+                if name == "pop" {
+                    // A move-only element moves out to the caller.
+                    self.types.intern(Ty::Optional(elem))
+                } else {
+                    if self.move_only(elem) {
+                        let message = format!(
+                            "`clear` would leak the elements, since `{}` owns memory; `pop` and `free` each one instead",
+                            self.show(elem)
+                        );
+                        self.error(fx.file, span, message);
+                    }
+                    return Item::Nothing;
+                }
             }
             "free" => {
                 let v = self.value(fx, a, None);

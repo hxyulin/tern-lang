@@ -58,9 +58,7 @@ type Lexer (
     tokens: [..]Token,
     diagnostics: [..]Diagnostic,
     // One entry per open interpolation: how many { inside it are open.
-    // Only the first depth entries are in use, since [..]T has no pop.
     open_braces: [..]u32,
-    depth: usize,
 )
 
 pub fn lex(alloc: Allocator, src: []u8) -> Lexed ! OutOfMemory {
@@ -70,25 +68,16 @@ pub fn lex(alloc: Allocator, src: []u8) -> Lexed ! OutOfMemory {
         tokens: make(alloc),
         diagnostics: make(alloc),
         open_braces: make(alloc),
-        depth: 0,
     )
     let result: ! OutOfMemory = run(inout l)
-    let (
-        src: _,
-        pos: _,
-        tokens: [..]Token,
-        diagnostics: [..]Diagnostic,
-        open_braces: [..]u32,
-        depth: _,
-    ) = l
-    free(sink open_braces)
+    free(sink l.open_braces)
     match result {
         ok {
-            return ok.(value: Lexed.(tokens: tokens, diagnostics: diagnostics))
+            return ok.(value: Lexed.(tokens: l.tokens, diagnostics: l.diagnostics))
         }
         err(error: OutOfMemory) {
-            free(sink tokens)
-            free(sink diagnostics)
+            free(sink l.tokens)
+            free(sink l.diagnostics)
             return err.(error: error)
         }
     }
@@ -141,9 +130,9 @@ fn fail(l: inout Lexer, start: usize, problem: Problem) -> ! OutOfMemory {
 // Handles a line end at byte `at`: a newline, a block comment holding
 // one, or the end of the file.
 fn line_end(l: inout Lexer, at: usize) -> ! OutOfMemory {
-    if l.depth > 0 {
+    if l.open_braces.len > 0 {
         try report(inout l, at, at, Problem.line_ends_in_interpolation)
-        l.depth = 0
+        clear(inout l.open_braces)
     }
     if l.tokens.len > 0 && ends_statement(l.tokens[l.tokens.len - 1].kind) {
         let semicolon: Token = Token.(kind: TokenKind.semicolon, start: u32.(at), end: u32.(at))
@@ -244,21 +233,23 @@ fn token(l: inout Lexer) -> ! OutOfMemory {
             return fail(inout l, start, Problem.attribute_name_missing)
         }
         '{' {
-            if l.depth > 0 {
-                l.open_braces[l.depth - 1] += 1
+            let open: usize = l.open_braces.len
+            if open > 0 {
+                l.open_braces[open - 1] += 1
             }
             l.pos += 1
             return add_token(inout l, TokenKind.l_brace, start)
         }
         '}' {
             l.pos += 1
-            if l.depth == 0 {
+            let open: usize = l.open_braces.len
+            if open == 0 {
                 return add_token(inout l, TokenKind.r_brace, start)
             }
-            if l.open_braces[l.depth - 1] == 0 {
+            if l.open_braces[open - 1] == 0 {
                 return string_text(inout l, start, Opening.brace)
             }
-            l.open_braces[l.depth - 1] -= 1
+            l.open_braces[open - 1] -= 1
             return add_token(inout l, TokenKind.r_brace, start)
         }
         _ {
@@ -483,19 +474,14 @@ fn close_string(l: inout Lexer, start: usize, opening: Opening) -> ! OutOfMemory
             return add_token(inout l, TokenKind.str, start)
         }
         brace {
-            l.depth -= 1
+            let _: ?u32 = pop(inout l.open_braces)
             return add_token(inout l, TokenKind.str_end, start)
         }
     }
 }
 
 fn open_interpolation(l: inout Lexer) -> ! OutOfMemory {
-    if l.depth == l.open_braces.len {
-        try push(inout l.open_braces, 0)
-    } else {
-        l.open_braces[l.depth] = 0
-    }
-    l.depth += 1
+    try push(inout l.open_braces, 0)
     return ok
 }
 

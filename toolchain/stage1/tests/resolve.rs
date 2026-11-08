@@ -94,8 +94,8 @@ fn f(a: u8) {
         let b: u8 = 1
         let helper: u8 = b
         let io: u8 = helper
-        let make: u8 = io
-        let _: u8 = make
+        let none: u8 = io
+        let _: u8 = none
     }
 }
 ";
@@ -111,7 +111,7 @@ fn f(a: u8) {
         "{got:?}"
     );
     assert_eq!(got[3], "`io` is an imported package; pick another name");
-    assert_eq!(got[4], "`make` is a built-in name; pick another name");
+    assert_eq!(got[4], "`none` is a built-in name; pick another name");
 }
 
 #[test]

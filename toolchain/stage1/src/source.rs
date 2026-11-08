@@ -1,7 +1,9 @@
 //! Source files, byte spans and line/column lookup.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::diagnostic::Diagnostic;
 
 /// A byte range in one source file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -69,4 +71,26 @@ impl SourceFile {
     pub fn slice(&self, span: Span) -> &str {
         &self.text[span.range()]
     }
+}
+
+/// Reads a source file. Source is UTF-8: if it is not, the text stops
+/// before the first byte that breaks it, and the diagnostic points there.
+/// The caller then reports that error alone.
+pub fn read(path: &Path) -> std::io::Result<(SourceFile, Option<Diagnostic>)> {
+    let bytes = std::fs::read(path)?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(text) => (SourceFile::new(path, text), None),
+        Err(e) => {
+            let at = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(at);
+            let text = String::from_utf8(bytes).expect("valid up to here");
+            let span = Span::new(at, at);
+            let error = Diagnostic::error(
+                span,
+                "the file is not UTF-8 from here on; source files are UTF-8",
+            );
+            (SourceFile::new(path, text), Some(error))
+        }
+    })
 }

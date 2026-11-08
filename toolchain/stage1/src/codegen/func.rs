@@ -2347,6 +2347,76 @@ impl<'a> FnGen<'_, 'a> {
                 self.switch_to(after, true);
                 V::M(out)
             }
+            "pop" => {
+                let vty = self.ty(arg(0));
+                let core = self.g.core(vty);
+                let Ty::Growable(elem) = self.g.types.get(core).clone() else {
+                    return self.dummy(ty);
+                };
+                let size = self.g.layout(elem).size;
+                let v = self.addr_of(arg(0));
+                let len_addr = self.offset(v, 8);
+                let len = self.ins().load(Type::I64, len_addr);
+                let zero = self.iconst(Type::I64, 0);
+                let has = self.ins().icmp(IntCC::Ne, len, zero);
+                // The result is built in a slot, which also serves a `?*T`
+                // that is a single pointer.
+                let out = self.temp(ty);
+                let (some, kind) = self.g.variant(ty, "some");
+                let (none, _) = self.g.variant(ty, "none");
+                let take = self.f.create_block();
+                let empty = self.f.create_block();
+                let after = self.f.create_block();
+                self.brif(has, take, empty);
+                self.switch_to(take, true);
+                let one = self.iconst(Type::I64, 1);
+                let new_len = self.ins().isub(len, one);
+                self.ins().store(new_len, len_addr);
+                let ptr = self.ins().load(Type::Ptr, v);
+                let size_v = self.usize_const(size);
+                let off = self.ins().imul(new_len, size_v);
+                let at = self.ins().ptradd(ptr, off);
+                match kind {
+                    EnumKind::Tagged {
+                        tag,
+                        payload_offset,
+                    } => {
+                        let t = self.iconst(tag, some.tag);
+                        self.ins().store(t, out);
+                        let payload = some.payload.expect("some has a payload");
+                        let (_, field_off) = self.g.field(payload, "value");
+                        let dst = self.offset(out, payload_offset + field_off);
+                        let x = self.load(at, elem);
+                        self.store(x, elem, dst, false);
+                    }
+                    _ => {
+                        let p = self.ins().load(Type::Ptr, at);
+                        self.ins().store(p, out);
+                    }
+                }
+                self.jump(after);
+                self.switch_to(empty, true);
+                match kind {
+                    EnumKind::Tagged { tag, .. } => {
+                        let t = self.iconst(tag, none.tag);
+                        self.ins().store(t, out);
+                    }
+                    _ => {
+                        let null = self.null();
+                        self.ins().store(null, out);
+                    }
+                }
+                self.jump(after);
+                self.switch_to(after, true);
+                self.load(out, ty)
+            }
+            "clear" => {
+                let v = self.addr_of(arg(0));
+                let zero = self.iconst(Type::I64, 0);
+                let len_addr = self.offset(v, 8);
+                self.ins().store(zero, len_addr);
+                V::Unit
+            }
             "free" => {
                 let vty = self.ty(arg(0));
                 let core = self.g.core(vty);

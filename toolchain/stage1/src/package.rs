@@ -160,21 +160,32 @@ impl Loader {
 
     fn parse_file(&mut self, path: PathBuf, package: PackageId) -> FileId {
         let id = FileId(u32::try_from(self.program.files.len()).expect("few files"));
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
+        let source = match crate::source::read(&path) {
+            Ok((source, None)) => source,
+            Ok((source, Some(error))) => {
+                // Report the encoding alone, and parse nothing.
+                self.program.diagnostics.push((id, error));
+                let empty = parser::parse("");
+                self.program.files.push(File {
+                    source,
+                    ast: empty.ast,
+                    package,
+                });
+                return id;
+            }
             Err(e) => {
                 self.program
                     .errors
                     .push(format!("cannot read {}: {e}", path.display()));
-                String::new()
+                SourceFile::new(path, String::new())
             }
         };
-        let parsed = parser::parse(&text);
+        let parsed = parser::parse(&source.text);
         self.program
             .diagnostics
             .extend(parsed.diagnostics.into_iter().map(|d| (id, d)));
         self.program.files.push(File {
-            source: SourceFile::new(path, text),
+            source,
             ast: parsed.ast,
             package,
         });

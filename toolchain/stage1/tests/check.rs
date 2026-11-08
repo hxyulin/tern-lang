@@ -519,7 +519,6 @@ fn payloads(alloc: Allocator, maybe: ?[..]u8) {
             "cannot move `borrowed`: the parameter is borrowed; declare it `sink` to own it",
             "cannot move `edit` out of an `inout` parameter: the caller still owns it",
             "`c` is used after it was moved on line 20",
-            "cannot move a `[..][]u8` out of a field, element or pointer; move the whole value, or destructure it",
             "`e` is already passed `sink` by the `defer` on line 30",
             "`m` is used after it was moved on line 34",
             "`kept` is moved inside a loop, so the next pass would use it moved; give it a new value before the pass ends",
@@ -665,7 +664,84 @@ fn f() {
         one("move_types", source),
         [
             "`a` is used after it was moved on line 10",
-            "`held` is used after it was moved on line 13",
+            "`held.count` is used after `held` was moved on line 13",
+        ]
+    );
+}
+
+#[test]
+fn pop_and_clear() {
+    let source = "type Callback fn()
+
+fn tick() {
+}
+
+fn f(alloc: Allocator) {
+    var nums: [..]u32 = make(alloc)
+    let _: ?u32 = pop(inout nums)
+    clear(inout nums)
+    var lists: [..][..]u8 = make(alloc)
+    clear(inout lists)
+    var fixed: [2]u8 = [1, 2]
+    let _: ?u8 = pop(inout fixed)
+    let free: u32 = 1
+    let offset: u32 = free
+    let _: u32 = offset
+    let push: Callback = tick
+    push()
+    let _: Callback = push
+    free(sink nums)
+    free(sink lists)
+}
+";
+    assert_eq!(
+        one("pop_and_clear", source),
+        [
+            "`clear` would leak the elements, since `[..]u8` owns memory; `pop` and `free` each one instead",
+            "`pop` takes a `[..]T`, not `[2]u8`",
+            "this calls the built-in `push`, not the local function value `push`; rename the local",
+            "`push` takes 2 arguments, found 0",
+        ]
+    );
+}
+
+#[test]
+fn partial_moves() {
+    let source = "type Pair (a: [..]u8, b: [..]u8, n: u32)
+
+fn read(_: []u8) {
+}
+
+fn f(alloc: Allocator, borrowed: Pair, edit: inout Pair) {
+    var p: Pair = Pair.(a: make(alloc), b: make(alloc), n: 0)
+    free(sink p.a)
+    read(p.b)
+    let _: u32 = p.n
+    read(p.a)
+    p.a = make(alloc)
+    read(p.a)
+    free(sink p.a)
+    let _: Pair = p
+    free(sink borrowed.a)
+    free(sink edit.b)
+    var q: Pair = Pair.(a: make(alloc), b: make(alloc), n: 0)
+    defer free(sink q.b)
+    free(sink q.a)
+    free(sink q.b)
+    var r: Pair = Pair.(a: make(alloc), b: make(alloc), n: 0)
+    free(sink r.a)
+    r = Pair.(a: make(alloc), b: make(alloc), n: 1)
+    let _: Pair = r
+}
+";
+    assert_eq!(
+        one("partial_moves", source),
+        [
+            "`p.a` is used after it was moved on line 8",
+            "`p` is used after `p.a` was moved on line 14",
+            "cannot move `borrowed.a`: the parameter is borrowed; declare it `sink` to own it",
+            "cannot move `edit.b` out of an `inout` parameter: the caller still owns it",
+            "`q.b` is already passed `sink` by the `defer` on line 19",
         ]
     );
 }

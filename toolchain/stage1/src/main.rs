@@ -32,14 +32,14 @@ fn main() -> ExitCode {
         [command, path] => (command.as_str(), path),
         _ => return usage(),
     };
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let file = match stage1::source::read(Path::new(path)) {
+        Ok((file, Some(error))) => return report(&file, &[error]),
+        Ok((file, None)) => file,
         Err(e) => {
             eprintln!("ternc: cannot read {path}: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let file = SourceFile::new(path, text);
     match command {
         "lex" => lex(&file),
         "parse" => parse(&file),

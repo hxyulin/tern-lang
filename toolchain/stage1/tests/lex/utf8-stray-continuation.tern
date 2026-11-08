@@ -1,0 +1,2 @@
+let a: u8 = 1 // caf√© is fine
+let b: u8 = 2 // Ä is not

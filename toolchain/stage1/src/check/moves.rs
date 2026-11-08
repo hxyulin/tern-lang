@@ -1,10 +1,13 @@
 //! Moves. A value passed `sink` cannot be used afterward, and a `move
 //! type`, or a type that holds one or a `[..]T`, moves instead of copying.
 //!
-//! The check follows each function's control flow. It records the locals
-//! moved on the way to each point; branches join by taking every local
-//! moved on any path that reaches the join. A move of a whole local is
-//! the only kind: a field, element or global cannot be moved out of.
+//! The check follows each function's control flow. It records the places
+//! moved on the way to each point; branches join by taking every place
+//! moved on any path that reaches the join. A place is a local the
+//! function owns, or a field of one, as in `free(sink l.tokens)`: the
+//! other fields stay usable, and assigning the field restores it. An
+//! element, a global, or what a pointer or borrowed parameter holds
+//! cannot be moved out of.
 
 use std::collections::HashMap;
 
@@ -14,8 +17,36 @@ use crate::resolve::LocalId;
 use crate::source::Span;
 use crate::types::{NamedDef, NamedId, Ty, TyId};
 
-/// Moved locals, each with where it moved.
-pub(super) type Moved = HashMap<LocalId, Span>;
+/// A local, or a field of it reached through `.name` steps.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Place {
+    pub local: LocalId,
+    pub fields: Vec<String>,
+}
+
+impl Place {
+    pub fn whole(local: LocalId) -> Place {
+        Place {
+            local,
+            fields: Vec::new(),
+        }
+    }
+
+    /// Whether one place holds the other, or they are the same.
+    pub fn overlaps(&self, other: &Place) -> bool {
+        self.local == other.local && self.fields.iter().zip(&other.fields).all(|(a, b)| a == b)
+    }
+
+    /// Whether `self` holds `other` and is not the same place.
+    fn strictly_holds(&self, other: &Place) -> bool {
+        self.local == other.local
+            && self.fields.len() < other.fields.len()
+            && other.fields.starts_with(&self.fields)
+    }
+}
+
+/// Moved places, each with where it moved.
+pub(super) type Moved = HashMap<Place, Span>;
 
 /// What a loop's `break`s and `continue`s carry to where they go.
 #[derive(Default)]
@@ -26,8 +57,8 @@ pub(super) struct LoopFlow {
 
 pub(super) fn union_into(target: &mut Option<Moved>, moved: &Moved) {
     let target = target.get_or_insert_with(Moved::new);
-    for (&id, &span) in moved {
-        target.entry(id).or_insert(span);
+    for (place, &span) in moved {
+        target.entry(place.clone()).or_insert(span);
     }
 }
 
@@ -121,8 +152,12 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Name(_) => {
                 if let Some(Res::Local(id)) = res {
-                    self.move_local(fx, id, span);
+                    self.move_place(fx, Place::whole(id), span);
                 }
+            }
+            ExprKind::Field { .. } if self.local_place(fx, e).is_some() => {
+                let (_, place) = self.local_place(fx, e).expect("checked above");
+                self.move_place(fx, place, span);
             }
             ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_) => {
                 let message = format!(
@@ -142,24 +177,51 @@ impl<'a> Checker<'a> {
         match (&fx.ast.expr(inner).kind, res) {
             (ExprKind::Name(_), Some(Res::Local(id))) => {
                 let span = fx.ast.expr(inner).span;
-                self.move_local(fx, id, span);
+                self.move_place(fx, Place::whole(id), span);
             }
             _ => self.consume(fx, e, param),
         }
     }
 
-    fn move_local(&mut self, fx: &mut Fx, id: LocalId, span: Span) {
-        let Some(info) = fx.locals.get(&id) else {
+    /// The place `e` names: a local the function sees, or fields of one,
+    /// with the name expression at its root.
+    pub(super) fn local_place(&self, fx: &Fx, e: ExprId) -> Option<(ExprId, Place)> {
+        match &fx.ast.expr(e).kind {
+            ExprKind::Paren(inner) => self.local_place(fx, *inner),
+            ExprKind::Name(_) => match self.names.files[fx.file.0 as usize].exprs[e.index()] {
+                Some(Res::Local(id)) => Some((e, Place::whole(id))),
+                _ => None,
+            },
+            ExprKind::Field { value, name } => {
+                let (root, mut place) = self.local_place(fx, *value)?;
+                place.fields.push(self.text(fx.file, name.span).to_owned());
+                Some((root, place))
+            }
+            _ => None,
+        }
+    }
+
+    fn place_name(&self, fx: &Fx, place: &Place) -> String {
+        let mut name = self.local_name(fx, place.local).to_owned();
+        for field in &place.fields {
+            name.push('.');
+            name.push_str(field);
+        }
+        name
+    }
+
+    fn move_place(&mut self, fx: &mut Fx, place: Place, span: Span) {
+        let Some(info) = fx.locals.get(&place.local) else {
             return;
         };
         let (ty, owner) = (info.ty, info.owner);
-        let name = self.local_name(fx, id);
+        let name = self.place_name(fx, &place);
         let moves = self.move_only(ty);
         let problem = match owner {
             Owner::Own => None,
             Owner::Part(whole) => {
                 if moves {
-                    self.move_local(fx, whole, span);
+                    self.move_place(fx, Place::whole(whole), span);
                 }
                 None
             }
@@ -181,30 +243,54 @@ impl<'a> Checker<'a> {
             self.error(fx.file, span, message);
             return;
         }
-        if let Some(&at) = fx.deferred.get(&id) {
+        let deferred = fx.deferred.iter().find(|(p, _)| p.overlaps(&place));
+        if let Some((p, &at)) = deferred {
             let line = self.line(fx, at);
+            let what = self.place_name(fx, p);
             let message =
-                format!("`{name}` is already passed `sink` by the `defer` on line {line}");
+                format!("`{what}` is already passed `sink` by the `defer` on line {line}");
             self.error(fx.file, span, message);
         }
-        fx.moved.entry(id).or_insert(span);
+        fx.moved.entry(place).or_insert(span);
     }
 
-    /// A read of a local, which must not have moved.
+    /// A use of a local, or of the fields `field()` recorded for it: no
+    /// part of what it reads may have moved. An assignment's target may
+    /// have moved, but not something that holds it.
     pub(super) fn use_local(&mut self, fx: &mut Fx, e: ExprId, id: LocalId, span: Span) {
-        if fx.assign_target == Some(e) {
-            return;
-        }
+        let used = Place {
+            local: id,
+            fields: fx.field_uses.remove(&e).unwrap_or_default(),
+        };
+        let assigning = fx.assign_target == Some(e);
+        let mut conflicts: Vec<(Place, Span)> = fx
+            .moved
+            .iter()
+            .filter(|(moved, _)| {
+                if assigning {
+                    moved.strictly_holds(&used)
+                } else {
+                    moved.overlaps(&used)
+                }
+            })
+            .map(|(p, s)| (p.clone(), *s))
+            .collect();
+        conflicts.sort_by_key(|(_, at)| at.start);
         // Reported once: later uses are the same mistake.
-        if let Some(at) = fx.moved.remove(&id) {
-            let name = self.local_name(fx, id);
-            let line = self.line(fx, at);
-            self.error(
-                fx.file,
-                span,
-                format!("`{name}` is used after it was moved on line {line}"),
-            );
-        }
+        let Some((moved, at)) = conflicts.into_iter().next() else {
+            return;
+        };
+        fx.moved
+            .retain(|p, _| !p.overlaps(&used) || (assigning && !p.strictly_holds(&used)));
+        let used_name = self.place_name(fx, &used);
+        let moved_name = self.place_name(fx, &moved);
+        let line = self.line(fx, at);
+        let message = if used_name == moved_name {
+            format!("`{used_name}` is used after it was moved on line {line}")
+        } else {
+            format!("`{used_name}` is used after `{moved_name}` was moved on line {line}")
+        };
+        self.error(fx.file, span, message);
     }
 
     /// Who owns the payloads a `match` on `value` binds.
@@ -238,16 +324,20 @@ impl<'a> Checker<'a> {
         // A local declared outside the loop and moved on a path back to
         // the top would be used moved by the next pass.
         let depth = fx.loops.len();
-        let mut carried: Vec<(LocalId, Span)> = back
+        let mut carried: Vec<(Place, Span)> = back
             .iter()
-            .filter(|(id, _)| {
-                !before.contains_key(id) && fx.locals.get(id).is_some_and(|l| l.loop_depth <= depth)
+            .filter(|(place, _)| {
+                !before.contains_key(place)
+                    && fx
+                        .locals
+                        .get(&place.local)
+                        .is_some_and(|l| l.loop_depth <= depth)
             })
-            .map(|(id, span)| (*id, *span))
+            .map(|(place, span)| (place.clone(), *span))
             .collect();
         carried.sort_by_key(|(_, span)| span.start);
-        for (id, span) in carried {
-            let name = self.local_name(fx, id);
+        for (place, span) in carried {
+            let name = self.place_name(fx, &place);
             self.error(
                 fx.file,
                 span,

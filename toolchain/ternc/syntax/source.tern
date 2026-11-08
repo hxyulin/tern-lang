@@ -29,20 +29,20 @@ pub fn line_starts(alloc: Allocator, text: []u8) -> [..]u32 ! OutOfMemory {
     return ok.(value: starts)
 }
 
-pub fn position(starts: []u32, at: u32) -> Position {
-    // Find the last line that starts at or before at.
+pub fn position(starts: []u32, offset: u32) -> Position {
+    // Find the last line that starts at or before offset.
     var low: usize = 0
     var high: usize = starts.len
     for low < high {
         let mid: usize = low + (high - low) / 2
-        if starts[mid] <= at {
+        if starts[mid] <= offset {
             low = mid + 1
         } else {
             high = mid
         }
     }
     let line: usize = low - 1
-    return Position.(line: u32.(line + 1), column: at - starts[line] + 1)
+    return Position.(line: u32.(line + 1), column: offset - starts[line] + 1)
 }
 
 // The text of a 1-based line without its line ending, or an empty view

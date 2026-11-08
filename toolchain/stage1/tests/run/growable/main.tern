@@ -37,6 +37,62 @@ fn run() -> ! OutOfMemory {
     try push(inout text, '!')
     let view: []u8 = text
     io.print("{view} {text.len} {view[2..5]}\n")
+    try pops(heap.c_allocator)
+    return ok
+}
+
+// pop, clear, and locals that take built-in function names.
+fn pops(alloc: Allocator) -> ! OutOfMemory {
+    var stack: [..]u32 = make(alloc)
+    defer free(sink stack)
+    for let i: u32 in 1..4 {
+        try push(inout stack, i * 10)
+    }
+    let push: u32 = 7
+    var offset: u32 = 0
+    for {
+        match pop(inout stack) {
+            some(value: u32) {
+                offset += value + push
+            }
+            none {
+                break
+            }
+        }
+    }
+    io.print("popped {offset} left {stack.len}\n")
+    try push(inout stack, 5)
+    try push(inout stack, 6)
+    clear(inout stack)
+    match pop(inout stack) {
+        some(value: _) {
+            io.print("not empty\n")
+        }
+        none {
+            io.print("cleared {stack.len}\n")
+        }
+    }
+    var words: [..][..]u8 = make(alloc)
+    defer free(sink words)
+    let sources: [2][]u8 = ["ab", "cde"]
+    for let w: []u8 in sources {
+        var owned: [..]u8 = make(alloc)
+        try append(inout owned, w)
+        try push(inout words, owned)
+    }
+    for {
+        match pop(inout words) {
+            some(value as word: [..]u8) {
+                let view: []u8 = word
+                io.print("word {view} ")
+                free(sink word)
+            }
+            none {
+                break
+            }
+        }
+    }
+    io.print("\n")
     return ok
 }
 

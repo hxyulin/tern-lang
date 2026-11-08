@@ -1,0 +1,63 @@
+// UTF-8 text.
+
+// The length of the longest start of s that is valid UTF-8: s.len when
+// all of s is. A sequence cut off by the end of s is not valid.
+pub fn valid_up_to(s: []u8) -> usize {
+    var i: usize = 0
+    for i < s.len {
+        let n: usize = sequence_len(s, i)
+        if n == 0 {
+            return i
+        }
+        i += n
+    }
+    return i
+}
+
+// The length of the valid sequence starting at s[i], or 0 if none does.
+// Overlong forms, surrogates and code points past U+10FFFF are invalid.
+fn sequence_len(s: []u8, i: usize) -> usize {
+    let first: u8 = s[i]
+    if first < 0x80 {
+        return 1
+    }
+    var len: usize = 0
+    // The range of the second byte; the later ones take 80 to BF.
+    var low: u8 = 0x80
+    var high: u8 = 0xBF
+    if first >= 0xC2 && first <= 0xDF {
+        len = 2
+    } else if first == 0xE0 {
+        len = 3
+        low = 0xA0
+    } else if (first >= 0xE1 && first <= 0xEC) || first == 0xEE || first == 0xEF {
+        len = 3
+    } else if first == 0xED {
+        len = 3
+        high = 0x9F
+    } else if first == 0xF0 {
+        len = 4
+        low = 0x90
+    } else if first >= 0xF1 && first <= 0xF3 {
+        len = 4
+    } else if first == 0xF4 {
+        len = 4
+        high = 0x8F
+    } else {
+        return 0
+    }
+    if i + len > s.len {
+        return 0
+    }
+    let second: u8 = s[i + 1]
+    if second < low || second > high {
+        return 0
+    }
+    for let k: usize in 2..len {
+        let c: u8 = s[i + k]
+        if c < 0x80 || c > 0xBF {
+            return 0
+        }
+    }
+    return len
+}
