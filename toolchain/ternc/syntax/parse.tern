@@ -60,12 +60,13 @@ type Parser (
     diagnostics: [..]ParseDiagnostic,
 )
 
-// Parses one item of a list and returns its index in its arena.
+// Parses one item of a list and returns its index in its array.
 type Item fn(inout Parser) -> u32 ! Stop
 
-// Lexes and parses one file.
+// Lexes and parses one file. Everything it returns lives in alloc, which
+// is meant to be an arena: freeing the arena frees the tree.
 pub fn parse(alloc: Allocator, text: []u8) -> Parsed ! OutOfMemory {
-    var lexed: Lexed = try lex(alloc, text)
+    let lexed: Lexed = try lex(alloc, text)
     var p: Parser = Parser.(
         text: text,
         tokens: lexed.tokens,
@@ -74,10 +75,7 @@ pub fn parse(alloc: Allocator, text: []u8) -> Parsed ! OutOfMemory {
         scratch: make(alloc),
         diagnostics: make(alloc),
     )
-    let result: ! Stop = file(inout p)
-    free(inout p.tokens)
-    free(inout p.scratch)
-    match result {
+    match file(inout p) {
         ok {
             let parsed: Parsed = Parsed.(
                 ast: p.ast,
@@ -87,18 +85,9 @@ pub fn parse(alloc: Allocator, text: []u8) -> Parsed ! OutOfMemory {
             return ok.(value: parsed)
         }
         err(error: _) {
-            free_ast(inout p.ast)
-            free(inout p.diagnostics)
-            free(inout lexed.diagnostics)
             return err.(error: OutOfMemory.out_of_memory)
         }
     }
-}
-
-pub fn free_parsed(parsed: inout Parsed) {
-    free_ast(inout parsed.ast)
-    free(inout parsed.lex_diagnostics)
-    free(inout parsed.diagnostics)
 }
 
 fn memory(result: ! OutOfMemory) -> ! Stop {
@@ -344,7 +333,7 @@ fn comma_list(p: inout Parser, item: Item) -> List ! Stop {
     }
 }
 
-// Arenas.
+// Adding nodes.
 
 fn add_type(p: inout Parser, k: TypeKind, from: u32) -> TypeId ! Stop {
     let t: Type = Type.(kind: k, span: span_from(p, from))

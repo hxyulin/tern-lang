@@ -88,9 +88,9 @@ fn run_text(path: []u8, text: []u8, command: Command) -> u8 ! OutOfMemory {
 
 // Prints the tokens to stdout and the problems to stderr.
 fn lex_text(path: []u8, text: []u8, starts: []u32) -> u8 ! OutOfMemory {
-    var lexed: syntax.Lexed = try syntax.lex(heap.c_allocator, text)
-    defer free(inout lexed.tokens)
-    defer free(inout lexed.diagnostics)
+    var arena: heap.Arena = heap.new_arena(heap.c_allocator)
+    defer heap.free_arena(inout arena)
+    let lexed: syntax.Lexed = try syntax.lex(heap.arena_allocator(&arena), text)
     for let t: syntax.Token in lexed.tokens {
         let pos: syntax.Position = syntax.position(starts, t.start)
         let bytes: []u8 = text[usize.(t.start)..usize.(t.end)]
@@ -110,12 +110,13 @@ fn lex_text(path: []u8, text: []u8, starts: []u32) -> u8 ! OutOfMemory {
 // Prints the syntax tree to stdout if there are no problems, and the
 // problems to stderr, the lexer's first.
 fn parse_text(path: []u8, text: []u8, starts: []u32) -> u8 ! OutOfMemory {
-    var parsed: syntax.Parsed = try syntax.parse(heap.c_allocator, text)
-    defer syntax.free_parsed(inout parsed)
+    var arena: heap.Arena = heap.new_arena(heap.c_allocator)
+    defer heap.free_arena(inout arena)
+    let alloc: Allocator = heap.arena_allocator(&arena)
+    let parsed: syntax.Parsed = try syntax.parse(alloc, text)
     let problems: usize = parsed.lex_diagnostics.len + parsed.diagnostics.len
     if problems == 0 {
-        var tree: [..]u8 = try sexp.print(heap.c_allocator, parsed.ast, text)
-        defer free(inout tree)
+        let tree: [..]u8 = try sexp.print(alloc, parsed.ast, text)
         let view: []u8 = tree
         io.print("{view}\n")
     }

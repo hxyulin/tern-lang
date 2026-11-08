@@ -1245,7 +1245,7 @@ byte for byte. Nothing moves, and the compiler tracks no ownership.
   the outer buffer only; each element needs its own `free`. A deep
   `free` would need to know which copies own their buffer, which is the
   tracking this design removes. Structures built together belong in an
-  arena, freed with one call.
+  arena, freed with one call (see [Arenas](#arenas)).
 - A resource handle follows the same convention. `io.File` is a plain
   record; `io.close(inout f)` sets the descriptor to -1, so a second
   `close` does nothing.
@@ -1559,14 +1559,46 @@ defer free(inout v)
   existing container allocates without its signature saying so.
 - `Allocator` is a built-in record: a context pointer and function
   pointers. Function values capture nothing, so it needs no closures.
-  The standard library provides a C heap allocator, an arena, and a
-  fixed-buffer allocator over a `[N]u8` for embedded targets.
+  The standard library provides a C heap allocator and an arena (see
+  [Arenas](#arenas)); a fixed-buffer allocator over a `[N]u8` for
+  embedded targets is planned.
 - Allocating operations return `! OutOfMemory`, as in Zig. Every
   allocation shows as a `try`, and kernels and embedded code can handle
   the failure. Rejected: Rust's `push`, which stops the program instead,
   hiding each allocation point and making the failure fatal.
 - Release is explicit, with `free(inout v)` and usually `defer` (see
   [Values and buffers](#values-and-buffers)).
+
+### Arenas
+
+**Decided (2026-11-08).** `std.heap.Arena` is a bump allocator for values
+built and freed together, such as a syntax tree.
+
+```
+var arena: heap.Arena = heap.new_arena(heap.c_allocator)
+defer heap.free_arena(inout arena)
+let alloc: Allocator = heap.arena_allocator(&arena)
+```
+
+- It takes memory from a parent allocator in chunks, each twice the
+  last, from 4 KiB. Freeing or resizing the newest allocation works in
+  place; freeing any other does nothing.
+- An allocation of 64 KiB or more gets a block of its own from the
+  parent, so a large `[..]T` grows through the parent's `resize`
+  instead of being copied into the arena each time. Without this,
+  ternc's parse of a 32,000-line file used 1.7 times the memory.
+- `free_arena` returns every chunk and block; the arena can be used
+  again.
+- The `Allocator` points at the `Arena`, so the arena must stay where
+  it is while the allocator is in use. Nothing checks this, as nothing
+  checks a view.
+- A resize that moves copies with C's `memcpy`, so the arena needs
+  libc, as `c_allocator` does. A bare-metal arena needs a copy that is
+  not C's; that comes with the fixed-buffer allocator.
+
+ternc's driver lexes, parses and prints in one arena. Parsing a
+32,000-line file takes the same time as with `c_allocator` (23 ms) and
+9% more memory.
 
 ### Growable arrays: `[..]T`
 
@@ -1783,7 +1815,7 @@ targets. The first packages cover what the examples use:
 | --- | --- |
 | `std.c` | C's integer types: `c.int`, `c.size_t`, ... |
 | `std.libc` | `extern` declarations of the C functions std calls |
-| `std.heap` | `c_allocator`, over `malloc`, `realloc` and `free` |
+| `std.heap` | `c_allocator`, over `malloc`, `realloc` and `free`; `Arena` |
 | `std.fmt` | `Part`, `hex`, and the `chunks` iterator over a `Format` |
 | `std.io` | `File`, `open`, `close`, `read_to_end`, `print`, `eprint`, `Error` |
 | `std.os` | `args` and `env` |
@@ -1970,14 +2002,15 @@ lexer and then the parser.
   file, and the files in `toolchain/stage1/tests/lex`: `malformed.tern`
   triggers every lexer error, and the `utf8-*` files each break UTF-8 a
   different way.
-- **The tree is arenas and ranges** (decided 2026-11-08, the layout of
-  Zig's syntax tree). Each kind of node lives in an arena of the `Ast`
+- **The tree is arrays and ranges** (decided 2026-11-08, the layout of
+  Zig's syntax tree). Each kind of node lives in an array of the `Ast`
   and is referred to by index, such as `ExprId`. A list of nodes is a
   `List`, a range of one shared `extra: [..]u32` holding item indexes;
   records that appear only in lists, such as `Param` and `Arg`, have
-  arenas of their own. The parser gathers a list on a scratch stack and
-  copies it into `extra` once it is complete. No node owns memory, so
-  freeing the tree is one `free` per arena. Rejected: nodes that own
+  arrays of their own. The parser gathers a list on a scratch stack and
+  copies it into `extra` once it is complete. No node owns memory. The
+  driver lexes, parses and prints in one `heap.Arena` and frees it once;
+  before the arena, freeing the tree took one `free` per array. Rejected: nodes that own
   `[..]T` lists as stage 1's do, which makes freeing a walk over the
   tree.
 - **The parser is tested like the lexer.** `ternc parse FILE` prints

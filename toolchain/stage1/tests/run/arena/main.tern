@@ -1,0 +1,59 @@
+// An arena: arrays that grow in it, interleaved and alone, an allocation
+// larger than a chunk, and reuse after free_arena.
+
+import std.heap
+import std.io
+
+fn sum(v: []u32) -> u64 {
+    var s: u64 = 0
+    for let x: u32 in v {
+        s += u64.(x)
+    }
+    return s
+}
+
+fn fill_two(alloc: Allocator, n: u32) -> u64 ! OutOfMemory {
+    var a: [..]u32 = make(alloc)
+    var b: [..]u32 = make(alloc)
+    for let i: u32 in 0..n {
+        try push(inout a, i)
+        try push(inout b, i * 2)
+    }
+    return ok.(value: sum(a) + sum(b))
+}
+
+fn one_big(alloc: Allocator) -> u64 ! OutOfMemory {
+    var big: [..]u8 = make(alloc)
+    for let i: u32 in 0..100000 {
+        try push(inout big, truncate[u8](i))
+    }
+    var s: u64 = 0
+    for let x: u8 in big {
+        s += u64.(x)
+    }
+    // Freeing the newest allocation gives its space back.
+    free(inout big)
+    return ok.(value: s)
+}
+
+fn run() -> ! OutOfMemory {
+    var arena: heap.Arena = heap.new_arena(heap.c_allocator)
+    defer heap.free_arena(inout arena)
+    let alloc: Allocator = heap.arena_allocator(&arena)
+    io.print("{try fill_two(alloc, 1000)}\n")
+    io.print("{try one_big(alloc)}\n")
+    heap.free_arena(inout arena)
+    io.print("{try fill_two(alloc, 10)}\n")
+    return ok
+}
+
+fn main() -> u8 {
+    match run() {
+        ok {
+            return 0
+        }
+        err(error: _) {
+            return 1
+        }
+    }
+}

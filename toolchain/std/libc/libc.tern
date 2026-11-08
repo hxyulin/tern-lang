@@ -6,6 +6,7 @@ import std.c
 pub extern fn malloc(size: c.size_t) -> ?*u8
 pub extern fn realloc(p: ?*u8, size: c.size_t) -> ?*u8
 pub extern fn free(p: ?*u8)
+pub extern fn memcpy(to: *u8, from: *u8, n: c.size_t) -> *u8
 
 pub extern fn open(path: *u8, flags: c.int, ...) -> c.int
 pub extern fn close(fd: c.int) -> c.int

@@ -37,3 +37,293 @@ fn c_free(_: ?*u8, p: *u8, _: usize, _: usize) {
         libc.free(some.(value: p))
     }
 }
+
+// An arena: a bump allocator for values built and freed together, such as
+// a syntax tree. It takes memory from a parent allocator in chunks.
+// Freeing or resizing the newest allocation works in place; freeing any
+// other does nothing. An allocation of large_min bytes or more gets a
+// block of its own from the parent, so a large array grows through the
+// parent's resize instead of being copied into the arena each time.
+// free_arena returns every chunk and block to the parent.
+//
+//   var arena: heap.Arena = heap.new_arena(heap.c_allocator)
+//   defer heap.free_arena(inout arena)
+//   let alloc: Allocator = heap.arena_allocator(&arena)
+//
+// The Allocator points at the Arena, so the Arena must stay where it is
+// while the Allocator is in use.
+pub type Arena (
+    parent: Allocator,
+    // The newest chunk. It starts with a header: the previous chunk, then
+    // this chunk's size.
+    chunk: ?*u8,
+    // Bytes of the chunk in use, header included, and its size.
+    used: usize,
+    size: usize,
+    // Where the newest allocation starts in the chunk.
+    last: usize,
+    // The large blocks, each starting with a header: the next block, then
+    // this block's size.
+    large: ?*u8,
+)
+
+let header: usize = 16
+let first_chunk: usize = 4096
+let large_min: usize = 65536
+
+pub fn new_arena(parent: Allocator) -> Arena {
+    return Arena.(parent: parent, chunk: none, used: 0, size: 0, last: 0, large: none)
+}
+
+pub fn arena_allocator(a: *Arena) -> Allocator {
+    return Allocator.(
+        context: some.(value: cast[*u8](a)),
+        alloc: arena_alloc,
+        resize: arena_resize,
+        free: arena_free,
+    )
+}
+
+// Returns every chunk and block to the parent. The arena can be used
+// again.
+pub fn free_arena(a: inout Arena) {
+    free_list(a.parent, a.chunk)
+    free_list(a.parent, a.large)
+    a.chunk = none
+    a.large = none
+    a.used = 0
+    a.size = 0
+    a.last = 0
+}
+
+// Frees each chunk or block in a list linked through their headers.
+fn free_list(parent: Allocator, first: ?*u8) {
+    var next: ?*u8 = first
+    for {
+        match next {
+            some(value as chunk: *u8) {
+                // SAFETY: every chunk starts with the header bump wrote.
+                unsafe {
+                    next = cast[*?*u8](chunk).*
+                    let size: usize = cast[*usize](offset(chunk, 8)).*
+                    parent.free(parent.context, chunk, size, header)
+                }
+            }
+            none {
+                return
+            }
+        }
+    }
+}
+
+// The Arena an Allocator's context points at.
+fn arena_of(context: ?*u8) -> *Arena {
+    match context {
+        some(value as p: *u8) {
+            return cast[*Arena](p)
+        }
+        none {
+            panic("an arena allocator without its arena")
+        }
+    }
+}
+
+fn arena_alloc(context: ?*u8, size: usize, align: usize) -> ?*u8 {
+    let a: *Arena = arena_of(context)
+    // SAFETY: arena_allocator made the context from a live Arena.
+    unsafe {
+        if is_large(size, align) {
+            return large_alloc(inout a.*, size)
+        }
+        return bump(inout a.*, size, align)
+    }
+}
+
+// Whether an allocation of this size gets a block of its own. Blocks
+// carry a header-sized prefix, so their alignment is at most header.
+fn is_large(size: usize, align: usize) -> bool {
+    return size >= large_min && align <= header
+}
+
+fn large_alloc(a: inout Arena, size: usize) -> ?*u8 {
+    match a.parent.alloc(a.parent.context, header + size, header) {
+        some(value as block: *u8) {
+            // SAFETY: the block holds at least header bytes.
+            unsafe {
+                cast[*?*u8](block).* = a.large
+                cast[*usize](offset(block, 8)).* = header + size
+            }
+            a.large = some.(value: block)
+            return some.(value: offset(block, header))
+        }
+        none {
+            return none
+        }
+    }
+}
+
+// The block a large allocation sits in.
+fn block_of(p: *u8) -> *u8 {
+    return cast[*u8](cast[usize](p) - header)
+}
+
+// Replaces the link to `old` in the list of large blocks with `with`.
+fn relink(a: inout Arena, old: *u8, with: ?*u8) {
+    if points_to(a.large, old) {
+        a.large = with
+        return
+    }
+    var node: ?*u8 = a.large
+    for {
+        match node {
+            some(value as block: *u8) {
+                // SAFETY: every large block starts with its header.
+                let next: ?*u8 = unsafe { cast[*?*u8](block).* }
+                if points_to(next, old) {
+                    unsafe {
+                        cast[*?*u8](block).* = with
+                    }
+                    return
+                }
+                node = next
+            }
+            none {
+                return
+            }
+        }
+    }
+}
+
+fn points_to(p: ?*u8, target: *u8) -> bool {
+    match p {
+        some(value as q: *u8) {
+            return cast[usize](q) == cast[usize](target)
+        }
+        none {
+            return false
+        }
+    }
+}
+
+fn arena_resize(context: ?*u8, p: *u8, old_size: usize, new_size: usize, align: usize) -> ?*u8 {
+    let a: *Arena = arena_of(context)
+    // SAFETY: as in arena_alloc; p came from this arena, so it holds
+    // old_size bytes.
+    unsafe {
+        if is_large(old_size, align) {
+            let block: *u8 = block_of(p)
+            let size: usize = header + new_size
+            match a.*.parent.resize(a.*.parent.context, block, header + old_size, size, header) {
+                some(value as moved: *u8) {
+                    cast[*usize](offset(moved, 8)).* = size
+                    relink(inout a.*, block, some.(value: moved))
+                    return some.(value: offset(moved, header))
+                }
+                none {
+                    return none
+                }
+            }
+        }
+        // Growing in place stays below large_min, so an allocation of
+        // that size is always a block of its own.
+        if is_last(a.*, p) && a.*.last + new_size <= a.*.size && !is_large(new_size, align) {
+            a.*.used = a.*.last + new_size
+            return some.(value: p)
+        }
+        var fresh: ?*u8 = none
+        if is_large(new_size, align) {
+            fresh = large_alloc(inout a.*, new_size)
+        } else {
+            fresh = bump(inout a.*, new_size, align)
+        }
+        match fresh {
+            some(value as q: *u8) {
+                var n: usize = old_size
+                if new_size < n {
+                    n = new_size
+                }
+                let _: *u8 = libc.memcpy(q, p, c.size_t.(n))
+                return some.(value: q)
+            }
+            none {
+                return none
+            }
+        }
+    }
+}
+
+fn arena_free(context: ?*u8, p: *u8, size: usize, align: usize) {
+    let a: *Arena = arena_of(context)
+    // SAFETY: as in arena_alloc.
+    unsafe {
+        if is_large(size, align) {
+            let block: *u8 = block_of(p)
+            let next: ?*u8 = cast[*?*u8](block).*
+            relink(inout a.*, block, next)
+            a.*.parent.free(a.*.parent.context, block, header + size, header)
+            return
+        }
+        if is_last(a.*, p) {
+            a.*.used = a.*.last
+        }
+    }
+}
+
+// Whether p is the newest allocation.
+fn is_last(a: Arena, p: *u8) -> bool {
+    match a.chunk {
+        some(value as chunk: *u8) {
+            return cast[usize](p) == cast[usize](chunk) + a.last
+        }
+        none {
+            return false
+        }
+    }
+}
+
+// Takes size bytes aligned to align, starting a new chunk if the newest
+// one is full.
+fn bump(a: inout Arena, size: usize, align: usize) -> ?*u8 {
+    match a.chunk {
+        some(value as chunk: *u8) {
+            let base: usize = cast[usize](chunk)
+            let start: usize = align_up(base + a.used, align) - base
+            if start + size <= a.size {
+                a.used = start + size
+                a.last = start
+                return some.(value: offset(chunk, start))
+            }
+        }
+        none {
+        }
+    }
+    // A new chunk: double the last, and at least big enough.
+    var chunk_size: usize = first_chunk
+    if a.size * 2 > chunk_size {
+        chunk_size = a.size * 2
+    }
+    if header + size + align > chunk_size {
+        chunk_size = header + size + align
+    }
+    match a.parent.alloc(a.parent.context, chunk_size, header) {
+        some(value as chunk: *u8) {
+            // SAFETY: the chunk holds at least header bytes.
+            unsafe {
+                cast[*?*u8](chunk).* = a.chunk
+                cast[*usize](offset(chunk, 8)).* = chunk_size
+            }
+            a.chunk = some.(value: chunk)
+            a.used = header
+            a.size = chunk_size
+            return bump(inout a, size, align)
+        }
+        none {
+            return none
+        }
+    }
+}
+
+// x rounded up to a multiple of align, a power of two.
+fn align_up(x: usize, align: usize) -> usize {
+    return (x + align - 1) & ~(align - 1)
+}

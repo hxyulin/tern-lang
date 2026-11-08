@@ -1,9 +1,10 @@
 // The syntax tree.
 //
-// Nodes live in arenas inside Ast and refer to each other by index, so no
-// node owns memory and freeing the tree frees each arena once. A list of
-// nodes, such as a call's arguments, is a List: a range of `extra`, which
-// holds the index of each item in that item's arena.
+// Nodes live in arrays inside Ast and refer to each other by index, so no
+// node owns memory. The parser builds the tree in an arena allocator, and
+// freeing that arena frees it. A list of nodes, such as a call's
+// arguments, is a List: a range of `extra`, which holds the index of each
+// item in that item's array.
 
 pub type ExprId u32
 pub type TypeId u32
@@ -23,7 +24,7 @@ pub type Ast (
     pub types: [..]Type,
     pub stmts: [..]Stmt,
     pub pats: [..]Pattern,
-    // The arenas of records that only appear in lists.
+    // The arrays of records that only appear in lists.
     pub names: [..]Span,
     pub attributes: [..]Attribute,
     pub params: [..]Param,
@@ -61,28 +62,7 @@ pub fn new_ast(alloc: Allocator) -> Ast {
     )
 }
 
-pub fn free_ast(ast: inout Ast) {
-    free(inout ast.imports)
-    free(inout ast.decls)
-    free(inout ast.exprs)
-    free(inout ast.types)
-    free(inout ast.stmts)
-    free(inout ast.pats)
-    free(inout ast.names)
-    free(inout ast.attributes)
-    free(inout ast.params)
-    free(inout ast.fields)
-    free(inout ast.variants)
-    free(inout ast.destructs)
-    free(inout ast.arms)
-    free(inout ast.args)
-    free(inout ast.tuple_items)
-    free(inout ast.str_parts)
-    free(inout ast.globals)
-    free(inout ast.extra)
-}
-
-// The arena indexes a list holds.
+// The array indexes a list holds.
 pub fn items(extra: []u32, list: List) -> []u32 {
     let start: usize = usize.(list.start)
     return extra[start..start + usize.(list.len)]
