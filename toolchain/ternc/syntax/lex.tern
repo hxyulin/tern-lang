@@ -70,14 +70,14 @@ pub fn lex(alloc: Allocator, src: []u8) -> Lexed ! OutOfMemory {
         open_braces: make(alloc),
     )
     let result: ! OutOfMemory = run(inout l)
-    free(sink l.open_braces)
+    free(inout l.open_braces)
     match result {
         ok {
             return ok.(value: Lexed.(tokens: l.tokens, diagnostics: l.diagnostics))
         }
         err(error: OutOfMemory) {
-            free(sink l.tokens)
-            free(sink l.diagnostics)
+            free(inout l.tokens)
+            free(inout l.diagnostics)
             return err.(error: error)
         }
     }

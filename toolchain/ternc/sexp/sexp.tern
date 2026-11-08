@@ -13,7 +13,7 @@ pub fn print(alloc: Allocator, ast: syntax.Ast, text: []u8) -> [..]u8 ! OutOfMem
             return ok.(value: pr.out)
         }
         err(error: OutOfMemory) {
-            free(sink pr.out)
+            free(inout pr.out)
             return err.(error: error)
         }
     }
@@ -99,7 +99,7 @@ fn decl(pr: inout Printer, ast: syntax.Ast, d: syntax.Decl) -> ! OutOfMemory {
         function(is_unsafe: _, name: _, params: _, result: _, body: _) { "function_declaration" }
         extern_fn(name: _, params: _, variadic: _, result: _) { "extern_declaration" }
         extern_var(mutable: _, name: _, ty: _) { "extern_variable" }
-        type_decl(moves: _, name: _, def: _) { "type_declaration" }
+        type_decl(name: _, def: _) { "type_declaration" }
         global(is_shared: _, local: _) { "global_declaration" }
     }
     try open(inout pr, node)
@@ -135,10 +135,7 @@ fn decl(pr: inout Printer, ast: syntax.Ast, d: syntax.Decl) -> ! OutOfMemory {
             try ident(inout pr)
             try ty(inout pr, ast, t)
         }
-        type_decl(moves: bool, name: _, def: syntax.TypeDef) {
-            if moves {
-                try leaf(inout pr, "moving")
-            }
+        type_decl(name: _, def: syntax.TypeDef) {
             try ident(inout pr)
             try type_def(inout pr, ast, def)
         }

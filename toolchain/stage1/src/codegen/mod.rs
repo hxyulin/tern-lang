@@ -8,8 +8,8 @@
 //! Every function uses the C calling convention. A value held in memory
 //! is returned through `sret`, and an `inout` argument is passed as a
 //! pointer. A `let` parameter held in memory is a pointer to the caller's
-//! value, which C sees as `const T *`; a `sink` one, and any record an
-//! `extern` function takes, is passed `byval`, as C passes records.
+//! value, which C sees as `const T *`; a record an `extern` function
+//! takes is passed `byval`, as C passes records.
 
 mod data;
 mod func;

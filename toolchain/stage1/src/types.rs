@@ -273,7 +273,6 @@ impl Types {
                         let mode = match mode {
                             Mode::Let => "",
                             Mode::Inout => "inout ",
-                            Mode::Sink => "sink ",
                         };
                         format!("{mode}{}", self.display(*ty))
                     })

@@ -61,6 +61,7 @@ pub const BUILTIN_FUNCTIONS: &[&str] = &[
     "append",
     "clear",
     "free",
+    "take",
     "copy",
     "fill",
     "from_address",

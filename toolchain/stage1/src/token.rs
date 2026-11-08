@@ -47,8 +47,6 @@ pub enum TokenKind {
     Pub,
     Return,
     Shared,
-    Move,
-    Sink,
     Try,
     Type,
     Union,
@@ -111,7 +109,7 @@ impl TokenKind {
     pub fn keyword(text: &str) -> Option<TokenKind> {
         use TokenKind::{
             As, Break, Continue, Defer, Else, Enum, Extern, Fn, For, If, Import, In, Inout, Let,
-            Lock, Match, Move, Pub, Return, Shared, Sink, Try, Type, Union, Unsafe, Var,
+            Lock, Match, Pub, Return, Shared, Try, Type, Union, Unsafe, Var,
         };
         Some(match text {
             "as" => As,
@@ -130,11 +128,9 @@ impl TokenKind {
             "let" => Let,
             "lock" => Lock,
             "match" => Match,
-            "move" => Move,
             "pub" => Pub,
             "return" => Return,
             "shared" => Shared,
-            "sink" => Sink,
             "try" => Try,
             "type" => Type,
             "union" => Union,

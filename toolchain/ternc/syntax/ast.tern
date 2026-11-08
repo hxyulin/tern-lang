@@ -61,25 +61,25 @@ pub fn new_ast(alloc: Allocator) -> Ast {
     )
 }
 
-pub fn free_ast(ast: sink Ast) {
-    free(sink ast.imports)
-    free(sink ast.decls)
-    free(sink ast.exprs)
-    free(sink ast.types)
-    free(sink ast.stmts)
-    free(sink ast.pats)
-    free(sink ast.names)
-    free(sink ast.attributes)
-    free(sink ast.params)
-    free(sink ast.fields)
-    free(sink ast.variants)
-    free(sink ast.destructs)
-    free(sink ast.arms)
-    free(sink ast.args)
-    free(sink ast.tuple_items)
-    free(sink ast.str_parts)
-    free(sink ast.globals)
-    free(sink ast.extra)
+pub fn free_ast(ast: inout Ast) {
+    free(inout ast.imports)
+    free(inout ast.decls)
+    free(inout ast.exprs)
+    free(inout ast.types)
+    free(inout ast.stmts)
+    free(inout ast.pats)
+    free(inout ast.names)
+    free(inout ast.attributes)
+    free(inout ast.params)
+    free(inout ast.fields)
+    free(inout ast.variants)
+    free(inout ast.destructs)
+    free(inout ast.arms)
+    free(inout ast.args)
+    free(inout ast.tuple_items)
+    free(inout ast.str_parts)
+    free(inout ast.globals)
+    free(inout ast.extra)
 }
 
 // The arena indexes a list holds.
@@ -100,8 +100,7 @@ pub type DeclKind enum {
     function(is_unsafe: bool, name: Span, params: List, result: ?TypeId, body: Block)
     extern_fn(name: Span, params: List, variadic: bool, result: ?TypeId)
     extern_var(mutable: bool, name: Span, ty: TypeId)
-    // `moves` is set for a `move type`.
-    type_decl(moves: bool, name: Span, def: TypeDef)
+    type_decl(name: Span, def: TypeDef)
     global(is_shared: bool, local: Local)
 }
 
@@ -109,7 +108,6 @@ pub type DeclKind enum {
 pub type Mode enum {
     let_mode
     inout_mode
-    sink_mode
 }
 
 // A parameter, or a parameter of a function type, which has no name.

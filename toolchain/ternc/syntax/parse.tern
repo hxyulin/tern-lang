@@ -65,7 +65,7 @@ type Item fn(inout Parser) -> u32 ! Stop
 
 // Lexes and parses one file.
 pub fn parse(alloc: Allocator, text: []u8) -> Parsed ! OutOfMemory {
-    let lexed: Lexed = try lex(alloc, text)
+    var lexed: Lexed = try lex(alloc, text)
     var p: Parser = Parser.(
         text: text,
         tokens: lexed.tokens,
@@ -75,8 +75,8 @@ pub fn parse(alloc: Allocator, text: []u8) -> Parsed ! OutOfMemory {
         diagnostics: make(alloc),
     )
     let result: ! Stop = file(inout p)
-    free(sink p.tokens)
-    free(sink p.scratch)
+    free(inout p.tokens)
+    free(inout p.scratch)
     match result {
         ok {
             let parsed: Parsed = Parsed.(
@@ -87,18 +87,18 @@ pub fn parse(alloc: Allocator, text: []u8) -> Parsed ! OutOfMemory {
             return ok.(value: parsed)
         }
         err(error: _) {
-            free_ast(sink p.ast)
-            free(sink p.diagnostics)
-            free(sink lexed.diagnostics)
+            free_ast(inout p.ast)
+            free(inout p.diagnostics)
+            free(inout lexed.diagnostics)
             return err.(error: OutOfMemory.out_of_memory)
         }
     }
 }
 
-pub fn free_parsed(parsed: sink Parsed) {
-    free_ast(sink parsed.ast)
-    free(sink parsed.lex_diagnostics)
-    free(sink parsed.diagnostics)
+pub fn free_parsed(parsed: inout Parsed) {
+    free_ast(inout parsed.ast)
+    free(inout parsed.lex_diagnostics)
+    free(inout parsed.diagnostics)
 }
 
 fn memory(result: ! OutOfMemory) -> ! Stop {
@@ -488,14 +488,7 @@ fn declaration_kind(p: inout Parser) -> DeclKind ! Stop {
             }
         }
         kw_type {
-            return type_declaration(inout p, false)
-        }
-        kw_move {
-            advance(inout p)
-            if next_kind(p) != TokenKind.kw_type {
-                return err.(error: expected(inout p, "`type` after `move`"))
-            }
-            return type_declaration(inout p, true)
+            return type_declaration(inout p)
         }
         kw_let, kw_var {
             let l: Local = try local(inout p)
@@ -598,9 +591,6 @@ fn mode(p: inout Parser) -> Mode {
     if eat(inout p, TokenKind.kw_inout) {
         return Mode.inout_mode
     }
-    if eat(inout p, TokenKind.kw_sink) {
-        return Mode.sink_mode
-    }
     return Mode.let_mode
 }
 
@@ -616,11 +606,11 @@ fn parameter(p: inout Parser) -> u32 ! Stop {
     return ok.(value: u32.(p.ast.params.len - 1))
 }
 
-fn type_declaration(p: inout Parser, moves: bool) -> DeclKind ! Stop {
+fn type_declaration(p: inout Parser) -> DeclKind ! Stop {
     advance(inout p)
     let n: Span = try name(inout p)
     let def: TypeDef = try type_def(inout p)
-    return ok.(value: DeclKind.type_decl.(moves: moves, name: n, def: def))
+    return ok.(value: DeclKind.type_decl.(name: n, def: def))
 }
 
 fn type_def(p: inout Parser) -> TypeDef ! Stop {

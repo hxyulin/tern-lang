@@ -18,7 +18,7 @@ fn build(alloc: Allocator, n: u32) -> [..]u32 ! OutOfMemory {
             ok {
             }
             err(error: OutOfMemory) {
-                free(sink out)
+                free(inout out)
                 return err.(error: error)
             }
         }
@@ -28,10 +28,10 @@ fn build(alloc: Allocator, n: u32) -> [..]u32 ! OutOfMemory {
 
 fn run() -> ! OutOfMemory {
     var squares: [..]u32 = try build(heap.c_allocator, 100)
-    defer free(sink squares)
+    defer free(inout squares)
     io.print("{squares.len} {sum(squares)} {squares[99]}\n")
     var text: [..]u8 = make(heap.c_allocator)
-    defer free(sink text)
+    defer free(inout text)
     try append(inout text, "abc")
     try append(inout text, "defgh")
     try push(inout text, '!')
@@ -41,10 +41,11 @@ fn run() -> ! OutOfMemory {
     return ok
 }
 
-// pop, clear, and locals that take built-in function names.
+// pop, clear, take, repeated free, and locals that take built-in
+// function names.
 fn pops(alloc: Allocator) -> ! OutOfMemory {
     var stack: [..]u32 = make(alloc)
-    defer free(sink stack)
+    defer free(inout stack)
     for let i: u32 in 1..4 {
         try push(inout stack, i * 10)
     }
@@ -73,19 +74,23 @@ fn pops(alloc: Allocator) -> ! OutOfMemory {
         }
     }
     var words: [..][..]u8 = make(alloc)
-    defer free(sink words)
+    defer free(inout words)
     let sources: [2][]u8 = ["ab", "cde"]
+    var owned: [..]u8 = make(alloc)
+    defer free(inout owned)
     for let w: []u8 in sources {
-        var owned: [..]u8 = make(alloc)
         try append(inout owned, w)
-        try push(inout words, owned)
+        // take hands the buffer over and leaves owned empty, so it can
+        // grow again and the deferred free has nothing to free.
+        try push(inout words, take(inout owned))
     }
     for {
         match pop(inout words) {
-            some(value as word: [..]u8) {
+            some(value: [..]u8) {
+                var word: [..]u8 = value
                 let view: []u8 = word
                 io.print("word {view} ")
-                free(sink word)
+                free(inout word)
             }
             none {
                 break
@@ -93,6 +98,11 @@ fn pops(alloc: Allocator) -> ! OutOfMemory {
         }
     }
     io.print("\n")
+    // free leaves the array empty, so freeing it twice does nothing.
+    try push(inout stack, 1)
+    free(inout stack)
+    free(inout stack)
+    io.print("freed {stack.len}\n")
     return ok
 }
 

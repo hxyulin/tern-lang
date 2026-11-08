@@ -703,12 +703,12 @@ mod tests {
     #[test]
     fn words() {
         assert_eq!(
-            kinds("_ _x fn sink @packed"),
+            kinds("_ _x fn inout @packed"),
             [
                 K::Underscore,
                 K::Ident,
                 K::Fn,
-                K::Sink,
+                K::Inout,
                 K::Attribute,
                 K::Eof
             ]

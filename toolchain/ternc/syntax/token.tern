@@ -38,8 +38,6 @@ pub type TokenKind enum {
     kw_pub
     kw_return
     kw_shared
-    kw_move
-    kw_sink
     kw_try
     kw_type
     kw_union
@@ -123,8 +121,6 @@ pub fn keyword(text: []u8) -> ?TokenKind {
         "pub" { return some.(value: TokenKind.kw_pub) }
         "return" { return some.(value: TokenKind.kw_return) }
         "shared" { return some.(value: TokenKind.kw_shared) }
-        "move" { return some.(value: TokenKind.kw_move) }
-        "sink" { return some.(value: TokenKind.kw_sink) }
         "try" { return some.(value: TokenKind.kw_try) }
         "type" { return some.(value: TokenKind.kw_type) }
         "union" { return some.(value: TokenKind.kw_union) }
@@ -177,8 +173,6 @@ pub fn kind_name(kind: TokenKind) -> []u8 {
         kw_pub { "Pub" }
         kw_return { "Return" }
         kw_shared { "Shared" }
-        kw_move { "Move" }
-        kw_sink { "Sink" }
         kw_try { "Try" }
         kw_type { "Type" }
         kw_union { "Union" }

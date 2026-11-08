@@ -1066,6 +1066,18 @@ impl<'a> FnGen<'_, 'a> {
         self.spill(v, ty)
     }
 
+    /// Leaves the `[..]T` at `v` empty: no buffer, length and capacity 0.
+    /// It keeps its allocator, so it can grow again.
+    fn empty_growable(&mut self, v: Value) {
+        let null = self.null();
+        self.ins().store(null, v);
+        let zero = self.iconst(Type::I64, 0);
+        for offset in [8, 16] {
+            let addr = self.offset(v, offset);
+            self.ins().store(zero, addr);
+        }
+    }
+
     /// Whether a `let` argument can pass the address of its storage: a
     /// local, or a field or element of one held in the local's own memory
     /// or its `[..]T`. A global, or a value reached through a view or a
@@ -2188,7 +2200,7 @@ impl<'a> FnGen<'_, 'a> {
             Ty::Fn(f) => f.params.iter().map(|(_, t)| *t).collect(),
             _ => Vec::new(),
         };
-        // A call inside an argument that changes or moves a value could
+        // A call inside an argument that passes something `inout` could
         // change a borrowed argument before the callee reads it, so then
         // borrowed arguments are copied.
         let ast = self.ast;
@@ -2496,7 +2508,16 @@ impl<'a> FnGen<'_, 'a> {
                     .call_indirect(sig, free_fn, &[ctx, ptr, bytes, align]);
                 self.jump(after);
                 self.switch_to(after, true);
+                self.empty_growable(v);
                 V::Unit
+            }
+            "take" => {
+                let vty = self.ty(arg(0));
+                let v = self.addr_of(arg(0));
+                let out = self.temp(vty);
+                self.store(V::M(v), vty, out, false);
+                self.empty_growable(v);
+                V::M(out)
             }
             "fill" => {
                 let core = self.g.core(ty);
@@ -2712,8 +2733,7 @@ pub enum CallArg {
     None,
 }
 
-/// Whether an expression holds a call that passes an argument `inout` or
-/// `sink`.
+/// Whether an expression holds a call that passes an argument `inout`.
 fn changes_in_call(ast: &crate::ast::Ast, e: ExprId) -> bool {
     let any = |es: &mut dyn Iterator<Item = ExprId>| {
         let mut found = false;

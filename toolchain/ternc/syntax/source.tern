@@ -10,7 +10,7 @@ pub fn line_starts(alloc: Allocator, text: []u8) -> [..]u32 ! OutOfMemory {
         ok {
         }
         err(error: OutOfMemory) {
-            free(sink starts)
+            free(inout starts)
             return err.(error: error)
         }
     }
@@ -20,7 +20,7 @@ pub fn line_starts(alloc: Allocator, text: []u8) -> [..]u32 ! OutOfMemory {
                 ok {
                 }
                 err(error: OutOfMemory) {
-                    free(sink starts)
+                    free(inout starts)
                     return err.(error: error)
                 }
             }

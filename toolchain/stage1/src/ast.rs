@@ -117,8 +117,6 @@ pub enum DeclKind {
         ty: TypeId,
     },
     Type {
-        /// `move type`: values move instead of copying.
-        moves: bool,
         name: Name,
         def: TypeDef,
     },
@@ -142,7 +140,6 @@ pub struct FnDecl {
 pub enum Mode {
     Let,
     Inout,
-    Sink,
 }
 
 #[derive(Debug)]

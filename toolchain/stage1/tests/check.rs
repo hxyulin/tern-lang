@@ -317,7 +317,7 @@ fn arrays_and_builtins() {
     try append(inout v, b[1..])
     let w: u8 = truncate[u8](v.len)
     let _: u8 = w
-    free(sink v)
+    free(inout v)
     return ok
 }
 ";
@@ -419,117 +419,6 @@ fn f() -> u32 {
 }
 
 #[test]
-fn moves() {
-    let source = "type Names (list: [..][]u8, count: u32)
-
-fn take(_: sink [..]u8) {
-}
-
-fn read(_: []u8) {
-}
-
-fn f(alloc: Allocator, borrowed: [..]u8, edit: inout [..]u8, n: u32) {
-    var a: [..]u8 = make(alloc)
-    let b: [..]u8 = a
-    read(a)
-    read(b)
-    take(sink b)
-    take(sink b)
-    let _: [..]u8 = borrowed
-    take(sink edit)
-    var c: [..]u8 = make(alloc)
-    if n > 1 {
-        free(sink c)
-    }
-    read(c)
-    var d: [..]u8 = make(alloc)
-    free(sink d)
-    d = make(alloc)
-    read(d)
-    let names: Names = Names.(list: make(alloc), count: 0)
-    let _: [..][]u8 = names.list
-    var e: [..]u8 = make(alloc)
-    defer free(sink e)
-    read(e)
-    take(sink e)
-    let m: u32 = n
-    take_u32(sink m)
-    let _: u32 = m
-}
-
-fn take_u32(_: sink u32) {
-}
-
-fn in_loops(alloc: Allocator, items: [][..]u8, n: u32) -> [..]u8 {
-    var kept: [..]u8 = make(alloc)
-    for let i: u32 in 0..n {
-        if i == 3 {
-            return kept
-        }
-        take(sink kept)
-    }
-    var other: [..]u8 = make(alloc)
-    for {
-        take(sink other)
-        other = make(alloc)
-        if n > 2 {
-            break
-        }
-    }
-    for let item: [..]u8 in items {
-        take(sink item)
-    }
-    for let _: u32 in 0..n {
-        var fresh: [..]u8 = make(alloc)
-        take(sink fresh)
-    }
-    return other
-}
-
-fn payloads(alloc: Allocator, maybe: ?[..]u8) {
-    var mine: ?[..]u8 = some.(value: make(alloc))
-    match mine {
-        some(value: [..]u8) {
-            take(sink value)
-        }
-        none {
-        }
-    }
-    match mine {
-        some(value: [..]u8) {
-            read(value)
-        }
-        none {
-        }
-    }
-    match maybe {
-        some(value: [..]u8) {
-            take(sink value)
-        }
-        none {
-        }
-    }
-}
-";
-    assert_eq!(
-        one("moves", source),
-        [
-            "`a` is used after it was moved on line 11",
-            "`b` is used after it was moved on line 14",
-            "cannot move `borrowed`: the parameter is borrowed; declare it `sink` to own it",
-            "cannot move `edit` out of an `inout` parameter: the caller still owns it",
-            "`c` is used after it was moved on line 20",
-            "`e` is already passed `sink` by the `defer` on line 30",
-            "`m` is used after it was moved on line 34",
-            "`kept` is moved inside a loop, so the next pass would use it moved; give it a new value before the pass ends",
-            "cannot move `item`: a loop's binding borrows from what the loop goes over",
-            "`mine` is used after it was moved on line 71",
-            "cannot move `maybe`: the parameter is borrowed; declare it `sink` to own it",
-        ]
-    );
-}
-
-#[test]
 fn inout_arguments_do_not_overlap() {
     let source = "import std.heap
 
@@ -559,7 +448,7 @@ fn f(p: inout Pair, v: inout [4]u32, i: usize, j: usize) {
         err(error: _) {
         }
     }
-    free(sink items)
+    free(inout items)
 }
 ";
     assert_eq!(
@@ -643,33 +532,6 @@ let where: *u32 = &count
 }
 
 #[test]
-fn move_types() {
-    let source = "move type Handle (id: u32)
-
-type Holder (handle: Handle, count: u32)
-
-fn close(_: sink Handle) {
-}
-
-fn f() {
-    let a: Handle = Handle.(id: 1)
-    let b: Handle = a
-    close(sink a)
-    let held: Holder = Holder.(handle: b, count: 0)
-    let _: Holder = held
-    let _: u32 = held.count
-}
-";
-    assert_eq!(
-        one("move_types", source),
-        [
-            "`a` is used after it was moved on line 10",
-            "`held.count` is used after `held` was moved on line 13",
-        ]
-    );
-}
-
-#[test]
 fn pop_and_clear() {
     let source = "type Callback fn()
 
@@ -690,14 +552,13 @@ fn f(alloc: Allocator) {
     let push: Callback = tick
     push()
     let _: Callback = push
-    free(sink nums)
-    free(sink lists)
+    free(inout nums)
+    free(inout lists)
 }
 ";
     assert_eq!(
         one("pop_and_clear", source),
         [
-            "`clear` would leak the elements, since `[..]u8` owns memory; `pop` and `free` each one instead",
             "`pop` takes a `[..]T`, not `[2]u8`",
             "this calls the built-in `push`, not the local function value `push`; rename the local",
             "`push` takes 2 arguments, found 0",
@@ -706,42 +567,39 @@ fn f(alloc: Allocator) {
 }
 
 #[test]
-fn partial_moves() {
-    let source = "type Pair (a: [..]u8, b: [..]u8, n: u32)
+fn values_copy_and_free_empties() {
+    let source = "type Names (list: [..][]u8, count: u32)
 
 fn read(_: []u8) {
 }
 
-fn f(alloc: Allocator, borrowed: Pair, edit: inout Pair) {
-    var p: Pair = Pair.(a: make(alloc), b: make(alloc), n: 0)
-    free(sink p.a)
-    read(p.b)
-    let _: u32 = p.n
-    read(p.a)
-    p.a = make(alloc)
-    read(p.a)
-    free(sink p.a)
-    let _: Pair = p
-    free(sink borrowed.a)
-    free(sink edit.b)
-    var q: Pair = Pair.(a: make(alloc), b: make(alloc), n: 0)
-    defer free(sink q.b)
-    free(sink q.a)
-    free(sink q.b)
-    var r: Pair = Pair.(a: make(alloc), b: make(alloc), n: 0)
-    free(sink r.a)
-    r = Pair.(a: make(alloc), b: make(alloc), n: 1)
-    let _: Pair = r
+fn f(alloc: Allocator, given: [..]u8, edit: inout [..]u8) -> [..]u8 {
+    var a: [..]u8 = make(alloc)
+    let b: [..]u8 = a
+    read(a)
+    read(b)
+    let names: Names = Names.(list: make(alloc), count: 0)
+    let list: [..][]u8 = names.list
+    let _: u32 = names.count
+    var c: [..]u8 = take(inout a)
+    free(inout c)
+    free(inout c)
+    free(inout edit)
+    free(inout b)
+    free(inout given)
+    let n: u32 = 1
+    let _: [..]u8 = take(inout n)
+    let _: [..][]u8 = list
+    return a
 }
 ";
     assert_eq!(
-        one("partial_moves", source),
+        one("values_copy", source),
         [
-            "`p.a` is used after it was moved on line 8",
-            "`p` is used after `p.a` was moved on line 14",
-            "cannot move `borrowed.a`: the parameter is borrowed; declare it `sink` to own it",
-            "cannot move `edit.b` out of an `inout` parameter: the caller still owns it",
-            "`q.b` is already passed `sink` by the `defer` on line 19",
+            "cannot pass `inout` `b`: it is not a `var` or an `inout` parameter",
+            "cannot pass `inout` `given`: it is not a `var` or an `inout` parameter",
+            "cannot pass `inout` `n`: it is not a `var` or an `inout` parameter",
+            "`take` takes a `[..]T`, not `u32`",
         ]
     );
 }

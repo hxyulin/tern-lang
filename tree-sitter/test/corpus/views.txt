@@ -1,9 +1,9 @@
 ================================================================================
-View result and sink at the call site
+View result and inout at the call site
 ================================================================================
 
 fn find(haystack: []u8, needle: []u8) -> ?[]u8 {
-    consume(sink f)
+    consume(inout f)
     return none
 }
 
@@ -377,7 +377,7 @@ Growable arrays
 fn names(alloc: Allocator, text: []u8) -> [..][]u8 ! OutOfMemory {
     var out: [..][]u8 = make(alloc)
     try push(inout out, text)
-    defer free(sink out)
+    defer free(inout out)
     let n: usize = out.len
     return ok.(value: out)
 }

@@ -30,8 +30,9 @@ fn run() -> ! AppError {
         return err.(error: AppError.usage)
     }
     match read_all(heap.c_allocator, args[1]) {
-        ok(value as text: [..]u8) {
-            defer free(sink text)
+        ok(value: [..]u8) {
+            var text: [..]u8 = value
+            defer free(inout text)
             return check(text)
         }
         err(error: io.Error) {

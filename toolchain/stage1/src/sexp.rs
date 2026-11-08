@@ -135,10 +135,7 @@ impl Printer<'_> {
                 self.ident();
                 self.ty(*ty);
             }
-            DeclKind::Type { moves, def, .. } => {
-                if *moves {
-                    self.leaf("moving");
-                }
+            DeclKind::Type { def, .. } => {
                 self.ident();
                 self.type_def(def);
             }

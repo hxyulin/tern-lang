@@ -91,7 +91,6 @@ The running list. Each new keyword needs a reason.
 | `var` | mutable binding |
 | `return` | return statement |
 | `inout` | read-write parameter, written at the call site too |
-| `sink` | consuming parameter |
 | `defer` | cleanup at block exit |
 | `if`, `else` | branches, as a statement or an expression |
 | `for`, `in` | the one loop form |
@@ -106,12 +105,11 @@ The running list. Each new keyword needs a reason.
 | `union` | untagged unions, for C interop |
 | `shared` | a global reachable from interrupt handlers or other contexts |
 | `lock` | the only place a `shared` global can be accessed |
-| `move` | `move type`: a type whose values move instead of copying |
 
 `true` and `false` are predeclared names, not keywords, as in Go.
 
 Keywords are reserved everywhere, so none can be a field or variable
-name: a field cannot be called `type`, `in` or `sink`.
+name: a field cannot be called `type`, `in` or `inout`.
 `_` is a reserved token for discards, not a keyword.
 
 ### Keyword-led declarations and statements
@@ -812,7 +810,7 @@ predeclared, none keywords.
 | Types | `i8` `i16` `i32` `i64` `isize` `u8` `u16` `u32` `u64` `usize` `f32` `f64` `bool` `Allocator` `Format` `PanicInfo` `OutOfMemory` |
 | Values | `true` `false` `none` `some` `ok` `err` |
 | Control | `panic` |
-| Growable arrays | `make` `push` `pop` `append` `clear` `free` `copy` |
+| Growable arrays | `make` `push` `pop` `append` `clear` `free` `take` `copy` |
 | Arrays | `fill` |
 | Pointers | `from_address` `from_pointer` `offset` `cast` `volatile_load` `volatile_store` |
 | Conversions | `truncate` `c_string` |
@@ -966,8 +964,8 @@ The caller passes the address of its own storage when the argument is
 a local, or a field or element held in a local's memory or `[..]T`. It
 copies when the callee could change the value another way: the argument
 is a global, or is reached through a view or a pointer, or another
-argument of the same call holds a call that passes something `inout` or
-`sink`. A callee that changes the caller's value through an alias the
+argument of the same call holds a call that passes something `inout`.
+A callee that changes the caller's value through an alias the
 compiler cannot see, such as a global that an `inout` parameter also
 names, makes the change visible through the parameter; this is defined
 behavior, as for `inout` under [Exclusivity](#exclusivity). The
@@ -1065,8 +1063,8 @@ apply; attributes never change what code means.
 - **`parallel`**, structured fork-join: `parallel (a: f(x), b: g(y))`,
   checked like one call with several arguments, so branches can borrow
   from the caller. The user judged it too much for the initial design.
-- **Threads and channels.** A spawned function would take only `sink`
-  parameters and use only `shared` globals. The API needs the allocator
+- **Threads and channels.** A spawned function would take parameters
+  it alone holds and use only `shared` globals. The API needs the allocator
   model and generics.
 - **Atomics.** `lock` covers flags and counters at the cost of an
   interrupt mask or lock per access. An `atomic u32` usable without a lock
@@ -1147,7 +1145,7 @@ code (goal 3). The model has these layers.
 ### Temporal safety: not checked
 
 **Decided (2026-11-08).** The first version checks spatial safety only:
-bounds, null, and use after `sink`. It does not check that a view or
+bounds and null. It does not check that a view or
 pointer outlives what it points into. This is where Zig and Odin stand.
 
 The earlier design checked temporal safety without lifetimes: views could
@@ -1192,31 +1190,13 @@ b.x = 10
 // a.x is still 1
 ```
 
-The compiler avoids the copies. An assignment from a variable that is not
-used again is a move. A large read-only parameter is passed by pointer,
-which no code can observe.
+The exception is a handle: a view or a `[..]T` refers to elements stored
+elsewhere, and a copy of it refers to the same elements (see
+[Values and buffers](#values-and-buffers)).
 
-**Decided (2026-11-08):** types that own resources are move-only.
-`var b: [..]u8 = a` moves if `a` is not used again and is an error
-otherwise. Copying is written out (`try copy(alloc, a)`), so a reviewer
-sees every expensive copy.
-
-**Decided (2026-11-08):** `move type` marks a type whose values move
-instead of copying, for a resource the compiler cannot see, such as a
-file descriptor held in a `c.int`.
-
-```
-pub move type File (fd: c.int)
-```
-
-- A type that holds a `move type` or a `[..]T` moves too.
-- It is a keyword, not an attribute, because it changes which rules
-  apply, as `shared` does.
-- Rejected: an attribute (`@move`), which would break the rule that
-  attributes never change meaning, and moving every record by default
-  with `copy type` to opt out, as Rust does. Most small records, such as
-  points and handles, copy, and copying by default matches mutable
-  value semantics and C.
+The compiler avoids the copies. A large read-only parameter is passed by
+pointer (see [One calling convention](#one-calling-convention)), and an
+assignment from a variable that is not used again can reuse its storage.
 
 Sources: Hylo (formerly Val) and Swift structs. Paper: Dimitri Racordon,
 Denys Shabalin, Daniel Zheng, Dave Abrahams and Brennan Saeta,
@@ -1224,6 +1204,56 @@ Denys Shabalin, Daniel Zheng, Dave Abrahams and Brennan Saeta,
 Technology 21(2), 2022. It expands "Native Implementation of Mutable Value
 Semantics" (ICOOOLPS 2021, arXiv 2106.12678). Checked on 2026-11-08
 against the Google Research listing and the authors' preprint.
+
+### Values and buffers
+
+**Decided (2026-11-08), replacing move-only types.** Every type copies,
+byte for byte. Nothing moves, and the compiler tracks no ownership.
+
+- A `[..]T` is a handle: a pointer to its buffer, a length, a capacity
+  and an allocator. Copying it copies the handle, not the buffer, so
+  two copies refer to the same elements, as in Zig. A deep copy is
+  written out: `try copy(alloc, v)`.
+- `free(inout v)` frees the buffer and leaves `v` empty: no buffer,
+  length and capacity 0, the same allocator. Freeing an empty array
+  does nothing, so freeing a variable twice is harmless, and the array
+  can grow again.
+- `take(inout v)` returns the array and leaves `v` empty. It is the
+  explicit hand-off, for when a local stays alive after its buffer
+  goes elsewhere: `try push(inout words, take(inout line))`. From
+  Rust's `mem::take`.
+- `free` frees one level. `free(inout words)` on a `[..][..]u8` frees
+  the outer buffer only; each element needs its own `free`. A deep
+  `free` would need to know which copies own their buffer, which is the
+  tracking this design removes. Structures built together belong in an
+  arena, freed with one call.
+- A resource handle follows the same convention. `io.File` is a plain
+  record; `io.close(inout f)` sets the descriptor to -1, so a second
+  `close` does nothing.
+- What this gives up: the compiler no longer reports a double free or a
+  use after free of a container. Both need two live copies of one
+  handle; a debug allocator catches them in tests, as it catches a
+  dangling view.
+
+The user chose this on 2026-11-08 because the earlier model was neither
+simple nor intuitive. It tracked ownership without freeing anything
+automatically, and without making memory safe, since views were already
+unchecked. Every friction item from porting the lexer and parser came
+from that tracking: destructuring a record to free it, partial moves,
+the rule that `clear` could not drop owning elements, and who owned a
+`match` payload.
+
+Rejected on 2026-11-08:
+
+- **Move-only types** (decided earlier that day): a type that held a
+  `[..]T` or a `move type` moved instead of copying, so `let b: T = a`
+  copied or moved depending on what `T` held, possibly several levels
+  down. The checker tracked moved locals and fields through each
+  function's control flow, with rules for loops, `defer` and `match`
+  payloads.
+- **Declared owners with a deep `free`:** owners stay tracked, but a
+  record holding a `[..]T` must say `move type`, and `free` frees every
+  owning part. It removed the invisible part and kept every move rule.
 
 ### Second-class references and parameter modes
 
@@ -1239,9 +1269,8 @@ Parameter modes:
   `p: let Point`, so it has one spelling (decided 2026-11-08).
 - `inout`: read and write. The call site writes `inout` too, so a reviewer
   knows a call can change only the arguments marked `inout`.
-- `sink`: takes ownership. The caller cannot use the value afterward. The
-  call site writes `sink` too (decided 2026-11-08), so a reviewer sees
-  where a value stops being usable.
+- `sink`, which took ownership, was removed on 2026-11-08 with move-only
+  types: nothing is owned, so there is nothing to take.
 
 ```
 fn bump(p: inout Point) {
@@ -1249,10 +1278,9 @@ fn bump(p: inout Point) {
 }
 
 bump(inout a)
-consume(sink f)
 ```
 
-Sources: Hylo's `let`, `inout`, `sink` modes; Swift's `inout` with `&` at
+Sources: Hylo's `let` and `inout` modes; Swift's `inout` with `&` at
 the call site; Pascal and Ada parameter modes. On second-class values in
 general: Leo Osvald, Grégory Essertel, Xilun Wu, Lilliam I. González
 Alayón and Tiark Rompf, "Gentrification Gone too Far? Affordable 2nd-Class
@@ -1501,7 +1529,7 @@ fn names(alloc: Allocator, text: []u8) -> [..][]u8 ! OutOfMemory {
 }
 
 var v: [..][]u8 = try names(heap.c_allocator, text)
-defer free(sink v)
+defer free(inout v)
 ```
 
 - A function that creates allocating values takes an `Allocator`, so its
@@ -1518,9 +1546,8 @@ defer free(sink v)
   allocation shows as a `try`, and kernels and embedded code can handle
   the failure. Rejected: Rust's `push`, which stops the program instead,
   hiding each allocation point and making the failure fatal.
-- Release is explicit, with `free(sink v)` and usually `defer`.
-  Containers are move-only (see
-  [Mutable value semantics](#mutable-value-semantics)).
+- Release is explicit, with `free(inout v)` and usually `defer` (see
+  [Values and buffers](#values-and-buffers)).
 
 ### Growable arrays: `[..]T`
 
@@ -1533,10 +1560,10 @@ Jai's. `[..]u8` is the owned string; there is no separate `String`.
 - It has `.len`, and passing it where a `[]T` is expected makes a view.
 - It needs no generic type syntax such as `List[T]`, which the grammar
   does not have.
-- `pop(inout v)` removes the last element and returns it as a `?T`,
-  moving it out if it moves. `clear(inout v)` sets the length to 0 and
-  keeps the memory; it is an error when the elements own memory, since
-  they would leak. Added on 2026-11-08 for the lexer's stack.
+- `pop(inout v)` removes the last element and returns it as a `?T`.
+  `clear(inout v)` sets the length to 0 and keeps the memory; elements
+  that hold buffers of their own are not freed. Added on 2026-11-08 for
+  the lexer's stack.
 - `push` can move the elements, which leaves earlier views of them
   dangling. Nothing checks this (see
   [Temporal safety](#temporal-safety-not-checked)); a debug allocator
@@ -1655,6 +1682,8 @@ Rejected on 2026-11-08:
   ran into, and the main source of difficulty when reading Rust.
 - **Second-class views with `uses` lists** (this design until
   2026-11-08): see [Temporal safety](#temporal-safety-not-checked).
+- **Move-only types with ownership tracking** (this design until
+  2026-11-08): see [Values and buffers](#values-and-buffers).
 
 ## Runtime
 
@@ -1801,8 +1830,8 @@ proposal for the user to confirm.
   function. The backend is keel (decided 2026-11-08): stage 1 takes it
   as a git dependency on https://github.com/hxyulin/keel, pinned to a
   commit in `Cargo.lock`, now `b56275c`.
-- The safety checks are local: bounds, null, use after `sink`, and
-  exclusivity at each call site. Nothing crosses function boundaries.
+- The safety checks are local: bounds, null, and exclusivity at each
+  call site. Nothing crosses function boundaries.
 
 ### Stage 1
 
@@ -1818,7 +1847,7 @@ Decided the same day:
   literals; an operator takes the type of its other operand. Assigning
   to a `let`, or passing it `inout`, is an error, and so is a call
   statement that ignores a result. The same pass checks `unsafe`,
-  `shared` access, moves, exclusivity, the `Format` parameter rule and
+  `shared` access, exclusivity, the `Format` parameter rule and
   constant initializers.
 - **Parser:** hand-written recursive descent, one function per rule of
   the tree-sitter grammar. It prints its tree in tree-sitter's
@@ -1834,32 +1863,10 @@ Decided the same day:
 follow the decided rules where those reach, and fill gaps where they do
 not. The user agreed to each.
 
-- **What moves.** A `move type` moves, and so does a type that holds a
-  `[..]T` or a `move type`, directly or through a record, tuple, array,
-  enum payload, optional or result. `io.File` is a `move type`.
-- **A move takes a local, or a field of one.** Changed on 2026-11-08
-  from whole locals only, after the lexer port had to destructure a
-  record to free its `[..]T` fields. `free(sink l.tokens)` moves one
-  field of a local the function owns: using `l.tokens`, or `l` as a
-  whole, is then an error, while `l`'s other fields stay usable, and
-  `l.tokens = ...` restores it. Moving out of an element, a pointer or
-  a global is still an error. A parameter passed without `sink`, an
-  `inout` parameter and a `for` binding do not own their value, so
-  neither they nor their fields can be moved.
-- **Where values move.** Binding, returning, assigning, storing in a
-  construction or array literal, `push`, and passing `sink`. Passing to
-  a plain parameter, interpolating and comparing do not move. `sink`
-  moves a local of any type; the others move only a moving type.
-- **Flow.** A local or field moved on any path that reaches a point
-  counts as moved there; `x = ...` or `x.f = ...` gives it a value
-  again. A local declared
-  outside a loop and moved on a path back to the loop's top is an
-  error. A `defer` moves what it passes `sink` when its block ends, so
-  the value stays usable until then.
-- **`match` payloads.** A payload bound by a `match` on a local belongs
-  to that local: moving the payload moves the local. A payload of a
-  `match` on a call's result is owned; on a field or global it is
-  borrowed.
+- **Moves.** Removed on 2026-11-08 with move-only types; see
+  [Values and buffers](#values-and-buffers). The checker had tracked
+  moved locals and fields through each function's control flow, with
+  rules for loops, `defer` and `match` payloads.
 - **`unsafe`.** The body of an `unsafe fn` is not an `unsafe` block, so
   each unchecked operation inside still sits in one, as std already
   writes it. `volatile_load`, `volatile_store` and `from_pointer` need
@@ -1903,8 +1910,8 @@ not. The user agreed to each.
 - **The C calling convention, with the specified layouts.** A value in
   memory is returned through `sret`; an `inout` argument is a pointer.
   A `let` parameter in memory is a pointer to the caller's value (see
-  [One calling convention](#one-calling-convention)); a `sink` one, and
-  a record an `extern` function takes, is passed `byval`. The layouts
+  [One calling convention](#one-calling-convention)); a record an
+  `extern` function takes is passed `byval`. The layouts
   stay Leaning: the user asked to change them as development needs.
 - **Everything but `@export` functions is local to the program**
   (2026-11-08). The module is the whole program, so keel may inline any
@@ -1952,8 +1959,8 @@ lexer and then the parser.
   arenas of their own. The parser gathers a list on a scratch stack and
   copies it into `extra` once it is complete. No node owns memory, so
   freeing the tree is one `free` per arena. Rejected: nodes that own
-  `[..]T` lists as stage 1's do, which makes every node a move type and
-  freeing a walk over the tree.
+  `[..]T` lists as stage 1's do, which makes freeing a walk over the
+  tree.
 - **The parser is tested like the lexer.** `ternc parse FILE` prints
   what stage 1's prints: the S-expression tree, or the diagnostics. The
   test compares the two on every tern file and every tree-sitter corpus
@@ -1971,7 +1978,9 @@ Friction found while porting the lexer, and what became of it:
 
 - `[..]T` had no `pop` or `clear`: both are now built-ins.
 - Freeing a record that holds `[..]T` fields took destructuring every
-  field: a field of a local can now be moved out.
+  field. A field of a local could then be moved out; since the move to
+  [Values and buffers](#values-and-buffers), nothing moves and
+  `free(inout l.tokens)` simply frees it.
 - `offset` could not name a parameter: built-in functions are now names
   only in call position.
 - Input was not checked to be UTF-8: both compilers now check it.

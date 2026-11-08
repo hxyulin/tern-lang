@@ -53,7 +53,6 @@ fn paren {}
 fn brace() u8
 extern let errno u8
 unsafe type T u8
-move fn f() {}
 extern type T u8
 shared let x: u8 = 1
 }

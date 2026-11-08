@@ -23,7 +23,7 @@ pub fn describe(e: Error) -> []u8 {
     }
 }
 
-pub move type File (fd: c.int)
+pub type File (fd: c.int)
 
 let max_path: usize = 1024
 
@@ -48,7 +48,8 @@ pub fn close(f: inout File) {
     if i32.(f.fd) < 0 {
         return
     }
-    // SAFETY: f.fd is a descriptor from open, and is closed only once.
+    // SAFETY: f.fd is a descriptor from open. Closing sets it to -1, so a
+    // second close returns above.
     let _: c.int = unsafe { libc.close(f.fd) }
     f.fd = c.int.(-1)
 }
@@ -65,14 +66,14 @@ pub fn read_to_end(alloc: Allocator, f: inout File) -> [..]u8 ! Error {
             return ok.(value: out)
         }
         if count < 0 {
-            free(sink out)
+            free(inout out)
             return err.(error: Error.read_failed)
         }
         match append(inout out, buf[..usize.(count)]) {
             ok {
             }
             err(error: _) {
-                free(sink out)
+                free(inout out)
                 return err.(error: Error.out_of_memory)
             }
         }
