@@ -24,7 +24,7 @@ fn main() -> u8 {
 }
 
 fn run() -> ! AppError {
-    let args: []str = os.args()
+    let args: [][]u8 = os.args()
     if args.len != 2 {
         return err.(error: AppError.usage)
     }
@@ -38,13 +38,13 @@ fn run() -> ! AppError {
     }
 }
 
-fn read_all(path: str) -> String ! io.Error {
+fn read_all(path: []u8) -> String ! io.Error {
     var f: io.File = try io.open(path)
     defer io.close(inout f)
     return io.read_to_end(inout f)
 }
 
-fn check(text: str) -> ! AppError {
+fn check(text: []u8) -> ! AppError {
     var line_no: u32 = 0
     var start: usize = 0
     for start < text.len {
@@ -67,17 +67,17 @@ fn show(line: ini.Line) {
     match line {
         blank {
         }
-        section(name: str) {
+        section(name: []u8) {
             io.print("[{name}]\n")
         }
-        pair(key: str, value: str) {
+        pair(key: []u8, value: []u8) {
             io.print("  {key} = {value}\n")
         }
     }
 }
 
 // The index of the next '\n' at or after start, or the end of text.
-fn line_end(text: str, start: usize) -> usize {
+fn line_end(text: []u8, start: usize) -> usize {
     var i: usize = start
     for i < text.len && text[i] != '\n' {
         i += 1
@@ -99,7 +99,7 @@ fn report(e: AppError) {
     }
 }
 
-fn describe(e: ini.ParseError) -> str {
+fn describe(e: ini.ParseError) -> []u8 {
     return match e {
         missing_equals { "expected key = value" }
         empty_key { "empty key" }

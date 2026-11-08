@@ -185,7 +185,7 @@ fn f() {
         rect(w: f32, h: f32) { w * h }
         empty { 0.0 }
     }
-    let name: str = match code { 0 { "ok" }; -1 { "failed" }; 'x' { "exit" }; _ { "other" } }
+    let name: []u8 = match code { 0 { "ok" }; -1 { "failed" }; 'x' { "exit" }; _ { "other" } }
 }
 
 --------------------------------------------------------------------------------
@@ -238,8 +238,9 @@ fn f() {
               (float_literal)))))
       (let_declaration
         (identifier)
-        (type_name
-          (identifier))
+        (view_type
+          (type_name
+            (identifier)))
         (match_expression
           (identifier)
           (match_expression_arm

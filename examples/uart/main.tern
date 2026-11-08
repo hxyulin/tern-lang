@@ -16,7 +16,7 @@ type Command enum {
 let gpio_out: *u32 = from_address[*u32](0x4002_0014)
 let led_pin: u32 = 1 << 5
 
-let prompt: str = "> "
+let prompt: []u8 = "> "
 
 // 115200 baud from a 48 MHz clock.
 let baud_divisor: u32 = 26
@@ -35,7 +35,7 @@ fn main() {
             some(value: u8) {
                 if value == '\r' {
                     board.write_str("\r\n")
-                    run(str.(line[..n]))
+                    run(line[..n])
                     n = 0
                     board.write_str(prompt)
                 } else if n < line.len {
@@ -48,7 +48,7 @@ fn main() {
     }
 }
 
-fn run(line: str) {
+fn run(line: []u8) {
     match parse_command(line) {
         led_on {
             set_led(true)
@@ -67,7 +67,7 @@ fn run(line: str) {
     }
 }
 
-fn parse_command(line: str) -> Command {
+fn parse_command(line: []u8) -> Command {
     return match line {
         "led on" { Command.led_on }
         "led off" { Command.led_off }

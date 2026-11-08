@@ -10,7 +10,7 @@ type Buffer (data: *u8, len: usize)
 pub let origin: Point = Point.(x: 0, y: 0)
 var count: u32 = 0
 
-pub fn open(path: str) -> io.File ! io.Error {
+pub fn open(path: []u8) -> io.File ! io.Error {
     let f: io.File = try io.open(path)
     return ok.(value: f)
 }
@@ -81,8 +81,9 @@ pub fn open(path: str) -> io.File ! io.Error {
     (parameter_list
       (parameter
         (identifier)
-        (type_name
-          (identifier))))
+        (view_type
+          (type_name
+            (identifier)))))
     (result_type
       (type_name
         (identifier)

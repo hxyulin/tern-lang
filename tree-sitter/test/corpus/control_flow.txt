@@ -46,7 +46,7 @@ If expression
 
 fn f() {
     let x: i32 = if c { a } else { b }
-    let s: str = if n == 0 { "none" } else if n == 1 { "one" } else { "many" }
+    let s: []u8 = if n == 0 { "none" } else if n == 1 { "one" } else { "many" }
     let y: i32 = if c {
         a
     } else {
@@ -75,8 +75,9 @@ fn f() {
             (identifier))))
       (let_declaration
         (identifier)
-        (type_name
-          (identifier))
+        (view_type
+          (type_name
+            (identifier)))
         (if_expression
           (comparison_expression
             (identifier)

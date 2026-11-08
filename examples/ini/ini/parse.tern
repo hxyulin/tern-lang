@@ -7,8 +7,8 @@
 
 pub type Line enum {
     blank
-    section(name: str)
-    pair(key: str, value: str)
+    section(name: []u8)
+    pair(key: []u8, value: []u8)
 }
 
 pub type ParseError enum {
@@ -17,8 +17,8 @@ pub type ParseError enum {
     unclosed_section
 }
 
-pub fn parse_line(line: str) -> Line ! ParseError {
-    let t: str = trim(strip_comment(line))
+pub fn parse_line(line: []u8) -> Line ! ParseError {
+    let t: []u8 = trim(strip_comment(line))
     if t.len == 0 {
         return ok.(value: Line.blank)
     }
@@ -26,25 +26,25 @@ pub fn parse_line(line: str) -> Line ! ParseError {
         if t[t.len - 1] != ']' {
             return err.(error: ParseError.unclosed_section)
         }
-        let name: str = trim(t[1..t.len - 1])
+        let name: []u8 = trim(t[1..t.len - 1])
         return ok.(value: Line.section.(name: name))
     }
     match index_of(t, '=') {
         none {
             return err.(error: ParseError.missing_equals)
         }
-        some(value: usize) {
-            let key: str = trim(t[..value])
+        some(value as eq: usize) {
+            let key: []u8 = trim(t[..eq])
             if key.len == 0 {
                 return err.(error: ParseError.empty_key)
             }
-            let rest: str = trim(t[value + 1..])
+            let rest: []u8 = trim(t[eq + 1..])
             return ok.(value: Line.pair.(key: key, value: rest))
         }
     }
 }
 
-fn strip_comment(s: str) -> str {
+fn strip_comment(s: []u8) -> []u8 {
     for let i: usize in 0..s.len {
         match s[i] {
             ';' {
@@ -60,7 +60,7 @@ fn strip_comment(s: str) -> str {
     return s
 }
 
-fn trim(s: str) -> str {
+fn trim(s: []u8) -> []u8 {
     var a: usize = 0
     var b: usize = s.len
     for a < b && is_space(s[a]) {
@@ -76,7 +76,7 @@ fn is_space(c: u8) -> bool {
     return c == ' ' || c == '\t' || c == '\r'
 }
 
-fn index_of(s: str, c: u8) -> ?usize {
+fn index_of(s: []u8, c: u8) -> ?usize {
     for let i: usize in 0..s.len {
         if s[i] == c {
             return some.(value: i)

@@ -2,7 +2,7 @@
 View result and sink at the call site
 ================================================================================
 
-fn find(haystack: str, needle: str) -> ?str {
+fn find(haystack: []u8, needle: []u8) -> ?[]u8 {
     consume(sink f)
     return none
 }
@@ -15,15 +15,18 @@ fn find(haystack: str, needle: str) -> ?str {
     (parameter_list
       (parameter
         (identifier)
-        (type_name
-          (identifier)))
+        (view_type
+          (type_name
+            (identifier))))
       (parameter
         (identifier)
+        (view_type
+          (type_name
+            (identifier)))))
+    (optional_type
+      (view_type
         (type_name
           (identifier))))
-    (optional_type
-      (type_name
-        (identifier)))
     (block
       (expression_statement
         (call_expression
@@ -100,7 +103,7 @@ Function types
 ================================================================================
 
 type Less fn(i32, i32) -> bool
-type Handler (name: str, run: fn(inout Ctx) -> ! Error)
+type Handler (name: []u8, run: fn(inout Ctx) -> ! Error)
 
 fn sort(v: inout []i32, less: fn(i32, i32) -> bool) {
     sort(inout v, less)
@@ -125,8 +128,9 @@ fn sort(v: inout []i32, less: fn(i32, i32) -> bool) {
     (tuple_type
       (tuple_type_field
         (identifier)
-        (type_name
-          (identifier)))
+        (view_type
+          (type_name
+            (identifier))))
       (tuple_type_field
         (identifier)
         (function_type
@@ -322,12 +326,12 @@ fn f() {
 Views in fields, payloads and globals
 ================================================================================
 
-let prompt: str = "> "
+let prompt: []u8 = "> "
 
-type LineIter (rest: str)
+type LineIter (rest: []u8)
 
 type Line enum {
-    pair(key: str, value: str)
+    pair(key: []u8, value: []u8)
 }
 
 --------------------------------------------------------------------------------
@@ -336,8 +340,9 @@ type Line enum {
   (global_declaration
     (let_declaration
       (identifier)
-      (type_name
-        (identifier))
+      (view_type
+        (type_name
+          (identifier)))
       (string_literal
         (string_content))))
   (type_declaration
@@ -345,8 +350,9 @@ type Line enum {
     (tuple_type
       (tuple_type_field
         (identifier)
-        (type_name
-          (identifier)))))
+        (view_type
+          (type_name
+            (identifier))))))
   (type_declaration
     (identifier)
     (enum_type
@@ -355,9 +361,11 @@ type Line enum {
         (tuple_type
           (tuple_type_field
             (identifier)
-            (type_name
-              (identifier)))
+            (view_type
+              (type_name
+                (identifier))))
           (tuple_type_field
             (identifier)
-            (type_name
-              (identifier))))))))
+            (view_type
+              (type_name
+                (identifier)))))))))

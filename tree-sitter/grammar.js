@@ -289,8 +289,14 @@ module.exports = grammar({
     // let (q: u32, r: _) = ...
     destructuring_pattern: ($) => seq('(', commaSep1($.destructuring_field), ')'),
 
+    // q: u32, or q as quotient: u32 to bind field q under another name.
     destructuring_field: ($) =>
-      seq(field('name', $.identifier), ':', field('type', choice($._type, $.discard))),
+      seq(
+        field('name', $.identifier),
+        optional(seq('as', field('binding', $.identifier))),
+        ':',
+        field('type', choice($._type, $.discard)),
+      ),
 
     discard: (_) => '_',
 

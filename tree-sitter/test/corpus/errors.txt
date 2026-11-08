@@ -106,7 +106,7 @@ type Lookup (hit: ?u32, raw: []u8 ! ParseError)
 try and defer
 ================================================================================
 
-fn copy(path: str) -> usize ! IoError {
+fn copy(path: []u8) -> usize ! IoError {
     var f: File = try open(path)
     defer close(inout f)
     try save(inout f)
@@ -122,8 +122,9 @@ fn copy(path: str) -> usize ! IoError {
     (parameter_list
       (parameter
         (identifier)
-        (type_name
-          (identifier))))
+        (view_type
+          (type_name
+            (identifier)))))
     (result_type
       (type_name
         (identifier))
@@ -272,3 +273,47 @@ fn f() {
                 (argument_list
                   (argument
                     (identifier)))))))))))
+
+================================================================================
+Renamed payload binding
+================================================================================
+
+fn f() {
+    match next {
+        some(value as b: u8) {
+            g(b)
+        }
+        none {
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (match_statement
+        (identifier)
+        (match_arm
+          (variant_pattern
+            (identifier)
+            (destructuring_pattern
+              (destructuring_field
+                (identifier)
+                (identifier)
+                (type_name
+                  (identifier)))))
+          (block
+            (expression_statement
+              (call_expression
+                (identifier)
+                (argument_list
+                  (argument
+                    (identifier)))))))
+        (match_arm
+          (variant_pattern
+            (identifier))
+          (block))))))

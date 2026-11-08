@@ -52,3 +52,4 @@
 (global_name package: (identifier) @module)
 (attribute_name) @attribute
 (variadic) @punctuation.special
+(destructuring_field binding: (identifier) @variable)

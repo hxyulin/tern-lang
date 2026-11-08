@@ -298,6 +298,7 @@ fn f() {
     let (q: u32, r: u32) = divmod(17, 5)
     let (r: _, q: u32) = divmod(17, 5)
     var (x: i32, y: i32) = p
+    let (q as quotient: u32, r: _) = divmod(17, 5)
     let _: u32 = g()
 }
 
@@ -353,6 +354,23 @@ fn f() {
               name: (identifier))))
         value: (identifier))
       (let_declaration
+        pattern: (destructuring_pattern
+          (destructuring_field
+            name: (identifier)
+            binding: (identifier)
+            type: (type_name
+              name: (identifier)))
+          (destructuring_field
+            name: (identifier)
+            type: (discard)))
+        value: (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (argument
+              value: (integer_literal))
+            (argument
+              value: (integer_literal)))))
+      (let_declaration
         name: (discard)
         type: (type_name
           name: (identifier))
@@ -370,7 +388,7 @@ fn bump() {
     counter += 1
 }
 
-fn report(s: str, t: str) -> str {
+fn report(s: []u8, t: []u8) -> []u8 {
     write(inout log.out, "{counter}")
     return s
 }
@@ -396,14 +414,17 @@ fn report(s: str, t: str) -> str {
     (parameter_list
       (parameter
         (identifier)
-        (type_name
-          (identifier)))
+        (view_type
+          (type_name
+            (identifier))))
       (parameter
         (identifier)
-        (type_name
-          (identifier))))
-    (type_name
-      (identifier))
+        (view_type
+          (type_name
+            (identifier)))))
+    (view_type
+      (type_name
+        (identifier)))
     (block
       (expression_statement
         (call_expression

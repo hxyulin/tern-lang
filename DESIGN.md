@@ -99,7 +99,7 @@ The running list. Each new keyword needs a reason.
 | `enum` | sum types and integer enums |
 | `match` | branch on a value, as a statement or an expression |
 | `try` | return early on `err` or `none` |
-| `import`, `as` | import a package, renaming it on a clash |
+| `import`, `as` | import a package, renaming it on a clash; `as` also renames a destructured field |
 | `pub` | visible outside the package |
 | `unsafe` | unchecked operations, and functions with unchecked preconditions |
 | `extern` | a C function declared without a body |
@@ -262,7 +262,11 @@ now. UTF-8 and UTF-16 handling goes in the standard library until a need
 for language support shows up. ASCII is a subset of UTF-8, so every literal
 stays valid if UTF-8 moves into the language later.
 
-- `str` is a byte view with no encoding guarantee.
+- A string literal is a `[]u8`, a view of static bytes, with no encoding
+  guarantee. There is no separate `str` type (decided 2026-11-08, the
+  user's proposal): one byte view type covers text and binary data, and
+  indexing and slicing it use byte offsets, as for any view. A UTF-8
+  string type can come from the standard library.
 - A string literal holds printable ASCII (`0x20` to `0x7E`). A tab, a
   newline or any other control character must be an escape, so invisible
   or direction-changing characters cannot hide in a literal (the "Trojan
@@ -400,7 +404,7 @@ assigned in each branch.
 
 ```
 let x: i32 = if c { a } else { b }
-let s: str = if n == 0 { "none" } else if n == 1 { "one" } else { "many" }
+let s: []u8 = if n == 0 { "none" } else if n == 1 { "one" } else { "many" }
 ```
 
 - The `else` is required.
@@ -420,7 +424,7 @@ for i < n { ... }                           // while
 for let p: Point in points { ... }          // over an array or view
 for let (k: Key, v: Value) in pairs { ... } // with destructuring
 for let i: u32 in 0..n { ... }              // over a range
-for var line: str in lines { ... }          // the body may change its copy
+for var line: []u8 in lines { ... }          // the body may change its copy
 ```
 
 - No C-style three-part `for`.
@@ -509,7 +513,7 @@ extra unwrapping syntax.
 ```
 fn read(f: inout File, buf: inout []u8) -> usize ! IoError { ... }
 
-fn copy(path: str) -> usize ! IoError {
+fn copy(path: []u8) -> usize ! IoError {
     var f: File = try open(path)
     defer close(inout f)
     let n: usize = try read(inout f, inout buf)
@@ -636,8 +640,21 @@ let (x: i32, y: i32) = p            // p: Point
   skipped.
 - It works on named types such as `Point`, which are named tuples
   underneath.
-- There is no renaming. To use other names, bind the whole value and read
-  its fields: `let d: (q: u32, r: u32) = divmod(17, 5)`, then `d.q`.
+- **Decided (2026-11-08):** `as` binds a field under another name:
+  `let (q as quotient: u32, r: _) = divmod(17, 5)`. It reads "field `q`,
+  as `quotient`, of type `u32`". It reuses the import keyword. The same
+  form works in `match` payloads, where a nested match would otherwise
+  shadow the outer binding:
+
+  ```
+  match next {
+      some(value as b: u8) { ... }
+      none { ... }
+  }
+  ```
+
+  The examples raised the need. Renaming a skipped field
+  (`r as x: _`) is a checker error.
 
 Rejected: `let (q: quot, r: rem) = ...` for renaming, because it reuses
 `name: Type` with a different meaning.
@@ -713,7 +730,7 @@ extern fn printf(format: *u8, ...) -> c.int
 - An `extern fn` declares a C function and has no body.
 - Calling one is always `unsafe`, because C can do anything.
 - Parameters and results use integers, floats, pointers, `?*T`, records
-  and integer enums. Views and `str` cannot cross: pass a pointer and a
+  and integer enums. Views cannot cross: pass a pointer and a
   length.
 - `...` marks a C variadic function. It comes last, and only in an
   `extern` declaration.
@@ -864,6 +881,19 @@ let f: io.File = try io.open(path)
 - Packages cannot form import cycles (see
   [Compiler design](#compiler-design)).
 
+**Leaning (2026-11-08): import roots.** A project file at the project's
+root names the project and its dependencies. An import path resolves in
+one of three places:
+
+- `std.` starts a standard library path. The name `std` is reserved.
+- A first segment that names a dependency in the project file starts a
+  path inside that dependency: `import vendor.x.io`.
+- Anything else is a directory under the project root: `import board`
+  is `<root>/board/`.
+
+This is Go modules without repeating the module name in every import.
+The project file's format is open.
+
 ### Visibility
 
 **Decided (2026-11-08).** `pub` marks a top-level declaration or a field
@@ -1012,8 +1042,7 @@ arguments and C's `restrict`. If it is, the backend can mark every
 
 ### Views
 
-**Decided.** Slices are a built-in view type, `[]T`, and `str` is a byte
-view. A view is a pointer and a length into memory owned by something
+**Decided.** Slices are a built-in view type, `[]T`. Text is `[]u8`. A view is a pointer and a length into memory owned by something
 else.
 
 **Decided (2026-11-08):** views are ordinary values. A view can be a
@@ -1023,15 +1052,15 @@ Nothing checks that it outlives what it points into (see
 
 ```
 pub type Line enum {
-    section(name: str)
-    pair(key: str, value: str)
+    section(name: []u8)
+    pair(key: []u8, value: []u8)
 }
 
-fn trim(s: str) -> str { ... }
-fn find(haystack: str, needle: str) -> ?str { ... }
+fn trim(s: []u8) -> []u8 { ... }
+fn find(haystack: []u8, needle: []u8) -> ?[]u8 { ... }
 ```
 
-A string literal is a view of static data, so `let prompt: str = "> "`
+A string literal is a view of static data, so `let prompt: []u8 = "> "`
 is a valid global.
 
 Rejected on 2026-11-08 with temporal safety: views only as locals,
@@ -1054,9 +1083,6 @@ where an array has `length` and a list has `size()`.
 **Decided (2026-11-08).** `s[a..b]` makes a view of `s` from `a` up to,
 not including, `b`. `s[a..]` and `s[..b]` omit an end, which is allowed
 only inside brackets. `s[..]` is not allowed; it is just `s`.
-
-**Open:** what indexing and slicing a `str` mean now that `str` is a byte
-view: byte offsets, as in Go, are the likely answer.
 
 ### Fixed arrays
 
@@ -1126,7 +1152,7 @@ pointers and Zig's pointers.
 ```
 var x: u32 = 0
 let p: *u32 = &x
-let uart: *u32 = unsafe { from_address[*u32](0x4000_0000) }
+let uart: *u32 = from_address[*u32](0x4000_0000)
 unsafe {
     p.* = 5
     h.*.next.*.len = 0
@@ -1138,7 +1164,8 @@ unsafe {
 - A `*T` is never null. `?*T` is the nullable pointer, the same size as
   `*T`, and null checks go through `match`.
 - An integer address becomes a pointer through the built-in
-  `from_address[*T](n)`. Offsets use `offset(p, n)`; `+` never applies to
+  `from_address[*T](n)`. It is safe, since creating a pointer is safe
+  (decided 2026-11-08); only the dereference needs `unsafe`. Offsets use `offset(p, n)`; `+` never applies to
   pointers.
 
 ### `unsafe`
@@ -1147,7 +1174,7 @@ unsafe {
 
 - `unsafe { ... }` is a block where unchecked operations are allowed.
   Like `if`, it also has an expression form holding one expression:
-  `let p: *u32 = unsafe { from_address[*u32](a) }`.
+  `let v: u32 = unsafe { p.* }`.
 - An `unsafe fn` has preconditions the compiler cannot check, and can be
   called only inside `unsafe`.
 - A lint requires a `// SAFETY:` comment above each `unsafe` block, so the
@@ -1182,9 +1209,20 @@ fn bump() {
 }
 ```
 
-- Global initializers are constant: literals, constructions and other
-  constants. Nothing runs before `main`, matching "no user code at
-  compile time".
+- Global initializers are constant. Nothing runs before `main`, matching
+  "no user code at compile time".
+
+**Decided (2026-11-08):** a constant is a literal, a construction, an
+operator applied to constants, another `let` global, or one of a closed
+list of built-ins: `from_address`, `fill`, `c_string`, `truncate`, and
+`.len` on an array. There are no user constant functions; Go's constant
+expressions with `len` and `unsafe.Sizeof` work the same way.
+
+```
+let uart: *Regs = from_address[*Regs](0x4000_C000)
+let table: [256]u8 = fill[256](0)
+let mask: u32 = 1 << 5
+```
 - A global reachable from an interrupt handler is declared `shared` and
   accessed inside `lock`. See [Concurrency](#concurrency).
 
@@ -1207,8 +1245,8 @@ and Zig. The user chose it over destructors because the release is visible
 where the resource is acquired.
 
 ```
-var f: File = open(path)?
-defer close(f)
+var f: File = try open(path)
+defer close(inout f)
 ```
 
 Forgetting a `defer` is not an error in the first version. An annotation
@@ -1218,6 +1256,22 @@ or a warning for owning values that are never released may come later.
 block, as in Zig. Go runs it at function exit, so a `defer` inside a loop
 needs a runtime list of pending calls. `defer` takes one call; cleanup
 that needs several calls uses several `defer`s.
+
+**Decided (2026-11-08):** `defer` accepts only a call that returns
+nothing. A fallible call there would leave two questions the code does
+not answer: where its error goes, and which error wins when the block is
+already returning one. Zig forbids `try` in `defer` for the same reason,
+and Go's silently ignored `defer f.Close()` errors are a known bug
+source. Libraries split cleanup instead: `close` returns nothing, and
+the part that can fail, such as `flush`, is a separate call made with
+`try` before the block ends.
+
+```
+var f: File = try open(path)
+defer close(inout f)
+try write(inout f, data)
+try flush(inout f)
+```
 
 **Deferred:** an error-only form like Zig's `errdefer`. It helps a
 function that builds something in steps and must undo them on failure,
@@ -1272,10 +1326,10 @@ Candidate A, external iterators without traits. The compiler knows the
 iterator is an ordinary struct holding a view.
 
 ```
-type LineIter (rest: str)
+type LineIter (rest: []u8)
 
-fn lines(s: str) -> LineIter { ... }
-fn next(it: inout LineIter) -> ?str { ... }
+fn lines(s: []u8) -> LineIter { ... }
+fn next(it: inout LineIter) -> ?[]u8 { ... }
 
 for line in lines(text) { ... }
 ```
@@ -1338,22 +1392,13 @@ Not in the first version. `[T]` is reserved for type arguments.
 
 Raised by the programs in `examples/` on 2026-11-08. They parse, but a
 checker would have to settle these. Dropping temporal safety settled
-views in enum payloads, `uses` across packages, global `str` constants
-and length.
+views in enum payloads, `uses` across packages, global string constants
+and length. The decisions of the same day settled `str` against `[]u8`,
+payload renames, fallible `defer` calls and constant initializers, and
+gave import roots a leaning.
 
-- **Payload bindings cannot be renamed.** `some(value: u8)` binds
-  `value`, so a match nested inside another arm shadows the outer
-  `value`.
 - **Converting an error needs a statement `match`.** A `match`
   expression arm cannot `return`, and there is no `From`, so passing an
   `io.Error` up as `AppError` takes a whole `match` with a `return` in
-  each arm.
-- **A fallible call in `defer`.** `defer io.close(inout f)` ignores a
-  result, which is otherwise an error.
-- **Constant initializers.** Whether `from_address[*Regs](0x4000_C000)`
-  counts as constant in a global, and whether it needs `unsafe`, since
-  creating a pointer is safe.
-- **`str` and `[]u8`.** The examples write `str.(line[..n])`. Whether
-  the two are the same type is not decided.
-- **Import roots.** The examples import packages from their own project
-  as `import board`. How a path resolves to a directory is not decided.
+  each arm. The user judged this an inconvenience, not a problem, and it
+  stays for now.
