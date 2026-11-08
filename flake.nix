@@ -1,5 +1,5 @@
 {
-  description = "tern: language design and grammar";
+  description = "tern: language design, grammar and compiler";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
@@ -17,7 +17,13 @@
     {
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          packages = [ pkgs.tree-sitter ];
+          packages = [
+            pkgs.tree-sitter
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.clippy
+            pkgs.rustfmt
+          ];
         };
       });
     };

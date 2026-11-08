@@ -3,7 +3,7 @@
 A design for a small systems language that compiles fast and is easy for
 people to review. "tern" is a working name.
 
-There is no code yet. [DESIGN.md](DESIGN.md) records the goals, each
+[DESIGN.md](DESIGN.md) records the goals, each
 decision with where the idea came from, what was rejected, and the open
 questions.
 
@@ -26,3 +26,17 @@ nix develop
 cd tree-sitter
 npm test
 ```
+
+## Compiler
+
+[toolchain/](toolchain) is a Cargo workspace. `stage1` is the bootstrap
+compiler, written in Rust. So far it only lexes:
+
+```
+cd toolchain
+cargo test
+cargo run -- lex ../examples/uart/main.tern
+```
+
+The tests lex every program in `examples/` and every corpus input the
+grammar accepts.

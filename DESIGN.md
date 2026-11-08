@@ -164,6 +164,10 @@ Consequences, enforced by the formatter:
 - An opening `{` goes on the same line as its `if`, `for` or `fn`.
 - A broken expression ends the line with its operator.
 
+Found by the stage 1 lexer on 2026-11-08: an attribute on its own line
+that ends in `)`, such as `@export("main")`, gets a semicolon after it.
+The parser skips semicolons between an attribute and its declaration.
+
 Rejected: JavaScript's rule, which inserts `;` only when parsing fails, so
 a line starting with `(` or `[` joins the line above it.
 
@@ -1601,6 +1605,13 @@ fn on_panic(info: PanicInfo) {
   function. keel is the likely backend.
 - The safety checks are local: bounds, null, use after `sink`, and
   exclusivity at each call site. Nothing crosses function boundaries.
+
+### Stage 1
+
+**Decided (2026-11-08).** The first compiler is written in Rust and lives
+in `toolchain/stage1`. Its lexer follows this document: Go's semicolon
+rule, nested block comments, and `StrStart`, `StrMid` and `StrEnd` tokens
+for interpolation. A line may not end inside an interpolation.
 
 ## Deferred
 
