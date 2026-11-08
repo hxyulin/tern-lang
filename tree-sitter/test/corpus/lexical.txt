@@ -1,0 +1,80 @@
+================================================================================
+Explicit semicolons and a one-line block
+================================================================================
+
+fn f() -> i32 { let x: i32 = 1; return x }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    result: (type_name
+      (identifier))
+    body: (block
+      (let_declaration
+        name: (identifier)
+        type: (type_name
+          (identifier))
+        value: (integer_literal))
+      (return_statement
+        value: (identifier)))))
+
+================================================================================
+Bare return ends at the line end
+================================================================================
+
+fn f() {
+    return
+    g()
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (return_statement)
+      (expression_statement
+        (call_expression
+          function: (identifier)
+          arguments: (argument_list))))))
+
+================================================================================
+Comments
+================================================================================
+
+// line comment
+type A u8 // trailing
+/* block /* nested */ still comment */
+type B u8 /* inline */
+type C u8 /* spans
+lines */ type D u8
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (line_comment)
+  (type_declaration
+    name: (identifier)
+    type: (type_name
+      (identifier)))
+  (line_comment)
+  (block_comment)
+  (type_declaration
+    name: (identifier)
+    type: (type_name
+      (identifier)))
+  (block_comment)
+  (type_declaration
+    name: (identifier)
+    type: (type_name
+      (identifier)))
+  (block_comment)
+  (type_declaration
+    name: (identifier)
+    type: (type_name
+      (identifier))))

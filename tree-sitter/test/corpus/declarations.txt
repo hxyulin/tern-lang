@@ -1,0 +1,360 @@
+================================================================================
+Function with explicit binding types
+================================================================================
+
+fn manhattan(a: Point, b: Point) -> i32 {
+    let dx: i32 = abs(a.x)
+    let dy: i32 = abs(a.y)
+    return add(dx, dy)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type_name
+          (identifier)))
+      (parameter
+        name: (identifier)
+        type: (type_name
+          (identifier))))
+    result: (type_name
+      (identifier))
+    body: (block
+      (let_declaration
+        name: (identifier)
+        type: (type_name
+          (identifier))
+        value: (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (argument
+              value: (field_expression
+                value: (identifier)
+                field: (identifier))))))
+      (let_declaration
+        name: (identifier)
+        type: (type_name
+          (identifier))
+        value: (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (argument
+              value: (field_expression
+                value: (identifier)
+                field: (identifier))))))
+      (return_statement
+        value: (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (argument
+              value: (identifier))
+            (argument
+              value: (identifier))))))))
+
+================================================================================
+Type declarations
+================================================================================
+
+type Point (x: i32, y: i32)
+type Celsius f64
+type Bytes []u8
+type Register *u32
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_declaration
+    name: (identifier)
+    type: (tuple_type
+      (tuple_type_field
+        name: (identifier)
+        type: (type_name
+          (identifier)))
+      (tuple_type_field
+        name: (identifier)
+        type: (type_name
+          (identifier)))))
+  (type_declaration
+    name: (identifier)
+    type: (type_name
+      (identifier)))
+  (type_declaration
+    name: (identifier)
+    type: (view_type
+      element: (type_name
+        (identifier))))
+  (type_declaration
+    name: (identifier)
+    type: (pointer_type
+      pointee: (type_name
+        (identifier)))))
+
+================================================================================
+Multi-line type with trailing comma
+================================================================================
+
+type Header (
+    magic: u32,
+    len: u32,
+)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_declaration
+    name: (identifier)
+    type: (tuple_type
+      (tuple_type_field
+        name: (identifier)
+        type: (type_name
+          (identifier)))
+      (tuple_type_field
+        name: (identifier)
+        type: (type_name
+          (identifier))))))
+
+================================================================================
+Named tuple return and tuple literal
+================================================================================
+
+fn divmod(a: u32, b: u32) -> (q: u32, r: u32) {
+    return (q: div(a, b), r: rem(a, b))
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type_name
+          (identifier)))
+      (parameter
+        name: (identifier)
+        type: (type_name
+          (identifier))))
+    result: (tuple_type
+      (tuple_type_field
+        name: (identifier)
+        type: (type_name
+          (identifier)))
+      (tuple_type_field
+        name: (identifier)
+        type: (type_name
+          (identifier))))
+    body: (block
+      (return_statement
+        value: (tuple_literal
+          (tuple_field
+            name: (identifier)
+            value: (call_expression
+              function: (identifier)
+              arguments: (argument_list
+                (argument
+                  value: (identifier))
+                (argument
+                  value: (identifier)))))
+          (tuple_field
+            name: (identifier)
+            value: (call_expression
+              function: (identifier)
+              arguments: (argument_list
+                (argument
+                  value: (identifier))
+                (argument
+                  value: (identifier))))))))))
+
+================================================================================
+Parameter modes and inout at the call site
+================================================================================
+
+fn bump(p: inout Point) {
+    p.x = succ(p.x)
+}
+
+fn consume(f: sink File, _: Event) {
+    bump(inout a)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        mode: (parameter_mode)
+        type: (type_name
+          (identifier))))
+    body: (block
+      (assignment_statement
+        left: (field_expression
+          value: (identifier)
+          field: (identifier))
+        right: (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (argument
+              value: (field_expression
+                value: (identifier)
+                field: (identifier))))))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        mode: (parameter_mode)
+        type: (type_name
+          (identifier)))
+      (parameter
+        name: (discard)
+        type: (type_name
+          (identifier))))
+    body: (block
+      (expression_statement
+        (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (argument
+              value: (identifier))))))))
+
+================================================================================
+Construction
+================================================================================
+
+fn f() {
+    var a: Point = Point.(x: 1, y: 2)
+    let t: Celsius = Celsius.(20.0)
+    let raw: f64 = f64.(t)
+    let h: Header = wire.Header.(magic: 7, len: 0)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (var_declaration
+        name: (identifier)
+        type: (type_name
+          (identifier))
+        value: (construct_expression
+          type: (identifier)
+          value: (tuple_literal
+            (tuple_field
+              name: (identifier)
+              value: (integer_literal))
+            (tuple_field
+              name: (identifier)
+              value: (integer_literal)))))
+      (let_declaration
+        name: (identifier)
+        type: (type_name
+          (identifier))
+        value: (construct_expression
+          type: (identifier)
+          value: (parenthesized_expression
+            (float_literal))))
+      (let_declaration
+        name: (identifier)
+        type: (type_name
+          (identifier))
+        value: (construct_expression
+          type: (identifier)
+          value: (parenthesized_expression
+            (identifier))))
+      (let_declaration
+        name: (identifier)
+        type: (type_name
+          (identifier))
+        value: (construct_expression
+          type: (field_expression
+            value: (identifier)
+            field: (identifier))
+          value: (tuple_literal
+            (tuple_field
+              name: (identifier)
+              value: (integer_literal))
+            (tuple_field
+              name: (identifier)
+              value: (integer_literal))))))))
+
+================================================================================
+Destructuring and discards
+================================================================================
+
+fn f() {
+    let (q: u32, r: u32) = divmod(17, 5)
+    let (r: _, q: u32) = divmod(17, 5)
+    var (x: i32, y: i32) = p
+    let _: u32 = g()
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_declaration
+        pattern: (destructuring_pattern
+          (destructuring_field
+            name: (identifier)
+            type: (type_name
+              (identifier)))
+          (destructuring_field
+            name: (identifier)
+            type: (type_name
+              (identifier))))
+        value: (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (argument
+              value: (integer_literal))
+            (argument
+              value: (integer_literal)))))
+      (let_declaration
+        pattern: (destructuring_pattern
+          (destructuring_field
+            name: (identifier)
+            type: (discard))
+          (destructuring_field
+            name: (identifier)
+            type: (type_name
+              (identifier))))
+        value: (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (argument
+              value: (integer_literal))
+            (argument
+              value: (integer_literal)))))
+      (var_declaration
+        pattern: (destructuring_pattern
+          (destructuring_field
+            name: (identifier)
+            type: (type_name
+              (identifier)))
+          (destructuring_field
+            name: (identifier)
+            type: (type_name
+              (identifier))))
+        value: (identifier))
+      (let_declaration
+        name: (discard)
+        type: (type_name
+          (identifier))
+        value: (call_expression
+          function: (identifier)
+          arguments: (argument_list))))))

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "tern",
+      "camelcase": "Tern",
+      "scope": "source.tern",
+      "path": ".",
+      "file-types": ["tern"],
+      "highlights": "queries/highlights.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "description": "Tree-sitter grammar for tern"
+  }
+}
