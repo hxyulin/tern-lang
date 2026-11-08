@@ -540,7 +540,7 @@ impl Checker<'_> {
 /// Whether two access paths can name the same storage: the same root, and
 /// no step where they go to different fields or different constant
 /// indexes.
-fn overlaps(a: &(Root, Vec<Step>), b: &(Root, Vec<Step>)) -> bool {
+pub(super) fn overlaps(a: &(Root, Vec<Step>), b: &(Root, Vec<Step>)) -> bool {
     if a.0 != b.0 {
         return false;
     }

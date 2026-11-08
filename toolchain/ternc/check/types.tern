@@ -476,16 +476,15 @@ pub fn intern(t: inout Types, ty: Ty) -> TyId ! OutOfMemory {
     var words: [..]u32 = take(inout t.words)
     try encode(inout t, ty, inout words)
     t.words = take(inout words)
-    let key: []u32 = t.words[start..]
     if t.slots.len > 0 {
         let mask: u64 = u64.(t.slots.len) - 1
-        var at: u64 = hash_words(key) & mask
+        var at: u64 = hash_words(t.words[start..]) & mask
         for {
             let slot: u32 = t.slots[usize.(at)]
             if slot == 0 {
                 break
             }
-            if same_words(key_words(t, slot - 1), key) {
+            if same_words(key_words(t, slot - 1), t.words[start..]) {
                 drop_words(inout t, start)
                 drop_parts(inout t, ty)
                 return ok.(value: TyId.(slot - 1))

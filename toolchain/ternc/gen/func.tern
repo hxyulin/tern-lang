@@ -55,26 +55,26 @@ type Fx (
 )
 
 // The function's state, at its entry block.
-fn new_fx(input: Input, g: Gen, file: u32, f: keel.Function, fn_name: []u8, result: ?check.TyId) -> Fx ! OutOfMemory {
+fn new_fx(input: Input, alloc: Allocator, m: keel.Module, file: u32, f: keel.Function, fn_name: []u8, result: ?check.TyId) -> Fx ! OutOfMemory {
     let pf: program.File = input.program.files[usize.(file)]
-    let entry: keel.Block = keel.create_block(g.m, f)
+    let entry: keel.Block = keel.create_block(m, f)
     var fx: Fx = Fx.(
-        m: g.m,
+        m: m,
         f: f,
         file: file,
         src: pf.text,
         fn_name: fn_name,
         block: entry,
         reachable: true,
-        blocks: make(g.alloc),
-        terminated: make(g.alloc),
-        joined: make(g.alloc),
-        locals: maps.new_ints(g.alloc),
-        addrs: make(g.alloc),
+        blocks: make(alloc),
+        terminated: make(alloc),
+        joined: make(alloc),
+        locals: maps.new_ints(alloc),
+        addrs: make(alloc),
         result: result,
         sret: none,
-        defers: make(g.alloc),
-        loops: make(g.alloc),
+        defers: make(alloc),
+        loops: make(alloc),
         pending_next: none,
     )
     try push(inout fx.blocks, entry)
@@ -103,7 +103,7 @@ fn function_body(input: Input, g: inout Gen, decl: maps.DeclRef, name: syntax.Sp
     if !has_attribute(input, decl, "export") {
         keel.set_local(g.m, f)
     }
-    var fx: Fx = try new_fx(input, g, decl.file, f, file_text(input, decl.file, name), abi.result)
+    var fx: Fx = try new_fx(input, g.alloc, g.m, decl.file, f, file_text(input, decl.file, name), abi.result)
     let entry: keel.Block = fx.block
     var values: [..]keel.Value = make(g.alloc)
     for let i: usize in 0..usize.(abi.param_count) {
@@ -330,8 +330,8 @@ fn data_addr(fx: Fx, s: keel.Symbol) -> keel.Value {
 
 // Names and types.
 
-fn span_text(fx: Fx, s: syntax.Span) -> []u8 {
-    return fx.src[usize.(s.start)..usize.(s.end)]
+fn span_text(src: []u8, s: syntax.Span) -> []u8 {
+    return src[usize.(s.start)..usize.(s.end)]
 }
 
 fn binding_of(input: Input, fx: Fx, s: syntax.Span) -> ?u32 {
@@ -822,7 +822,7 @@ fn destructure(input: Input, g: inout Gen, fx: inout Fx, fields: syntax.List, ty
             some(value: _) {
             }
         }
-        let f: FieldInfo = try field_of(input, inout g, ty, span_text(fx, d.field))
+        let f: FieldInfo = try field_of(input, inout g, ty, span_text(fx.src, d.field))
         let at: keel.Value = offset_by(fx, addr, f.offset)
         let v: V = try load_v(input, inout g, fx, at, f.ty)
         let name: syntax.Span = match d.rename {
@@ -1153,7 +1153,7 @@ fn arm_test(input: Input, g: inout Gen, fx: inout Fx, scrutinee: V, sty: check.T
                 try jump(inout fx, body)
             }
             variant(name: syntax.Span, payload: ?syntax.List) {
-                let name_text: []u8 = span_text(fx, name)
+                let name_text: []u8 = span_text(fx.src, name)
                 let cond: keel.Value = try variant_test(input, inout g, fx, scrutinee, sty, name_text)
                 try brif(inout fx, cond, body, fail)
                 match payload {

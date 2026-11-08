@@ -10,7 +10,7 @@ import syntax
 // The place expressions e is built from: e, then its base, through fields,
 // indexing and parentheses. Assigning to e or taking its address does not
 // read any of them.
-fn spine(alloc: Allocator, input: Input, fx: Fx, e: syntax.ExprId) -> []syntax.ExprId ! OutOfMemory {
+fn spine(alloc: Allocator, input: Input, fx: Fx, e: syntax.ExprId) -> [..]syntax.ExprId ! OutOfMemory {
     let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     var out: [..]syntax.ExprId = make(alloc)
     var current: syntax.ExprId = e
@@ -530,7 +530,7 @@ fn no_view(input: Input, c: inout Checker, file: u32, start: u32, ty: TyId, what
     if is_error(c.types, ty) || holds_format(input, c, ty) || !(try holds_view(inout c, ty)) {
         return ok
     }
-    let shown: []u8 = try show(inout c, ty)
+    let shown: [..]u8 = try show(inout c, ty)
     return match get(c.types, ty) {
         view(elem: _) {
             report(inout c, file, start, "{what} cannot be a view: it can outlive what `{shown}` points into, so store owned values or indexes")
@@ -689,7 +689,7 @@ fn fresh(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, target:
 
 // The name a place expression starts at.
 fn root_name(input: Input, c: Checker, fx: Fx, e: syntax.ExprId) -> syntax.Span ! OutOfMemory {
-    let s: []syntax.ExprId = try spine(c.alloc, input, fx, e)
+    let s: [..]syntax.ExprId = try spine(c.alloc, input, fx, e)
     return ok.(value: expr_span(input, fx, s[s.len - 1]))
 }
 
@@ -697,7 +697,7 @@ fn root_name(input: Input, c: Checker, fx: Fx, e: syntax.ExprId) -> syntax.Span 
 // element cannot be.
 fn no_owning_copy(c: inout Checker, file: u32, start: u32, name: []u8, elem: TyId) -> ! OutOfMemory {
     if try owning(inout c, elem) {
-        let shown: []u8 = try show(inout c, elem)
+        let shown: [..]u8 = try show(inout c, elem)
         try report(inout c, file, start, "`{name}` copies each element, and a `{shown}` cannot be copied: its buffer would have two owners")
     }
     return ok
@@ -783,7 +783,7 @@ fn no_format(input: Input, c: inout Checker, file: u32, start: u32, ty: TyId) ->
     if is_builtin_named(c, ty, BuiltinNamed.format) {
         return report(inout c, file, start, "a `Format` can only be a parameter: it points into the frame of the call that made it")
     }
-    let shown: []u8 = try show(inout c, ty)
+    let shown: [..]u8 = try show(inout c, ty)
     return report(inout c, file, start, "`{shown}` holds a `Format`, which can only be a parameter: it points into the frame of the call that made it")
 }
 
@@ -826,7 +826,8 @@ fn no_format_in_type(input: Input, c: inout Checker, file: u32, def: syntax.Type
                             match get(c.types, underlying) {
                                 tuple(fields as tys: Range) {
                                     let written: []u32 = syntax.items(ast.extra, fields)
-                                    let lowered: []TupleField = tuple_fields(c.types, tys)
+                                    var lowered: [..]TupleField = make(c.alloc)
+                                    try append(inout lowered, tuple_fields(c.types, tys))
                                     for let i: usize in 0..written.len {
                                         if i < lowered.len {
                                             let ft: syntax.TypeId = ast.fields[usize.(written[i])].ty
@@ -853,7 +854,8 @@ fn no_format_in_type(input: Input, c: inout Checker, file: u32, def: syntax.Type
         enum_type(int_type: _, variants: syntax.List) {
             match d {
                 enum_def(info: EnumInfo) {
-                    let lowered: []Variant = enum_variants(c.types, info)
+                    var lowered: [..]Variant = make(c.alloc)
+                    try append(inout lowered, enum_variants(c.types, info))
                     var k: usize = 0
                     for let i: u32 in syntax.items(ast.extra, variants) {
                         match ast.variants[usize.(i)] {
@@ -888,7 +890,8 @@ fn no_format_in_type(input: Input, c: inout Checker, file: u32, def: syntax.Type
             match d {
                 union_def(fields as tys: Range) {
                     let written: []u32 = syntax.items(ast.extra, fields)
-                    let lowered: []TupleField = tuple_fields(c.types, tys)
+                    var lowered: [..]TupleField = make(c.alloc)
+                    try append(inout lowered, tuple_fields(c.types, tys))
                     for let i: usize in 0..written.len {
                         if i < lowered.len {
                             let ft: syntax.TypeId = ast.fields[usize.(written[i])].ty

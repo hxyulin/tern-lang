@@ -157,7 +157,7 @@ fn panic_helper(input: Input, g: inout Gen, fx: Fx, message: ?[]Piece) -> keel.S
         none {
         }
     }
-    let name: []u8 = try program.format_text(g.alloc, "tern.panic.{g.helper_count}")
+    let name: [..]u8 = try program.format_text(g.alloc, "tern.panic.{g.helper_count}")
     g.helper_count += 1
     let params: [..]keel.Type = try helper_params(g.alloc, message)
     let none_types: [..]keel.Type = make(g.alloc)
@@ -167,7 +167,7 @@ fn panic_helper(input: Input, g: inout Gen, fx: Fx, message: ?[]Piece) -> keel.S
     let s: keel.Symbol = keel.function_symbol(g.m, f)
     keel.set_attributes(g.m, s, keel.cold | keel.noinline | keel.noreturn)
     try maps.put_text(inout g.helpers, key, u32.(g.syms.len - 1))
-    var inner: Fx = try new_fx(input, g, fx.file, f, fx.fn_name, none)
+    var inner: Fx = try new_fx(input, g.alloc, g.m, fx.file, f, fx.fn_name, none)
     let entry: keel.Block = inner.block
     var values: [..]keel.Value = make(g.alloc)
     for let t: keel.Type in params {
@@ -312,10 +312,11 @@ fn call_expr(input: Input, g: inout Gen, fx: inout Fx, callee: syntax.ExprId, ar
 }
 
 fn lower_call_args(input: Input, g: inout Gen, fx: inout Fx, args: syntax.List, abi: FnAbi) -> [..]CallArg ! OutOfMemory {
-    var fn_params: []check.FnParam = check.fn_params(g.types, check.Range.(start: 0, len: 0))
+    // A range into g.types.params, which lowering an argument can grow.
+    var fn_params: check.Range = check.Range.(start: 0, len: 0)
     match check.get(g.types, core_ty(g, abi.fn_ty)) {
         function(params: check.Range, result: _) {
-            fn_params = check.fn_params(g.types, params)
+            fn_params = params
         }
         _ {
         }
@@ -335,7 +336,7 @@ fn lower_call_args(input: Input, g: inout Gen, fx: inout Fx, args: syntax.List, 
     for let i: usize in 0..arg_ids.len {
         let arg: syntax.Arg = ast.args[usize.(arg_ids[i])]
         if i < usize.(abi.pass_count) {
-            let param_ty: check.TyId = fn_params[i].ty
+            let param_ty: check.TyId = g.types.params[usize.(fn_params.start) + i].ty
             match abi_pass(g, abi, i) {
                 place {
                     try push(inout out, CallArg.addr.(value: try addr_of(input, inout g, inout fx, arg.value)))

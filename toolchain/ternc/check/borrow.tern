@@ -1,0 +1,1328 @@
+// Rule 2: a view, or a value that holds one, borrows the storage it
+// points into, and that storage cannot change while the borrow is used.
+// Ported from stage 1's check/borrow.rs.
+//
+// After a function body is checked, one walk over it finds each local
+// that borrows, what it borrows (its loans), every use of a local, and
+// every place the function changes. A loan is an access path, or a
+// temporary that dies at the end of its statement. The walk repeats
+// until no local gains a loan, since a loop can carry a loan back to an
+// earlier statement. A change is an error when a local that borrows an
+// overlapping path is used after it, or anywhere in a loop around it.
+//
+// The same walk checks the callee's side: a returned view must point
+// into a parameter or static data, and a view stored in an `inout`
+// parameter into that parameter.
+
+import maps
+import program
+import resolve
+import syntax
+
+let temporary: []u8 = "this borrows a temporary, which is gone at the end of the statement; bind it to a local first"
+
+// A loan's path is a number in the walk's paths, or no_path for a value
+// that dies at the end of its statement.
+let no_path: u32 = 0xffff_ffff
+
+type Loan (path: u32, added: u32)
+
+type Region (start: u32, end: u32)
+
+// A local that borrows, or a `for` loop over borrowed storage, which has
+// no local and uses its loans throughout its body. A local that aliases
+// storage it does not own, as a `let` bound to a place does, lends what
+// it borrows.
+type Borrower (local: ?u32, aliases: bool, declared: u32, scope: Region, loans: [..]Loan)
+
+// A place the function changes, at a position.
+type Change (path: u32, at: u32, span: syntax.Span)
+
+type CallAt (callee: maps.DeclRef, span: syntax.Span, at: u32)
+
+type Use (local: u32, at: u32)
+
+type Problem (span: syntax.Span, message: [..]u8)
+
+// A call to a function declaration while a local borrows a global: an
+// error if the callee writes that global, which only the write sets say.
+type GlobalLoan (file: u32, span: syntax.Span, callee: maps.DeclRef, global: maps.DeclRef, borrower: ?u32)
+
+type Walk (
+    paths: [..]AccessPath,
+    borrowers: [..]Borrower,
+    // Each local's borrower, by number.
+    of_local: maps.IntMap,
+    uses: [..]Use,
+    changes: [..]Change,
+    calls: [..]CallAt,
+    loops: [..]Region,
+    // The innermost block or arm a binding is scoped to.
+    scopes: [..]Region,
+    // While walking a `defer`: where its uses happen.
+    deferred_at: ?u32,
+    // Only the first walk records uses, changes, calls and loops.
+    first: bool,
+    grew: bool,
+    // The last walk reports the callee's side.
+    reporting: bool,
+    params: maps.IntMap,
+    returns_view: bool,
+    problems: [..]Problem,
+)
+
+// Checks rule 2 in a function whose body fx has checked.
+fn check_borrows(input: Input, c: inout Checker, fx: Fx, params: syntax.List, body: syntax.Block) -> ! OutOfMemory {
+    var w: Walk = Walk.(
+        paths: make(c.alloc),
+        borrowers: make(c.alloc),
+        of_local: maps.new_ints(c.alloc),
+        uses: make(c.alloc),
+        changes: make(c.alloc),
+        calls: make(c.alloc),
+        loops: make(c.alloc),
+        scopes: make(c.alloc),
+        deferred_at: none,
+        first: true,
+        grew: false,
+        reporting: false,
+        params: maps.new_ints(c.alloc),
+        returns_view: false,
+        problems: make(c.alloc),
+    )
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    for let i: u32 in syntax.items(ast.extra, params) {
+        match ast.params[usize.(i)].name {
+            some(value as n: syntax.Span) {
+                match maps.get_int(input.names.files[usize.(fx.file)].bindings, n.start) {
+                    some(value as id: u32) {
+                        try maps.put_int(inout w.params, id, 1)
+                    }
+                    none {
+                    }
+                }
+            }
+            none {
+            }
+        }
+    }
+    match fx.result {
+        some(value as r: TyId) {
+            w.returns_view = try holds_view(inout c, r)
+        }
+        none {
+        }
+    }
+    // Each walk can only add loans, and there are finitely many paths, so
+    // this ends.
+    for {
+        w.grew = false
+        try walk_block(input, inout c, fx, inout w, body)
+        w.first = false
+        if !w.grew {
+            break
+        }
+    }
+    w.reporting = true
+    try walk_block(input, inout c, fx, inout w, body)
+    try conflicts(input, inout c, fx, inout w)
+    for let k: usize in 0..w.problems.len {
+        let p: Problem = w.problems[k]
+        var seen: bool = false
+        for let j: usize in 0..k {
+            let q: Problem = w.problems[j]
+            if q.span.start == p.span.start && q.span.end == p.span.end && program.bytes_equal(q.message, p.message) {
+                seen = true
+                break
+            }
+        }
+        if !seen {
+            try report(inout c, fx.file, p.span.start, "{p.message}")
+        }
+    }
+    return ok
+}
+
+fn ty_of(c: Checker, fx: Fx, e: syntax.ExprId) -> ?TyId {
+    match c.files[usize.(fx.file)].exprs[usize.(e)] {
+        some(value as item: Item) {
+            return match item {
+                value(ty: TyId) { some.(value: ty) }
+                _ { none }
+            }
+        }
+        none {
+            return none
+        }
+    }
+}
+
+// Whether a value of ty has storage a view can point into: a fixed or
+// growable array.
+fn has_storage(c: Checker, ty: TyId) -> bool {
+    return storage_in(c, ty, 0)
+}
+
+fn storage_in(c: Checker, ty: TyId, depth: u32) -> bool {
+    if depth > 32 {
+        return false
+    }
+    match get(c.types, ty) {
+        array(len: _, elem: _), growable(elem: _) {
+            return true
+        }
+        tuple(fields: Range) {
+            for let f: TupleField in tuple_fields(c.types, fields) {
+                if storage_in(c, f.ty, depth + 1) {
+                    return true
+                }
+            }
+            return false
+        }
+        optional(elem: TyId) {
+            return storage_in(c, elem, depth + 1)
+        }
+        result(value: ?TyId, error: TyId) {
+            match value {
+                some(value as v: TyId) {
+                    if storage_in(c, v, depth + 1) {
+                        return true
+                    }
+                }
+                none {
+                }
+            }
+            return storage_in(c, error, depth + 1)
+        }
+        named(id: _) {
+            match info_of(c, ty) {
+                some(value as info: NamedInfo) {
+                    match info.def {
+                        plain(underlying: TyId, pub_fields: _) {
+                            return storage_in(c, underlying, depth + 1)
+                        }
+                        enum_def(info as e: EnumInfo) {
+                            for let v: Variant in enum_variants(c.types, e) {
+                                match v.payload {
+                                    some(value as p: TyId) {
+                                        if storage_in(c, p, depth + 1) {
+                                            return true
+                                        }
+                                    }
+                                    none {
+                                    }
+                                }
+                            }
+                            return false
+                        }
+                        union_def(fields: Range) {
+                            for let f: TupleField in tuple_fields(c.types, fields) {
+                                if storage_in(c, f.ty, depth + 1) {
+                                    return true
+                                }
+                            }
+                            return false
+                        }
+                    }
+                }
+                none {
+                    return false
+                }
+            }
+        }
+        _ {
+            return false
+        }
+    }
+}
+
+fn is_array_or_growable(c: Checker, ty: TyId) -> bool {
+    return match get(c.types, ty) {
+        array(len: _, elem: _), growable(elem: _) { true }
+        _ { false }
+    }
+}
+
+fn local_text(input: Input, file: u32, id: u32) -> []u8 {
+    return file_text(input, file, input.names.files[usize.(file)].locals[usize.(id)])
+}
+
+fn here(w: Walk, s: syntax.Span) -> u32 {
+    return match w.deferred_at {
+        some(value as at: u32) { at }
+        none { s.start }
+    }
+}
+
+fn has_deref(path: AccessPath) -> bool {
+    for let s: Step in path.steps {
+        match s {
+            deref {
+                return true
+            }
+            _ {
+            }
+        }
+    }
+    return false
+}
+
+fn same_path(input: Input, file: u32, a: AccessPath, b: AccessPath) -> bool {
+    if !same_root(a.root, b.root) || a.steps.len != b.steps.len {
+        return false
+    }
+    for let i: usize in 0..a.steps.len {
+        let same: bool = match a.steps[i] {
+            field(name as m: syntax.Span) {
+                match b.steps[i] {
+                    field(name as n: syntax.Span) { program.bytes_equal(file_text(input, file, m), file_text(input, file, n)) }
+                    _ { false }
+                }
+            }
+            index(at as x: ?Wide) {
+                match b.steps[i] {
+                    index(at as y: ?Wide) {
+                        match x {
+                            some(value as p: Wide) {
+                                match y {
+                                    some(value as q: Wide) { wide_equal(p, q) }
+                                    none { false }
+                                }
+                            }
+                            none {
+                                match y {
+                                    some(value: _) { false }
+                                    none { true }
+                                }
+                            }
+                        }
+                    }
+                    _ { false }
+                }
+            }
+            deref {
+                match b.steps[i] {
+                    deref { true }
+                    _ { false }
+                }
+            }
+        }
+        if !same {
+            return false
+        }
+    }
+    return true
+}
+
+// The number of path in the walk's paths, adding it if it is new.
+fn path_number(input: Input, file: u32, w: inout Walk, path: inout AccessPath) -> u32 ! OutOfMemory {
+    for let i: usize in 0..w.paths.len {
+        if same_path(input, file, w.paths[i], path) {
+            return ok.(value: u32.(i))
+        }
+    }
+    try push(inout w.paths, take(inout path))
+    return ok.(value: u32.(w.paths.len - 1))
+}
+
+// Statements.
+
+fn walk_block(input: Input, c: inout Checker, fx: Fx, w: inout Walk, block: syntax.Block) -> ! OutOfMemory {
+    try push(inout w.scopes, Region.(start: block.span.start, end: block.span.end))
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    for let s: u32 in syntax.items(ast.extra, block.stmts) {
+        try walk_stmt(input, inout c, fx, inout w, syntax.StmtId.(s), block)
+    }
+    let _: ?Region = pop(inout w.scopes)
+    return ok
+}
+
+fn walk_stmt(input: Input, c: inout Checker, fx: Fx, w: inout Walk, id: syntax.StmtId, block: syntax.Block) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    match ast.stmts[usize.(id)].kind {
+        local(local: syntax.Local) {
+            let loans: [..]Loan = try loans_of(input, inout c, fx, inout w, local.value)
+            let declared: u32 = ast.exprs[usize.(local.value)].span.end
+            match local.binding {
+                single(name: ?syntax.Span, ty: _) {
+                    match name {
+                        some(value as n: syntax.Span) {
+                            try bind_loans(input, inout c, fx, inout w, n, local.value, loans, declared)
+                        }
+                        none {
+                        }
+                    }
+                }
+                destructure(fields: syntax.List) {
+                    try bind_fields(input, inout c, fx, inout w, fields, local.value, loans, declared)
+                }
+            }
+        }
+        return_stmt(value: ?syntax.ExprId) {
+            match value {
+                some(value as e: syntax.ExprId) {
+                    let loans: [..]Loan = try loans_of(input, inout c, fx, inout w, e)
+                    if w.returns_view && w.reporting {
+                        let span: syntax.Span = ast.exprs[usize.(e)].span
+                        for let loan: Loan in loans {
+                            match try escapes(input, c, fx, w, loan.path, none) {
+                                some(value as var message: [..]u8) {
+                                    try push(inout w.problems, Problem.(span: span, message: take(inout message)))
+                                }
+                                none {
+                                }
+                            }
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        if_stmt(cond: syntax.ExprId, then: syntax.Block, otherwise: ?syntax.Else) {
+            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, cond)
+            try walk_block(input, inout c, fx, inout w, then)
+            match otherwise {
+                some(value as e: syntax.Else) {
+                    match e {
+                        block(body: syntax.Block) {
+                            try walk_block(input, inout c, fx, inout w, body)
+                        }
+                        if_stmt(stmt: syntax.StmtId) {
+                            try walk_stmt(input, inout c, fx, inout w, stmt, block)
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        match_stmt(value: syntax.ExprId, arms: syntax.List) {
+            let subject: [..]Loan = try loans_of(input, inout c, fx, inout w, value)
+            for let a: u32 in syntax.items(ast.extra, arms) {
+                let arm: syntax.Arm = ast.arms[usize.(a)]
+                match arm.body {
+                    block(body: syntax.Block) {
+                        let scope: Region = Region.(start: body.span.start, end: body.span.end)
+                        for let p: u32 in syntax.items(ast.extra, arm.patterns) {
+                            try bind_pattern(input, inout c, fx, inout w, syntax.PatId.(p), value, subject, scope)
+                        }
+                        try walk_block(input, inout c, fx, inout w, body)
+                    }
+                    branch(value: _) {
+                    }
+                }
+            }
+        }
+        for_stmt(kind: syntax.ForKind, body: syntax.Block) {
+            let region: Region = Region.(start: body.span.start, end: body.span.end)
+            match kind {
+                forever {
+                    try mark_loop(inout w, region)
+                }
+                while_loop(cond: syntax.ExprId) {
+                    try mark_loop(inout w, Region.(start: ast.exprs[usize.(cond)].span.start, end: region.end))
+                    let _: [..]Loan = try loans_of(input, inout c, fx, inout w, cond)
+                }
+                for_in(mutable: _, binding: syntax.Binding, iterable: syntax.Iterable) {
+                    try mark_loop(inout w, region)
+                    match iterable {
+                        range(start: syntax.ExprId, end: syntax.ExprId) {
+                            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, start)
+                            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, end)
+                        }
+                        value(value as e: syntax.ExprId) {
+                            try walk_for_in(input, inout c, fx, inout w, binding, e, region)
+                        }
+                    }
+                }
+            }
+            try walk_block(input, inout c, fx, inout w, body)
+        }
+        break_stmt, continue_stmt {
+        }
+        defer_stmt(call: syntax.ExprId) {
+            let outer: ?u32 = w.deferred_at
+            w.deferred_at = some.(value: block.span.end)
+            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, call)
+            w.deferred_at = outer
+        }
+        unsafe_stmt(body: syntax.Block) {
+            try walk_block(input, inout c, fx, inout w, body)
+        }
+        lock_stmt(globals: _, body: syntax.Block) {
+            try walk_block(input, inout c, fx, inout w, body)
+        }
+        assign(left: syntax.ExprId, op: syntax.AssignOp, right: syntax.ExprId) {
+            let loans: [..]Loan = try loans_of(input, inout c, fx, inout w, right)
+            let at: u32 = ast.exprs[usize.(right)].span.end
+            let whole: bool = match op {
+                set { true }
+                _ { false }
+            }
+            try walk_target(input, inout c, fx, inout w, left, whole)
+            match try access_path(input, c, fx, left) {
+                some(value as var path: AccessPath) {
+                    let span: syntax.Span = ast.exprs[usize.(left)].span
+                    let n: u32 = try path_number(input, fx.file, inout w, inout path)
+                    if w.first {
+                        try push(inout w.changes, Change.(path: n, at: at, span: span))
+                    }
+                    match ty_of(c, fx, left) {
+                        some(value as t: TyId) {
+                            if try holds_view(inout c, t) {
+                                try store(input, c, fx, inout w, n, loans, at, span)
+                            }
+                        }
+                        none {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        expr(value as e: syntax.ExprId) {
+            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, e)
+        }
+    }
+    return ok
+}
+
+fn mark_loop(w: inout Walk, region: Region) -> ! OutOfMemory {
+    if w.first {
+        try push(inout w.loops, region)
+    }
+    return ok
+}
+
+// Walks an assignment's target: its indexes are read, and so is the
+// target itself unless the assignment replaces it whole.
+fn walk_target(input: Input, c: inout Checker, fx: Fx, w: inout Walk, left: syntax.ExprId, whole: bool) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    let parts: [..]syntax.ExprId = try spine(c.alloc, input, fx, left)
+    for let i: usize in 0..parts.len {
+        let p: syntax.ExprId = parts[i]
+        match ast.exprs[usize.(p)].kind {
+            index(value: _, index as ix: syntax.Index) {
+                match ix {
+                    value(value as at: syntax.ExprId) {
+                        let _: [..]Loan = try loans_of(input, inout c, fx, inout w, at)
+                    }
+                    _ {
+                    }
+                }
+            }
+            name(name: _) {
+                if !(whole && i == 0) {
+                    try use_name(input, fx, inout w, p)
+                }
+            }
+            _ {
+            }
+        }
+    }
+    return ok
+}
+
+// The loans go into the place with path number n: a local that borrows
+// gains them, and a parameter must not keep a view of anything but
+// itself.
+fn store(input: Input, c: Checker, fx: Fx, w: inout Walk, n: u32, loans: []Loan, added: u32, span: syntax.Span) -> ! OutOfMemory {
+    var id: u32 = 0
+    match w.paths[usize.(n)].root {
+        local(id as l: u32) {
+            id = l
+        }
+        global(decl: _) {
+            return ok
+        }
+    }
+    if has_deref(w.paths[usize.(n)]) {
+        return ok
+    }
+    match maps.get_int(w.params, id) {
+        some(value: _) {
+            if w.reporting {
+                for let loan: Loan in loans {
+                    match try escapes(input, c, fx, w, loan.path, some.(value: id)) {
+                        some(value as var message: [..]u8) {
+                            try push(inout w.problems, Problem.(span: span, message: take(inout message)))
+                        }
+                        none {
+                        }
+                    }
+                }
+            }
+            return ok
+        }
+        none {
+        }
+    }
+    match maps.get_int(w.of_local, id) {
+        some(value as b: u32) {
+            if w.reporting && has_temp(loans) {
+                try push(inout w.problems, Problem.(span: span, message: try program.own(c.alloc, temporary)))
+            }
+            try gain(inout w, b, loans, added)
+        }
+        none {
+        }
+    }
+    return ok
+}
+
+fn has_temp(loans: []Loan) -> bool {
+    for let l: Loan in loans {
+        if l.path == no_path {
+            return true
+        }
+    }
+    return false
+}
+
+fn gain(w: inout Walk, b: u32, loans: []Loan, added: u32) -> ! OutOfMemory {
+    for let loan: Loan in loans {
+        var found: bool = false
+        for let k: usize in 0..w.borrowers[usize.(b)].loans.len {
+            if w.borrowers[usize.(b)].loans[k].path == loan.path {
+                found = true
+                if added < w.borrowers[usize.(b)].loans[k].added {
+                    w.borrowers[usize.(b)].loans[k].added = added
+                }
+                break
+            }
+        }
+        if !found {
+            try push(inout w.borrowers[usize.(b)].loans, Loan.(path: loan.path, added: added))
+            w.grew = true
+        }
+    }
+    return ok
+}
+
+// Why a loan cannot leave the function, in a result or in the `inout`
+// parameter into, if it cannot. A result can point into any parameter,
+// and an `inout` parameter only into itself, so a caller knows what each
+// borrows without looking inside.
+fn escapes(input: Input, c: Checker, fx: Fx, w: Walk, n: u32, into: ?u32) -> ?[..]u8 ! OutOfMemory {
+    if n == no_path {
+        return ok.(value: some.(value: try program.own(c.alloc, temporary)))
+    }
+    var what: [..]u8 = make(c.alloc)
+    match w.paths[usize.(n)].root {
+        local(id: u32) {
+            var is_into: bool = false
+            match into {
+                some(value as p: u32) {
+                    is_into = p == id
+                }
+                none {
+                }
+            }
+            if is_into {
+                return ok.(value: none)
+            }
+            let is_param: bool = match maps.get_int(w.params, id) {
+                some(value: _) { true }
+                none { false }
+            }
+            let name: []u8 = local_text(input, fx.file, id)
+            match into {
+                none {
+                    if is_param {
+                        return ok.(value: none)
+                    }
+                }
+                some(value: _) {
+                }
+            }
+            if is_param {
+                what = try program.format_text(c.alloc, "the parameter `{name}`; an `inout` parameter keeps only views of itself")
+            } else {
+                what = try program.format_text(c.alloc, "`{name}`, which is gone when the function returns")
+            }
+        }
+        global(decl as g: maps.DeclRef) {
+            let name: []u8 = global_name(input, g)
+            what = try program.format_text(c.alloc, "the `var` global `{name}`, which can change after the function returns")
+        }
+    }
+    match into {
+        none {
+            return ok.(value: some.(value: try program.format_text(c.alloc, "this returns a view of {what}; return owned values or a view of a parameter")))
+        }
+        some(value as p: u32) {
+            let param: []u8 = local_text(input, fx.file, p)
+            return ok.(value: some.(value: try program.format_text(c.alloc, "`{param}` would keep a view of {what}")))
+        }
+    }
+}
+
+fn global_name(input: Input, g: maps.DeclRef) -> []u8 {
+    let decl: syntax.Decl = decl_of(input, g)
+    var span: syntax.Span = decl.span
+    match decl.kind {
+        global(is_shared: _, local: syntax.Local) {
+            match local.binding {
+                single(name: ?syntax.Span, ty: _) {
+                    match name {
+                        some(value as n: syntax.Span) {
+                            span = n
+                        }
+                        none {
+                        }
+                    }
+                }
+                _ {
+                }
+            }
+        }
+        extern_var(mutable: _, name: syntax.Span, ty: _) {
+            span = name
+        }
+        _ {
+        }
+    }
+    return file_text(input, g.file, span)
+}
+
+// A local bound to the value value, whose loans are loans. The borrow
+// starts at declared, once the value is computed.
+fn bind_loans(input: Input, c: inout Checker, fx: Fx, w: inout Walk, name: syntax.Span, value: syntax.ExprId, loans: []Loan, declared: u32) -> ! OutOfMemory {
+    var id: u32 = 0
+    match maps.get_int(input.names.files[usize.(fx.file)].bindings, name.start) {
+        some(value as found: u32) {
+            id = found
+        }
+        none {
+            return ok
+        }
+    }
+    var info: LocalInfo = LocalInfo.(ty: TyId.(0), mutable: false, owned: false)
+    match local_info(fx, id) {
+        some(value as found: LocalInfo) {
+            info = found
+        }
+        none {
+            return ok
+        }
+    }
+    let aliases: bool = !info.owned && (try owning(inout c, info.ty))
+    var all: [..]Loan = make(c.alloc)
+    let views: bool = try holds_view(inout c, info.ty)
+    if views {
+        try append(inout all, loans)
+    }
+    if aliases {
+        try append(inout all, try lend(input, c, fx, inout w, value, declared))
+        try append(inout all, loans)
+    }
+    if !views && !aliases {
+        return ok
+    }
+    if w.reporting && has_temp(all) {
+        let span: syntax.Span = input.program.files[usize.(fx.file)].ast.exprs[usize.(value)].span
+        try push(inout w.problems, Problem.(span: span, message: try program.own(c.alloc, temporary)))
+    }
+    let scope: Region = w.scopes[w.scopes.len - 1]
+    var start: u32 = declared
+    if scope.start > start {
+        start = scope.start
+    }
+    try borrower(c.alloc, inout w, id, aliases, start, scope, all)
+    return ok
+}
+
+fn borrower(alloc: Allocator, w: inout Walk, id: u32, aliases: bool, declared: u32, scope: Region, loans: []Loan) -> ! OutOfMemory {
+    var b: u32 = 0
+    match maps.get_int(w.of_local, id) {
+        some(value as known: u32) {
+            b = known
+        }
+        none {
+            try push(inout w.borrowers, Borrower.(local: some.(value: id), aliases: aliases, declared: declared, scope: scope, loans: make(alloc)))
+            b = u32.(w.borrowers.len - 1)
+            try maps.put_int(inout w.of_local, id, b)
+        }
+    }
+    try gain(inout w, b, loans, declared)
+    return ok
+}
+
+fn bind_fields(input: Input, c: inout Checker, fx: Fx, w: inout Walk, fields: syntax.List, value: syntax.ExprId, loans: []Loan, declared: u32) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    for let i: u32 in syntax.items(ast.extra, fields) {
+        let field: syntax.DestructField = ast.destructs[usize.(i)]
+        match field.ty {
+            some(value: _) {
+                var name: syntax.Span = field.field
+                match field.rename {
+                    some(value as r: syntax.Span) {
+                        name = r
+                    }
+                    none {
+                    }
+                }
+                try bind_loans(input, inout c, fx, inout w, name, value, loans, declared)
+            }
+            none {
+            }
+        }
+    }
+    return ok
+}
+
+fn bind_pattern(input: Input, c: inout Checker, fx: Fx, w: inout Walk, p: syntax.PatId, subject: syntax.ExprId, loans: []Loan, scope: Region) -> ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    match ast.pats[usize.(p)].kind {
+        variant(name: _, payload: ?syntax.List) {
+            match payload {
+                some(value as fields: syntax.List) {
+                    try push(inout w.scopes, scope)
+                    try bind_fields(input, inout c, fx, inout w, fields, subject, loans, scope.start)
+                    let _: ?Region = pop(inout w.scopes)
+                }
+                none {
+                }
+            }
+        }
+        _ {
+        }
+    }
+    return ok
+}
+
+fn walk_for_in(input: Input, c: inout Checker, fx: Fx, w: inout Walk, binding: syntax.Binding, e: syntax.ExprId, body: Region) -> ! OutOfMemory {
+    var loans: [..]Loan = try loans_of(input, inout c, fx, inout w, e)
+    var ty: TyId = TyId.(0)
+    match ty_of(c, fx, e) {
+        some(value as t: TyId) {
+            ty = t
+        }
+        none {
+            return ok
+        }
+    }
+    if is_array_or_growable(c, ty) {
+        try append(inout loans, try lend(input, c, fx, inout w, e, body.start))
+    }
+    if loans.len > 0 {
+        var found: ?u32 = none
+        for let k: usize in 0..w.borrowers.len {
+            let is_loop: bool = match w.borrowers[k].local {
+                some(value: _) { false }
+                none { true }
+            }
+            if is_loop && w.borrowers[k].declared == body.start {
+                found = some.(value: u32.(k))
+                break
+            }
+        }
+        match found {
+            some(value as b: u32) {
+                try gain(inout w, b, loans, body.start)
+            }
+            none {
+                try push(inout w.borrowers, Borrower.(local: none, aliases: false, declared: body.start, scope: body, loans: make(c.alloc)))
+                try gain(inout w, u32.(w.borrowers.len - 1), loans, body.start)
+            }
+        }
+    }
+    try push(inout w.scopes, body)
+    match binding {
+        single(name: ?syntax.Span, ty: _) {
+            match name {
+                some(value as n: syntax.Span) {
+                    try bind_loans(input, inout c, fx, inout w, n, e, loans, body.start)
+                }
+                none {
+                }
+            }
+        }
+        destructure(fields: syntax.List) {
+            try bind_fields(input, inout c, fx, inout w, fields, e, loans, body.start)
+        }
+    }
+    let _: ?Region = pop(inout w.scopes)
+    return ok
+}
+
+// Expressions.
+
+fn use_name(input: Input, fx: Fx, w: inout Walk, e: syntax.ExprId) -> ! OutOfMemory {
+    if !w.first {
+        return ok
+    }
+    match expr_res(input, fx.file, e) {
+        some(value as r: resolve.Res) {
+            match r {
+                local(id: u32) {
+                    let at: u32 = here(w, input.program.files[usize.(fx.file)].ast.exprs[usize.(e)].span)
+                    try push(inout w.uses, Use.(local: id, at: at))
+                }
+                _ {
+                }
+            }
+        }
+        none {
+        }
+    }
+    return ok
+}
+
+// What e lends when a view of its storage is taken: its own path, what a
+// local that aliases lends, or a temporary.
+fn lend(input: Input, c: Checker, fx: Fx, w: inout Walk, e: syntax.ExprId, added: u32) -> [..]Loan ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    var out: [..]Loan = make(c.alloc)
+    match ast.exprs[usize.(e)].kind {
+        paren(inner: syntax.ExprId) {
+            return lend(input, c, fx, inout w, inner, added)
+        }
+        unsafe_expr(body as inner: syntax.ExprId) {
+            return lend(input, c, fx, inout w, inner, added)
+        }
+        try_expr(operand as inner: syntax.ExprId) {
+            return lend(input, c, fx, inout w, inner, added)
+        }
+        if_expr(cond: _, then: syntax.ExprId, otherwise: syntax.IfElse) {
+            try append(inout out, try lend(input, c, fx, inout w, then, added))
+            let other: syntax.ExprId = match otherwise {
+                branch(value as x: syntax.ExprId) { x }
+                if_expr(value as x: syntax.ExprId) { x }
+            }
+            try append(inout out, try lend(input, c, fx, inout w, other, added))
+            return ok.(value: out)
+        }
+        match_expr(value: _, arms: syntax.List) {
+            for let a: u32 in syntax.items(ast.extra, arms) {
+                match ast.arms[usize.(a)].body {
+                    branch(value as x: syntax.ExprId) {
+                        try append(inout out, try lend(input, c, fx, inout w, x, added))
+                    }
+                    block(body: _) {
+                    }
+                }
+            }
+            return ok.(value: out)
+        }
+        _ {
+        }
+    }
+    match try access_path(input, c, fx, e) {
+        some(value as var path: AccessPath) {
+            if has_deref(path) {
+                return ok.(value: out)
+            }
+            match path.root {
+                local(id: u32) {
+                    match maps.get_int(w.of_local, id) {
+                        some(value as b: u32) {
+                            if w.borrowers[usize.(b)].aliases {
+                                try append(inout out, w.borrowers[usize.(b)].loans)
+                                return ok.(value: out)
+                            }
+                        }
+                        none {
+                        }
+                    }
+                }
+                global(decl as g: maps.DeclRef) {
+                    let mutable: bool = match decl_of(input, g).kind {
+                        global(is_shared: bool, local: syntax.Local) { is_shared || local.mutable }
+                        extern_var(mutable: _, name: _, ty: _) { true }
+                        _ { false }
+                    }
+                    if !mutable {
+                        return ok.(value: out)
+                    }
+                }
+            }
+            let n: u32 = try path_number(input, fx.file, inout w, inout path)
+            try push(inout out, Loan.(path: n, added: added))
+        }
+        none {
+            try push(inout out, Loan.(path: no_path, added: added))
+        }
+    }
+    return ok.(value: out)
+}
+
+// The loans of the value of e, walking it.
+fn loans_of(input: Input, c: inout Checker, fx: Fx, w: inout Walk, e: syntax.ExprId) -> [..]Loan ! OutOfMemory {
+    var out: [..]Loan = try loans_inner(input, inout c, fx, inout w, e)
+    match maps.get_int(fx.viewed, u32.(e)) {
+        some(value: _) {
+            let at: u32 = input.program.files[usize.(fx.file)].ast.exprs[usize.(e)].span.start
+            try append(inout out, try lend(input, c, fx, inout w, e, at))
+        }
+        none {
+        }
+    }
+    return ok.(value: out)
+}
+
+fn loans_inner(input: Input, c: inout Checker, fx: Fx, w: inout Walk, e: syntax.ExprId) -> [..]Loan ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    let span: syntax.Span = ast.exprs[usize.(e)].span
+    let res: ?resolve.Res = expr_res(input, fx.file, e)
+    var out: [..]Loan = make(c.alloc)
+    match ast.exprs[usize.(e)].kind {
+        name(name: _) {
+            try use_name(input, fx, inout w, e)
+            match res {
+                some(value as r: resolve.Res) {
+                    match r {
+                        local(id: u32) {
+                            match maps.get_int(w.of_local, id) {
+                                some(value as b: u32) {
+                                    try append(inout out, w.borrowers[usize.(b)].loans)
+                                }
+                                none {
+                                }
+                            }
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+        }
+        int, float, char {
+        }
+        str(parts: syntax.List) {
+            for let i: u32 in syntax.items(ast.extra, parts) {
+                match ast.str_parts[usize.(i)] {
+                    interpolation(value as x: syntax.ExprId) {
+                        try append(inout out, try loans_of(input, inout c, fx, inout w, x))
+                        match ty_of(c, fx, x) {
+                            some(value as t: TyId) {
+                                match get(c.types, t) {
+                                    growable(elem: _) {
+                                        try append(inout out, try lend(input, c, fx, inout w, x, ast.exprs[usize.(x)].span.start))
+                                    }
+                                    _ {
+                                    }
+                                }
+                            }
+                            none {
+                            }
+                        }
+                    }
+                    text(span: _) {
+                    }
+                }
+            }
+        }
+        paren(inner: syntax.ExprId) {
+            return loans_of(input, inout c, fx, inout w, inner)
+        }
+        unsafe_expr(body as inner: syntax.ExprId) {
+            return loans_of(input, inout c, fx, inout w, inner)
+        }
+        try_expr(operand as inner: syntax.ExprId) {
+            return loans_of(input, inout c, fx, inout w, inner)
+        }
+        tuple(items: syntax.List) {
+            for let i: u32 in syntax.items(ast.extra, items) {
+                try append(inout out, try loans_of(input, inout c, fx, inout w, ast.tuple_items[usize.(i)].value))
+            }
+        }
+        array(elems: syntax.List) {
+            for let i: u32 in syntax.items(ast.extra, elems) {
+                try append(inout out, try loans_of(input, inout c, fx, inout w, syntax.ExprId.(i)))
+            }
+        }
+        construct(ty: _, value: syntax.ExprId) {
+            return loans_of(input, inout c, fx, inout w, value)
+        }
+        field(value: syntax.ExprId, name: _) {
+            match res {
+                some(value as r: resolve.Res) {
+                    match r {
+                        decl(decl: _) {
+                            return ok.(value: out)
+                        }
+                        _ {
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            return loans_of(input, inout c, fx, inout w, value)
+        }
+        index(value: syntax.ExprId, index as ix: syntax.Index) {
+            try append(inout out, try loans_of(input, inout c, fx, inout w, value))
+            match ix {
+                value(value as i: syntax.ExprId) {
+                    let _: [..]Loan = try loans_of(input, inout c, fx, inout w, i)
+                }
+                slice(start: ?syntax.ExprId, end: ?syntax.ExprId) {
+                    match start {
+                        some(value as x: syntax.ExprId) {
+                            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, x)
+                        }
+                        none {
+                        }
+                    }
+                    match end {
+                        some(value as x: syntax.ExprId) {
+                            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, x)
+                        }
+                        none {
+                        }
+                    }
+                    match ty_of(c, fx, value) {
+                        some(value as t: TyId) {
+                            if is_array_or_growable(c, t) {
+                                try append(inout out, try lend(input, c, fx, inout w, value, span.start))
+                            }
+                        }
+                        none {
+                        }
+                    }
+                }
+                ty(ty: _) {
+                }
+            }
+        }
+        deref(inner: syntax.ExprId) {
+            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, inner)
+        }
+        unary(op: syntax.UnaryOp, operand: syntax.ExprId) {
+            match op {
+                address_of {
+                    try walk_target(input, inout c, fx, inout w, operand, false)
+                }
+                _ {
+                    let _: [..]Loan = try loans_of(input, inout c, fx, inout w, operand)
+                }
+            }
+        }
+        binary(op: _, left: syntax.ExprId, right: syntax.ExprId) {
+            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, left)
+            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, right)
+        }
+        if_expr(cond: syntax.ExprId, then: syntax.ExprId, otherwise: syntax.IfElse) {
+            let _: [..]Loan = try loans_of(input, inout c, fx, inout w, cond)
+            try append(inout out, try loans_of(input, inout c, fx, inout w, then))
+            let other: syntax.ExprId = match otherwise {
+                branch(value as x: syntax.ExprId) { x }
+                if_expr(value as x: syntax.ExprId) { x }
+            }
+            try append(inout out, try loans_of(input, inout c, fx, inout w, other))
+        }
+        match_expr(value: syntax.ExprId, arms: syntax.List) {
+            let subject: [..]Loan = try loans_of(input, inout c, fx, inout w, value)
+            for let a: u32 in syntax.items(ast.extra, arms) {
+                let arm: syntax.Arm = ast.arms[usize.(a)]
+                match arm.body {
+                    branch(value as x: syntax.ExprId) {
+                        let body: syntax.Span = ast.exprs[usize.(x)].span
+                        for let p: u32 in syntax.items(ast.extra, arm.patterns) {
+                            try bind_pattern(input, inout c, fx, inout w, syntax.PatId.(p), value, subject, Region.(start: body.start, end: body.end))
+                        }
+                        try append(inout out, try loans_of(input, inout c, fx, inout w, x))
+                    }
+                    block(body: _) {
+                    }
+                }
+            }
+        }
+        call(callee: syntax.ExprId, args: syntax.List) {
+            return call_loans(input, inout c, fx, inout w, e, callee, args)
+        }
+    }
+    return ok.(value: out)
+}
+
+fn call_loans(input: Input, c: inout Checker, fx: Fx, w: inout Walk, e: syntax.ExprId, callee: syntax.ExprId, args: syntax.List) -> [..]Loan ! OutOfMemory {
+    let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
+    let start: u32 = here(w, ast.exprs[usize.(e)].span)
+    // `cast[*u8](p)` names the built-in through an index.
+    let named: syntax.ExprId = match ast.exprs[usize.(callee)].kind {
+        index(value as v: syntax.ExprId, index: _) { v }
+        _ { callee }
+    }
+    var trusted: bool = false
+    var builtin: bool = false
+    var direct: ?maps.DeclRef = none
+    match expr_res(input, fx.file, named) {
+        some(value as r: resolve.Res) {
+            match r {
+                builtin(id: u32) {
+                    builtin = true
+                    trusted = match resolve.builtin_name(id) {
+                        "from_pointer", "from_address", "cast", "offset", "c_string" { true }
+                        _ { false }
+                    }
+                }
+                decl(decl as d: maps.DeclRef) {
+                    match decl_of(input, d).kind {
+                        function(is_unsafe: _, name: _, params: _, result: _, body: _) {
+                            direct = some.(value: d)
+                        }
+                        _ {
+                        }
+                    }
+                }
+                _ {
+                }
+            }
+        }
+        none {
+        }
+    }
+    if !builtin {
+        let _: [..]Loan = try loans_of(input, inout c, fx, inout w, callee)
+    }
+    if w.first {
+        match direct {
+            some(value as d: maps.DeclRef) {
+                try push(inout w.calls, CallAt.(callee: d, span: ast.exprs[usize.(callee)].span, at: start))
+            }
+            none {
+            }
+        }
+    }
+    // What each argument can lend the result.
+    var lent: [..]Loan = make(c.alloc)
+    for let i: u32 in syntax.items(ast.extra, args) {
+        let arg: syntax.Arg = ast.args[usize.(i)]
+        try append(inout lent, try loans_of(input, inout c, fx, inout w, arg.value))
+        let viewed: bool = match maps.get_int(fx.viewed, u32.(arg.value)) {
+            some(value: _) { true }
+            none { false }
+        }
+        match ty_of(c, fx, arg.value) {
+            some(value as t: TyId) {
+                if has_storage(c, t) && !viewed {
+                    try append(inout lent, try lend(input, c, fx, inout w, arg.value, start))
+                }
+            }
+            none {
+            }
+        }
+        if arg.mode == syntax.Mode.inout_mode && w.first {
+            match try access_path(input, c, fx, arg.value) {
+                some(value as var path: AccessPath) {
+                    let n: u32 = try path_number(input, fx.file, inout w, inout path)
+                    try push(inout w.changes, Change.(path: n, at: start, span: ast.exprs[usize.(arg.value)].span))
+                }
+                none {
+                }
+            }
+        }
+    }
+    var views: bool = false
+    match ty_of(c, fx, e) {
+        some(value as t: TyId) {
+            views = try holds_view(inout c, t)
+        }
+        none {
+        }
+    }
+    if trusted || !views {
+        return ok.(value: make(c.alloc))
+    }
+    return ok.(value: lent)
+}
+
+// The check.
+
+// Whether b's loan is in use at at: the local is used after it, or in a
+// loop around it that the local outlives.
+fn active(w: Walk, b: Borrower, loan: Loan, at: u32) -> bool {
+    if at < b.declared || at > b.scope.end || at < b.scope.start {
+        return false
+    }
+    var id: u32 = 0
+    match b.local {
+        some(value as l: u32) {
+            id = l
+        }
+        none {
+            return true
+        }
+    }
+    if loan.added < at {
+        for let u: Use in w.uses {
+            if u.local == id && u.at > at {
+                return true
+            }
+        }
+    }
+    for let r: Region in w.loops {
+        if r.start <= at && at <= r.end && r.start > b.declared && r.end <= b.scope.end {
+            if loan.added < at || (r.start <= loan.added && loan.added <= r.end) {
+                for let u: Use in w.uses {
+                    if u.local == id && r.start <= u.at && u.at <= r.end {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+fn conflicts(input: Input, c: inout Checker, fx: Fx, w: inout Walk) -> ! OutOfMemory {
+    for let k: usize in 0..w.changes.len {
+        let change: Change = w.changes[k]
+        var found: ?u32 = none
+        for let bi: usize in 0..w.borrowers.len {
+            let b: Borrower = w.borrowers[bi]
+            for let l: Loan in b.loans {
+                if l.path != no_path && overlaps(input, fx.file, w.paths[usize.(l.path)], w.paths[usize.(change.path)]) && active(w, b, l, change.at) {
+                    found = some.(value: u32.(bi))
+                    break
+                }
+            }
+            match found {
+                some(value: _) {
+                    break
+                }
+                none {
+                }
+            }
+        }
+        match found {
+            some(value as bi: u32) {
+                let changed: []u8 = file_text(input, fx.file, change.span)
+                match w.borrowers[usize.(bi)].local {
+                    some(value as id: u32) {
+                        let name: []u8 = local_text(input, fx.file, id)
+                        try push(inout w.problems, Problem.(span: change.span, message: try program.format_text(c.alloc, "`{changed}` cannot change here: `{name}` borrows it and is used later")))
+                    }
+                    none {
+                        try push(inout w.problems, Problem.(span: change.span, message: try program.format_text(c.alloc, "`{changed}` cannot change inside a `for` loop over it")))
+                    }
+                }
+            }
+            none {
+            }
+        }
+    }
+    for let call: CallAt in w.calls {
+        for let b: Borrower in w.borrowers {
+            for let l: Loan in b.loans {
+                if l.path != no_path {
+                    match w.paths[usize.(l.path)].root {
+                        global(decl as g: maps.DeclRef) {
+                            if active(w, b, l, call.at) {
+                                try push(inout c.global_loans, GlobalLoan.(file: fx.file, span: call.span, callee: call.callee, global: g, borrower: b.local))
+                            }
+                        }
+                        local(id: _) {
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return ok
+}

@@ -9,6 +9,13 @@ import syntax
 // finishes.
 fn check_expect(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: TyId) -> TyId ! OutOfMemory {
     let actual: TyId = try check_value(input, inout c, inout fx, e, some.(value: expected))
+    let to_view: bool = match get(c.types, expected) {
+        view(elem: _) { true }
+        _ { false }
+    }
+    if to_view && is_array_or_growable(c, actual) {
+        try maps.put_int(inout fx.viewed, u32.(e), 1)
+    }
     try expect_ty(inout c, fx.file, expr_span(input, fx, e).start, actual, expected)
     if is_never(c.types, actual) {
         return ok.(value: actual)
@@ -27,20 +34,20 @@ fn check_value(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, e
             try report(inout c, fx.file, start, "this call returns nothing, so it has no value")
         }
         type_item(ty: TyId) {
-            let shown: []u8 = try show(inout c, ty)
+            let shown: [..]u8 = try show(inout c, ty)
             try report(inout c, fx.file, start, "`{shown}` is a type, not a value")
         }
         builtin(id as builtin_index: u32) {
             let name: []u8 = resolve.builtin_name(builtin_index)
-            let message: []u8 = match name {
-                "some" { "write `some.(value: x)`" }
-                "err" { "write `err.(error: e)`" }
+            let message: [..]u8 = match name {
+                "some" { try program.own(c.alloc, "write `some.(value: x)`") }
+                "err" { try program.own(c.alloc, "write `err.(error: e)`") }
                 _ { try program.format_text(c.alloc, "`{name}` is a built-in function; call it") }
             }
             try report(inout c, fx.file, start, "{message}")
         }
         variant(ty: TyId, index: _) {
-            let shown: []u8 = try show(inout c, ty)
+            let shown: [..]u8 = try show(inout c, ty)
             try report(inout c, fx.file, start, "this variant of `{shown}` has a payload; build it with `.(...)`")
         }
     }
@@ -143,7 +150,7 @@ fn expr_item(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, exp
                     if is_float(c, ty) || is_error(c.types, ty) {
                         return value_item(inout c, ty)
                     }
-                    let shown: []u8 = try show(inout c, ty)
+                    let shown: [..]u8 = try show(inout c, ty)
                     try report(inout c, fx.file, span.start, "expected `{shown}`, found a float literal")
                     return error_item(inout c)
                 }
@@ -192,7 +199,7 @@ fn expr_item(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, exp
                     return value_item(inout c, ty)
                 }
                 _ {
-                    let shown: []u8 = try show(inout c, ty)
+                    let shown: [..]u8 = try show(inout c, ty)
                     try report(inout c, fx.file, span.start, "`.*` reads through a pointer, not a `{shown}`")
                     return error_item(inout c)
                 }
@@ -409,7 +416,7 @@ fn int_with_value(c: inout Checker, fx: Fx, start: u32, v: ?Wide, expected: ?TyI
             }
             match int_core(c, want) {
                 none {
-                    let shown: []u8 = try show(inout c, want)
+                    let shown: [..]u8 = try show(inout c, want)
                     try report(inout c, fx.file, start, "expected `{shown}`, found {what}")
                     return error_ty(inout c.types)
                 }
@@ -426,7 +433,7 @@ fn int_fits(c: inout Checker, fx: Fx, start: u32, v: ?Wide, ty: TyId) -> ! OutOf
     match int_core(c, ty) {
         none {
             if !is_error(c.types, ty) {
-                let shown: []u8 = try show(inout c, ty)
+                let shown: [..]u8 = try show(inout c, ty)
                 try report(inout c, fx.file, start, "expected `{shown}`, found an integer")
             }
         }
@@ -436,12 +443,12 @@ fn int_fits(c: inout Checker, fx: Fx, start: u32, v: ?Wide, ty: TyId) -> ! OutOf
                     if wide_less(n, int_min(int)) || wide_less(int_max(int), n) {
                         var buf: [48]u8 = fill[48](0)
                         let text: []u8 = wide_text(inout buf, n)
-                        let shown: []u8 = try show(inout c, ty)
+                        let shown: [..]u8 = try show(inout c, ty)
                         try report(inout c, fx.file, start, "`{text}` does not fit in `{shown}`")
                     }
                 }
                 none {
-                    let shown: []u8 = try show(inout c, ty)
+                    let shown: [..]u8 = try show(inout c, ty)
                     try report(inout c, fx.file, start, "this literal does not fit in `{shown}`")
                 }
             }
@@ -503,7 +510,7 @@ fn string_lit(input: Input, c: inout Checker, fx: inout Fx, parts: syntax.List, 
                     }
                 }
                 if !fine {
-                    let shown: []u8 = try show(inout c, ty)
+                    let shown: [..]u8 = try show(inout c, ty)
                     try report(inout c, fx.file, expr_span(input, fx, e).start, "`{shown}` cannot be interpolated; `\{}` takes integers, `bool`, `[]u8`, `[..]u8`, a `Format` and `fmt.Part`")
                 }
             }
@@ -533,7 +540,8 @@ fn tuple_lit(input: Input, c: inout Checker, fx: inout Fx, start: u32, items: sy
         some(value as want: TyId) {
             match get(c.types, want) {
                 tuple(fields: Range) {
-                    let wanted: []TupleField = tuple_fields(c.types, fields)
+                    var wanted: [..]TupleField = make(c.alloc)
+                    try append(inout wanted, tuple_fields(c.types, fields))
                     var same: bool = wanted.len == list.len
                     if same {
                         for let i: usize in 0..list.len {
@@ -613,7 +621,7 @@ fn array_lit(input: Input, c: inout Checker, fx: inout Fx, start: u32, elems: sy
                     return ok.(value: want)
                 }
                 _ {
-                    let shown: []u8 = try show(inout c, want)
+                    let shown: [..]u8 = try show(inout c, want)
                     try report(inout c, fx.file, start, "expected `{shown}`, found an array literal")
                     return error_ty(inout c.types)
                 }
@@ -680,7 +688,7 @@ fn field_access(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, 
     }
     var field: ?RecordField = none
     match try record_fields(input, c, base, fx.file) {
-        some(value as fields: []RecordField) {
+        some(value as fields: [..]RecordField) {
             field = find_field(c.types, fields, text)
         }
         none {
@@ -689,7 +697,7 @@ fn field_access(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, 
     match field {
         some(value as f: RecordField) {
             if !f.visible {
-                let shown: []u8 = try show(inout c, base)
+                let shown: [..]u8 = try show(inout c, base)
                 try report(inout c, fx.file, name.start, "field `{text}` of `{shown}` is private to its package")
             }
             var is_union: bool = false
@@ -712,7 +720,7 @@ fn field_access(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, 
             return value_item(inout c, f.ty)
         }
         none {
-            let shown: []u8 = try show(inout c, base)
+            let shown: [..]u8 = try show(inout c, base)
             try report(inout c, fx.file, name.start, "`{shown}` has no field `{text}`")
             return error_item(inout c)
         }
@@ -728,7 +736,8 @@ fn variant_item(input: Input, c: inout Checker, fx: Fx, ty: TyId, name: syntax.S
             match info.def {
                 enum_def(info as e: EnumInfo) {
                     is_enum = true
-                    let vs: []Variant = enum_variants(c.types, e)
+                    var vs: [..]Variant = make(c.alloc)
+                    try append(inout vs, enum_variants(c.types, e))
                     for let i: usize in 0..vs.len {
                         if program.bytes_equal(name_of(c.types, vs[i].name), text) {
                             match vs[i].payload {
@@ -750,10 +759,10 @@ fn variant_item(input: Input, c: inout Checker, fx: Fx, ty: TyId, name: syntax.S
         }
     }
     if is_enum {
-        let shown: []u8 = try show(inout c, ty)
+        let shown: [..]u8 = try show(inout c, ty)
         try report(inout c, fx.file, name.start, "`{shown}` has no variant `{text}`")
     } else if !is_error(c.types, ty) {
-        let shown: []u8 = try show(inout c, ty)
+        let shown: [..]u8 = try show(inout c, ty)
         try report(inout c, fx.file, name.start, "`{shown}` is not an enum, so it has no variant `{text}`")
     }
     return error_item(inout c)
@@ -867,11 +876,11 @@ fn construct_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, targ
             }
             if kind == 1 {
                 match try record_fields(input, c, ty, fx.file) {
-                    some(value as fields: []RecordField) {
+                    some(value as fields: [..]RecordField) {
                         for let f: RecordField in fields {
                             if !f.visible {
-                                let shown: []u8 = try show(inout c, ty)
-                                let field: []u8 = name_of(c.types, f.name)
+                                let shown: [..]u8 = try show(inout c, ty)
+                                let field: [..]u8 = try program.own(c.alloc, name_of(c.types, f.name))
                                 try report(inout c, fx.file, start, "`{shown}` cannot be built outside its package: field `{field}` is private")
                                 break
                             }
@@ -891,11 +900,11 @@ fn construct_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, targ
                     none { false }
                 }
                 if !from_int && !is_error(c.types, actual) {
-                    let shown: []u8 = try show(inout c, ty)
+                    let shown: [..]u8 = try show(inout c, ty)
                     try report(inout c, fx.file, start, "`{shown}` converts only from an integer")
                 }
             } else {
-                let shown: []u8 = try show(inout c, ty)
+                let shown: [..]u8 = try show(inout c, ty)
                 try report(inout c, fx.file, start, "`{shown}` is built from a variant, as in `{shown}.name`")
             }
             return value_item(inout c, ty)
@@ -904,7 +913,7 @@ fn construct_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, targ
             return value_item(inout c, ty)
         }
         _ {
-            let shown: []u8 = try show(inout c, ty)
+            let shown: [..]u8 = try show(inout c, ty)
             try report(inout c, fx.file, start, "`{shown}` cannot be built with `.(...)`")
             return error_item(inout c)
         }
@@ -955,10 +964,10 @@ fn construct_builtin(input: Input, c: inout Checker, fx: inout Fx, start: u32, n
     }
     if !fits {
         let what: []u8 = if program.bytes_equal(name, "some") { "an optional" } else { "a result" }
-        var message: []u8 = ""
+        var message: [..]u8 = make(c.alloc)
         match expected {
             some(value as want: TyId) {
-                let shown: []u8 = try show(inout c, want)
+                let shown: [..]u8 = try show(inout c, want)
                 message = try program.format_text(c.alloc, "`{name}` builds {what}, but `{shown}` is expected here")
             }
             none {
@@ -1031,8 +1040,8 @@ fn convert_number(input: Input, c: inout Checker, fx: inout Fx, value: syntax.Ex
         }
     }
     if !numeric {
-        let from: []u8 = try show(inout c, actual)
-        let to: []u8 = try show(inout c, target)
+        let from: [..]u8 = try show(inout c, actual)
+        let to: [..]u8 = try show(inout c, target)
         try report(inout c, fx.file, expr_span(input, fx, inner).start, "cannot convert `{from}` to `{to}`")
     }
     return ok
@@ -1054,7 +1063,7 @@ fn index_expr(input: Input, c: inout Checker, fx: inout Fx, value: syntax.ExprId
         error {
         }
         _ {
-            let shown: []u8 = try show(inout c, base)
+            let shown: [..]u8 = try show(inout c, base)
             try report(inout c, fx.file, expr_span(input, fx, value).start, "`{shown}` cannot be indexed")
             elem = try error_ty(inout c.types)
         }
@@ -1123,7 +1132,7 @@ fn unary_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, op: synt
                 }
             }
             if !fine {
-                let shown: []u8 = try show(inout c, ty)
+                let shown: [..]u8 = try show(inout c, ty)
                 try report(inout c, fx.file, start, "`-` applies to signed integers and floats, not `{shown}`")
             }
             return ok.(value: ty)
@@ -1139,7 +1148,7 @@ fn unary_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, op: synt
                 none { false }
             }
             if !is_int && !is_error(c.types, ty) {
-                let shown: []u8 = try show(inout c, ty)
+                let shown: [..]u8 = try show(inout c, ty)
                 try report(inout c, fx.file, start, "`~` applies to integers, not `{shown}`")
             }
             return ok.(value: ty)
@@ -1159,7 +1168,7 @@ fn unary_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, op: synt
                 none {
                 }
             }
-            let path: []syntax.ExprId = try spine(c.alloc, input, fx, operand)
+            let path: [..]syntax.ExprId = try spine(c.alloc, input, fx, operand)
             for let e: syntax.ExprId in path {
                 try mark(inout fx.addressed, u32.(e), 1)
             }
@@ -1218,16 +1227,16 @@ fn try_item(input: Input, c: inout Checker, fx: inout Fx, start: u32, operand: s
                 }
             }
             if !same {
-                var returns: []u8 = "nothing"
+                var returns: [..]u8 = try program.own(c.alloc, "nothing")
                 match fx.result {
                     some(value as r: TyId) {
-                        let shown: []u8 = try show(inout c, r)
+                        let shown: [..]u8 = try show(inout c, r)
                         returns = try program.format_text(c.alloc, "`{shown}`")
                     }
                     none {
                     }
                 }
-                let shown: []u8 = try show(inout c, error)
+                let shown: [..]u8 = try show(inout c, error)
                 try report(inout c, fx.file, start, "`try` passes up a `{shown}` error, but this function returns {returns}")
             }
             match value {
@@ -1243,7 +1252,7 @@ fn try_item(input: Input, c: inout Checker, fx: inout Fx, start: u32, operand: s
             return value_item(inout c, ty)
         }
         _ {
-            let shown: []u8 = try show(inout c, ty)
+            let shown: [..]u8 = try show(inout c, ty)
             try report(inout c, fx.file, start, "`try` takes an optional or a result, not `{shown}`")
             return error_item(inout c)
         }
@@ -1274,7 +1283,7 @@ fn shift_amount(input: Input, c: inout Checker, fx: inout Fx, amount: syntax.Exp
         none { false }
     }
     if !is_int && !is_error(c.types, ty) {
-        let shown: []u8 = try show(inout c, ty)
+        let shown: [..]u8 = try show(inout c, ty)
         try report(inout c, fx.file, expr_span(input, fx, amount).start, "a shift amount is an integer, not `{shown}`")
     }
     return ok
@@ -1330,7 +1339,7 @@ fn binary_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, op: syn
                 }
             }
             if !fine {
-                let shown: []u8 = try show(inout c, ty)
+                let shown: [..]u8 = try show(inout c, ty)
                 try report(inout c, fx.file, start, "`{op_text}` does not apply to `{shown}`")
             }
             return ok.(value: b)
@@ -1353,7 +1362,7 @@ fn binary_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, op: syn
                 _ { false }
             }
             if !fine {
-                let shown: []u8 = try show(inout c, ty)
+                let shown: [..]u8 = try show(inout c, ty)
                 try report(inout c, fx.file, start, "`{op_text}` does not apply to `{shown}`")
             }
             return ok.(value: ty)
@@ -1368,7 +1377,7 @@ fn require_int(c: inout Checker, fx: Fx, start: u32, op: syntax.BinaryOp, ty: Ty
     }
     if !fine {
         let op_text: []u8 = syntax.op_text(op)
-        let shown: []u8 = try show(inout c, ty)
+        let shown: [..]u8 = try show(inout c, ty)
         try report(inout c, fx.file, start, "`{op_text}` applies to built-in integers, not `{shown}`")
     }
     return ok
@@ -1419,7 +1428,8 @@ fn call_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, callee: s
                         try push(inout values, ast.args[usize.(list[i])].value)
                     }
                     try direct_call(input, inout c, fx, callee, values)
-                    let ps: []FnParam = fn_params(c.types, params)
+                    var ps: [..]FnParam = make(c.alloc)
+                    try append(inout ps, fn_params(c.types, params))
                     var modes: [..]ArgMode = make(c.alloc)
                     for let i: usize in 0..list.len {
                         if i < ps.len {
@@ -1457,14 +1467,14 @@ fn call_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, callee: s
                     return value_item(inout c, ty)
                 }
                 _ {
-                    let shown: []u8 = try show(inout c, ty)
+                    let shown: [..]u8 = try show(inout c, ty)
                     try report(inout c, fx.file, start, "`{shown}` is not a function")
                     return error_item(inout c)
                 }
             }
         }
         type_item(ty: TyId) {
-            let shown: []u8 = try show(inout c, ty)
+            let shown: [..]u8 = try show(inout c, ty)
             try report(inout c, fx.file, start, "build a `{shown}` with `{shown}.(...)`, not a call")
             return error_item(inout c)
         }
@@ -1489,8 +1499,8 @@ fn argument(input: Input, c: inout Checker, fx: inout Fx, arg: syntax.Arg, mode:
     if mode == syntax.Mode.inout_mode {
         let ty: TyId = try check_value(input, inout c, inout fx, arg.value, none)
         if !is_error(c.types, ty) && !is_error(c.types, param) && !same_ty(ty, param) {
-            let want: []u8 = try show(inout c, param)
-            let got: []u8 = try show(inout c, ty)
+            let want: [..]u8 = try show(inout c, param)
+            let got: [..]u8 = try show(inout c, ty)
             try report(inout c, fx.file, start, "expected `{want}`, found `{got}`")
         }
         try require_mutable(input, inout c, fx, arg.value, "pass `inout`")
@@ -1697,7 +1707,7 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
                 error {
                 }
                 _ {
-                    let shown: []u8 = try show(inout c, v)
+                    let shown: [..]u8 = try show(inout c, v)
                     try report(inout c, fx.file, expr_span(input, fx, a).start, "`{name}` takes a `[..]T`, not `{shown}`")
                 }
             }
@@ -1718,7 +1728,7 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
                     return error_item(inout c)
                 }
                 _ {
-                    let shown: []u8 = try show(inout c, v)
+                    let shown: [..]u8 = try show(inout c, v)
                     try report(inout c, fx.file, expr_span(input, fx, a).start, "`{name}` takes a `[..]T`, not `{shown}`")
                     return error_item(inout c)
                 }
@@ -1734,7 +1744,7 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
             }
             if program.bytes_equal(name, "free") {
                 if !growable {
-                    let shown: []u8 = try show(inout c, v)
+                    let shown: [..]u8 = try show(inout c, v)
                     try report(inout c, fx.file, expr_span(input, fx, a).start, "`free` takes a `[..]T`, not `{shown}`")
                 }
                 return ok.(value: Item.nothing)
@@ -1744,12 +1754,12 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
             }
             let astart: u32 = expr_span(input, fx, a).start
             if !(try owning(inout c, v)) {
-                let shown: []u8 = try show(inout c, v)
+                let shown: [..]u8 = try show(inout c, v)
                 try report(inout c, fx.file, astart, "`take` takes a value that owns a buffer, not `{shown}`")
                 return error_item(inout c)
             }
             if !(try emptiable(inout c, v)) {
-                let shown: []u8 = try show(inout c, v)
+                let shown: [..]u8 = try show(inout c, v)
                 try report(inout c, fx.file, astart, "`take` cannot leave a `{shown}` empty: only a `[..]T`, an optional, and records and tuples of them have an empty value")
             }
             return value_item(inout c, v)
@@ -1782,7 +1792,7 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
                     return value_item(inout c, try intern(inout c.types, Ty.result.(value: some.(value: g), error: oom)))
                 }
                 none {
-                    let shown: []u8 = try show(inout c, v)
+                    let shown: [..]u8 = try show(inout c, v)
                     try report(inout c, fx.file, start, "`copy` takes an array, view or `[..]T`, not `{shown}`")
                     return error_item(inout c)
                 }
@@ -1872,7 +1882,7 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
                 _ { false }
             }
             if !fine {
-                let shown: []u8 = try show(inout c, target)
+                let shown: [..]u8 = try show(inout c, target)
                 try report(inout c, fx.file, start, "`from_address` makes a pointer, not `{shown}`")
             }
             return value_item(inout c, target)
@@ -1897,8 +1907,8 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
                     none { is_error(c.types, v) }
                 }
                 if !(target_int && value_int) && !is_error(c.types, target) {
-                    let from: []u8 = try show(inout c, v)
-                    let to: []u8 = try show(inout c, target)
+                    let from: [..]u8 = try show(inout c, v)
+                    let to: [..]u8 = try show(inout c, target)
                     try report(inout c, fx.file, start, "`truncate` converts between integers, not `{from}` to `{to}`")
                 }
             }
@@ -1918,7 +1928,7 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
                     return value_item(inout c, p)
                 }
                 _ {
-                    let shown: []u8 = try show(inout c, p)
+                    let shown: [..]u8 = try show(inout c, p)
                     try report(inout c, fx.file, expr_span(input, fx, a).start, "`{name}` takes a pointer, not `{shown}`")
                     return error_item(inout c)
                 }
@@ -1958,7 +1968,7 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
                 error {
                 }
                 _ {
-                    let shown: []u8 = try show(inout c, p)
+                    let shown: [..]u8 = try show(inout c, p)
                     try report(inout c, fx.file, expr_span(input, fx, a).start, "`{name}` takes a pointer, not `{shown}`")
                     elem = try error_ty(inout c.types)
                 }
@@ -1977,7 +1987,7 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
                 _ { false }
             }
             if !fine {
-                let shown: []u8 = try show(inout c, ty)
+                let shown: [..]u8 = try show(inout c, ty)
                 try report(inout c, fx.file, start, "`{name}` takes built-in integers, not `{shown}`")
             }
             return value_item(inout c, ty)

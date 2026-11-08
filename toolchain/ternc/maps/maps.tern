@@ -161,7 +161,7 @@ fn grow_ints(m: inout IntMap) -> ! OutOfMemory {
     if size < 16 {
         size = 16
     }
-    let old: [..]IntSlot = m.slots
+    var old: [..]IntSlot = take(inout m.slots)
     m.slots = make(m.alloc)
     let empty: IntSlot = IntSlot.(used: false, key: 0, value: 0)
     for let _: usize in 0..size {

@@ -11,6 +11,7 @@
 //! which a last step closes over the call graph and checks (in
 //! [`effects`]).
 
+mod borrow;
 mod effects;
 mod rules;
 
@@ -60,6 +61,7 @@ pub fn check(program: &Program, names: &Resolution) -> Checked {
         growables: Vec::new(),
         direct: HashMap::new(),
         values: Vec::new(),
+        global_loans: Vec::new(),
         diagnostics: Vec::new(),
         files: program
             .files
@@ -134,6 +136,9 @@ struct Fx<'a> {
     /// union member or C global here is not read.
     written: HashSet<ExprId>,
     addressed: HashSet<ExprId>,
+    /// Arrays and growable arrays used where a view is expected: each
+    /// lends its storage to the view.
+    viewed: HashSet<ExprId>,
     /// While checking a `return` value: the locals it takes so far, so a
     /// place inside a construction is taken too, and only once.
     returning: Option<Vec<(rules::Root, Vec<rules::Step>)>>,
@@ -158,6 +163,7 @@ impl<'a> Fx<'a> {
             locked: Vec::new(),
             written: HashSet::new(),
             addressed: HashSet::new(),
+            viewed: HashSet::new(),
             returning: None,
             defers: Vec::new(),
             mentioned: None,
@@ -194,6 +200,8 @@ struct Checker<'a> {
     /// used as values; see [`effects`].
     direct: HashMap<DeclRef, effects::Direct>,
     values: Vec<effects::ValueUse>,
+    /// Calls made while a local borrows a global; see [`borrow`].
+    global_loans: Vec<borrow::GlobalLoan>,
     diagnostics: Vec<(FileId, Diagnostic)>,
     files: Vec<FileTypes>,
 }
@@ -786,6 +794,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 let diverges = self.block(&mut fx, &f.body);
+                self.borrows(&fx, f);
                 if let Some(result) = fx.result
                     && !diverges
                 {
@@ -1387,6 +1396,12 @@ impl<'a> Checker<'a> {
     /// Checks `e` against `expected` and returns `expected`.
     fn check(&mut self, fx: &mut Fx, e: ExprId, expected: TyId) -> TyId {
         let actual = self.value(fx, e, Some(expected));
+        if matches!(
+            (self.types.get(actual), self.types.get(expected)),
+            (Ty::Array(..) | Ty::Growable(_), Ty::View(_))
+        ) {
+            fx.viewed.insert(e);
+        }
         let span = fx.ast.expr(e).span;
         self.expect_ty(fx.file, span, actual, expected);
         if matches!(self.types.get(actual), Ty::Never) {

@@ -174,6 +174,22 @@ impl Checker<'_> {
             );
             problems.push((value.file, value.span, message));
         }
+        for loan in std::mem::take(&mut self.global_loans) {
+            if writes
+                .get(&loan.callee)
+                .is_some_and(|set| set.contains(&loan.global))
+            {
+                let callee = self.text(loan.file, loan.span);
+                let global = self.global_shown(loan.global, loan.file);
+                let message = match &loan.borrower {
+                    Some(who) => {
+                        format!("`{callee}` writes {global}, which `{who}` borrows and uses later")
+                    }
+                    None => format!("`{callee}` writes {global}, which the `for` loop borrows"),
+                };
+                problems.push((loan.file, loan.span, message));
+            }
+        }
         for (file, span, message) in problems {
             self.error(file, span, message);
         }

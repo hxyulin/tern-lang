@@ -562,6 +562,7 @@ fn f(alloc: Allocator, b: inout Bag, s: Shape, opt: inout ?[..]u8) -> ! OutOfMem
             "a `defer` uses `x` after this `return`; hand the value over with `take(inout x)`",
             "this would copy `b.items`, and its buffer would have two owners; hand it over with `take(inout b.items)` or make a second one with `try copy(alloc, b.items)`",
             "this would copy `b`, and its buffer would have two owners; hand it over with `take(inout b)` or make a second one with `try copy(alloc, b)`",
+            "`b` cannot change here: `seen` borrows it and is used later",
             "this would copy `line`, and its buffer would have two owners; hand it over with `take(inout line)` or make a second one with `try copy(alloc, line)`",
             "`append` copies each element, and a `[..]u8` cannot be copied: its buffer would have two owners",
             "`lines` overlaps `lines`, which is passed `inout`; an `inout` argument must not overlap another argument",
@@ -615,6 +616,85 @@ fn f(alloc: Allocator, text: []u8) -> ! OutOfMemory {
             "a `var` global cannot hold a view, and `?Name` holds one: it can outlive what the view points into, so store owned values or indexes",
             "a `[..]T` element cannot be a view: it can outlive what `[]u8` points into, so store owned values or indexes",
             "a `[..]T` element cannot hold a view, and `Token` holds one: it can outlive what the view points into, so store owned values or indexes",
+        ]
+    );
+}
+
+#[test]
+fn views_do_not_outlive_what_they_borrow() {
+    let source = "type Lines (rest: []u8)
+
+var table: [4]u8 = [1, 2, 3, 4]
+
+fn lines(text: []u8) -> Lines {
+    return Lines.(rest: text)
+}
+
+fn first(s: []u8) -> []u8 {
+    return s[..1]
+}
+
+fn bump() {
+    table[0] = 9
+}
+
+fn local_view() -> []u8 {
+    var buf: [4]u8 = [1, 2, 3, 4]
+    buf[0] = 2
+    return buf[0..]
+}
+
+fn global_view() -> []u8 {
+    return table[0..]
+}
+
+fn keep(it: inout Lines) {
+    var buf: [4]u8 = [1, 2, 3, 4]
+    buf[1] = 3
+    it.rest = buf[0..]
+}
+
+fn owned(alloc: Allocator) -> [..]u8 ! OutOfMemory {
+    var out: [..]u8 = make(alloc)
+    try push(inout out, 1)
+    return ok.(value: out)
+}
+
+fn f(alloc: Allocator) -> ! OutOfMemory {
+    var buf: [..]u8 = make(alloc)
+    try push(inout buf, 1)
+    let v: []u8 = buf
+    try push(inout buf, 2)
+    let n: usize = v.len
+    try push(inout buf, 3)
+    let it: Lines = lines(buf)
+    for let x: u8 in buf {
+        try push(inout buf, x)
+    }
+    let w: []u8 = first(try owned(alloc))
+    let t: []u8 = table[0..]
+    bump()
+    let _: usize = n + it.rest.len + w.len + t.len
+    // Allowed: the view is not used after the change.
+    let u: []u8 = buf
+    let m: usize = u.len
+    try push(inout buf, 4)
+    // Allowed: the result points into the parameter.
+    let head: []u8 = first(buf)
+    let _: usize = m + head.len
+    return ok
+}
+";
+    assert_eq!(
+        one("borrows", source),
+        [
+            "this returns a view of `buf`, which is gone when the function returns; return owned values or a view of a parameter",
+            "this returns a view of the `var` global `table`, which can change after the function returns; return owned values or a view of a parameter",
+            "`it` would keep a view of `buf`, which is gone when the function returns",
+            "`buf` cannot change here: `v` borrows it and is used later",
+            "`buf` cannot change here: `it` borrows it and is used later",
+            "this borrows a temporary, which is gone at the end of the statement; bind it to a local first",
+            "`bump` writes `table`, which `t` borrows and uses later",
         ]
     );
 }
@@ -814,6 +894,7 @@ fn f(alloc: Allocator, given: [..]u8, edit: inout [..]u8) -> [..]u8 {
     assert_eq!(
         one("values_copy", source),
         [
+            "`a` cannot change here: `b` borrows it and is used later",
             "cannot pass `inout` `b`: it is not a `var` or an `inout` parameter",
             "cannot pass `inout` `given`: it is not a `var` or an `inout` parameter",
             "cannot pass `inout` `n`: it is not a `var` or an `inout` parameter",

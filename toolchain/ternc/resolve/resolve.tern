@@ -316,8 +316,8 @@ type Resolver (
     found: [..]Found,
 )
 
-fn text_of(input: Input, r: Resolver, s: syntax.Span) -> []u8 {
-    return input.program.files[usize.(r.file)].text[usize.(s.start)..usize.(s.end)]
+fn text_of(input: Input, file: u32, s: syntax.Span) -> []u8 {
+    return input.program.files[usize.(file)].text[usize.(s.start)..usize.(s.end)]
 }
 
 fn problem(r: inout Resolver, start: u32, message: Format) -> ! OutOfMemory {
@@ -343,7 +343,7 @@ fn resolve_file(input: Input, r: inout Resolver) -> ! OutOfMemory {
             if i > 0 {
                 try push(inout path, '.')
             }
-            try append(inout path, text_of(input, r, ast.names[usize.(segments[i])]))
+            try append(inout path, text_of(input, r.file, ast.names[usize.(segments[i])]))
         }
         var local: syntax.Span = ast.names[usize.(segments[segments.len - 1])]
         match imp.alias {
@@ -353,7 +353,7 @@ fn resolve_file(input: Input, r: inout Resolver) -> ! OutOfMemory {
                 local = alias
             }
         }
-        let local_text: []u8 = text_of(input, r, local)
+        let local_text: []u8 = text_of(input, r.file, local)
         match package_lookup(input, r, local_text) {
             none {
             }
@@ -365,7 +365,7 @@ fn resolve_file(input: Input, r: inout Resolver) -> ! OutOfMemory {
         // The loader reports a name imported twice.
         var known: bool = false
         for let other: Import in r.imports {
-            if program.bytes_equal(text_of(input, r, other.name), local_text) {
+            if program.bytes_equal(text_of(input, r.file, other.name), local_text) {
                 known = true
             }
         }
@@ -383,13 +383,14 @@ fn resolve_file(input: Input, r: inout Resolver) -> ! OutOfMemory {
         try resolve_decl(input, inout r, d)
     }
     // The imports are in source order already.
-    for let imp: Import in r.imports {
+    for let n: usize in 0..r.imports.len {
+        let imp: Import = r.imports[n]
         match imp.package {
             none {
             }
             some(value: _) {
                 if !imp.used {
-                    let name: []u8 = text_of(input, r, imp.name)
+                    let name: []u8 = text_of(input, r.file, imp.name)
                     try problem(inout r, imp.span.start, "`{name}` is imported but never used")
                 }
             }
@@ -411,10 +412,10 @@ fn pop_scope(input: Input, r: inout Resolver) -> ! OutOfMemory {
     for let i: usize in mark..r.locals.len {
         let l: LocalBinding = r.locals[i]
         if !l.used {
-            let name: []u8 = text_of(input, r, l.span)
+            let name: []u8 = text_of(input, r.file, l.span)
             match l.field {
                 some(value as f: syntax.Span) {
-                    let field: []u8 = text_of(input, r, f)
+                    let field: []u8 = text_of(input, r.file, f)
                     try problem(inout r, l.span.start, "`{name}` is never used; skip the field with `{field}: _`")
                 }
                 none {
@@ -432,10 +433,10 @@ fn pop_scope(input: Input, r: inout Resolver) -> ! OutOfMemory {
 // Declares a local in the innermost scope; field is the field it comes
 // from, if any.
 fn bind(input: Input, r: inout Resolver, name: syntax.Span, field: ?syntax.Span) -> ! OutOfMemory {
-    let text: []u8 = text_of(input, r, name)
+    let text: []u8 = text_of(input, r.file, name)
     var earlier: ?syntax.Span = none
     for let l: LocalBinding in r.locals {
-        if program.bytes_equal(text_of(input, r, l.span), text) {
+        if program.bytes_equal(text_of(input, r.file, l.span), text) {
             earlier = some.(value: l.span)
             break
         }
@@ -470,7 +471,7 @@ fn bind(input: Input, r: inout Resolver, name: syntax.Span, field: ?syntax.Span)
 
 fn is_import(input: Input, r: Resolver, text: []u8) -> bool {
     for let imp: Import in r.imports {
-        if program.bytes_equal(text_of(input, r, imp.name), text) {
+        if program.bytes_equal(text_of(input, r.file, imp.name), text) {
             return true
         }
     }
@@ -479,11 +480,11 @@ fn is_import(input: Input, r: Resolver, text: []u8) -> bool {
 
 // Looks a name up, marking a local or import as used.
 fn lookup(input: Input, r: inout Resolver, name: syntax.Span) -> ?Res {
-    let text: []u8 = text_of(input, r, name)
+    let text: []u8 = text_of(input, r.file, name)
     var i: usize = r.locals.len
     for i > 0 {
         i -= 1
-        if program.bytes_equal(text_of(input, r, r.locals[i].span), text) {
+        if program.bytes_equal(text_of(input, r.file, r.locals[i].span), text) {
             r.locals[i].used = true
             return some.(value: Res.local.(id: r.locals[i].id))
         }
@@ -496,7 +497,7 @@ fn lookup(input: Input, r: inout Resolver, name: syntax.Span) -> ?Res {
         }
     }
     for let j: usize in 0..r.imports.len {
-        if program.bytes_equal(text_of(input, r, r.imports[j].name), text) {
+        if program.bytes_equal(text_of(input, r.file, r.imports[j].name), text) {
             r.imports[j].used = true
             match r.imports[j].package {
                 none {
@@ -556,7 +557,7 @@ fn callee(input: Input, r: inout Resolver, id: syntax.ExprId) -> ! OutOfMemory {
             return expr(input, inout r, id)
         }
     }
-    let text: []u8 = text_of(input, r, name)
+    let text: []u8 = text_of(input, r.file, name)
     if !is_builtin_function(text) {
         return expr(input, inout r, id)
     }
@@ -567,7 +568,7 @@ fn callee(input: Input, r: inout Resolver, id: syntax.ExprId) -> ! OutOfMemory {
         }
         none {
             for let l: LocalBinding in r.locals {
-                if program.bytes_equal(text_of(input, r, l.span), text) {
+                if program.bytes_equal(text_of(input, r.file, l.span), text) {
                     try maps.put_int(inout r.names.hidden_locals, name.start, l.id)
                     break
                 }
@@ -603,7 +604,7 @@ fn callee(input: Input, r: inout Resolver, id: syntax.ExprId) -> ! OutOfMemory {
 
 // `pkg.name`: a member of an imported package.
 fn member(input: Input, r: inout Resolver, package: u32, name: syntax.Span) -> ?maps.DeclRef ! OutOfMemory {
-    let text: []u8 = text_of(input, r, name)
+    let text: []u8 = text_of(input, r.file, name)
     let path: []u8 = input.program.packages[usize.(package)].path
     match maps.get_name(input.scopes[usize.(package)], text) {
         none {
@@ -764,7 +765,7 @@ fn ty(input: Input, r: inout Resolver, id: syntax.TypeId) -> ! OutOfMemory {
                                     }
                                 }
                                 _ {
-                                    let text: []u8 = text_of(input, r, pkg)
+                                    let text: []u8 = text_of(input, r.file, pkg)
                                     try problem(inout r, pkg.start, "`{text}` is not a package")
                                 }
                             }
@@ -808,7 +809,7 @@ fn ty(input: Input, r: inout Resolver, id: syntax.TypeId) -> ! OutOfMemory {
                 }
             }
             if !is_type {
-                let text: []u8 = text_of(input, r, name)
+                let text: []u8 = text_of(input, r.file, name)
                 try problem(inout r, name.start, "`{text}` is not a type")
             }
             r.names.types[usize.(id)] = res
@@ -851,7 +852,7 @@ fn ty(input: Input, r: inout Resolver, id: syntax.TypeId) -> ! OutOfMemory {
 }
 
 fn undefined(input: Input, r: inout Resolver, name: syntax.Span) -> ! OutOfMemory {
-    let text: []u8 = text_of(input, r, name)
+    let text: []u8 = text_of(input, r.file, name)
     return problem(inout r, name.start, "`{text}` is not defined")
 }
 
@@ -1014,7 +1015,7 @@ fn lock_name(input: Input, r: inout Resolver, g: syntax.GlobalName) -> ! OutOfMe
                 }
             }
             if !is_package {
-                let text: []u8 = text_of(input, r, pkg)
+                let text: []u8 = text_of(input, r.file, pkg)
                 try problem(inout r, pkg.start, "`{text}` is not a package")
             }
         }
@@ -1055,7 +1056,7 @@ fn lock_name(input: Input, r: inout Resolver, g: syntax.GlobalName) -> ! OutOfMe
 }
 
 fn not_shared(input: Input, r: inout Resolver, name: syntax.Span) -> ! OutOfMemory {
-    let text: []u8 = text_of(input, r, name)
+    let text: []u8 = text_of(input, r.file, name)
     return problem(inout r, name.start, "`lock` takes a `shared` global; `{text}` is not one")
 }
 
@@ -1149,7 +1150,7 @@ fn expr(input: Input, r: inout Resolver, id: syntax.ExprId) -> ! OutOfMemory {
                 some(value as found: Res) {
                     match found {
                         package(id: _) {
-                            let text: []u8 = text_of(input, r, name)
+                            let text: []u8 = text_of(input, r.file, name)
                             try problem(inout r, name.start, "`{text}` is a package; use one of its names, as in `{text}.name`")
                         }
                         _ {

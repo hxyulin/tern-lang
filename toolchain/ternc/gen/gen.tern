@@ -392,8 +392,8 @@ fn fn_abi(input: Input, g: inout Gen, fn_ty: check.TyId, variadic: bool, c_recor
         none {
         }
     }
-    let fn_params: []check.FnParam = check.fn_params(g.types, params_r)
-    for let p: check.FnParam in fn_params {
+    for let k: u32 in 0..params_r.len {
+        let p: check.FnParam = g.types.params[usize.(params_r.start + k)]
         let repr: Repr = try ty_repr(input, inout g, p.ty)
         var pass: Pass = Pass.skip
         match p.mode {
@@ -572,7 +572,7 @@ fn string_symbol(g: inout Gen, bytes: []u8) -> keel.Symbol ! OutOfMemory {
         none {
         }
     }
-    let name: []u8 = try program.format_text(g.alloc, "tern.str.{g.string_count}")
+    let name: [..]u8 = try program.format_text(g.alloc, "tern.str.{g.string_count}")
     g.string_count += 1
     var with_nul: [..]u8 = make(g.alloc)
     try append(inout with_nul, bytes)
@@ -738,7 +738,7 @@ fn panic_site(input: Input, g: inout Gen, path: []u8, function: []u8, line: u32,
     if layout.size > at {
         try push(inout items, keel.Item.zero.(size: u32.(layout.size - at)))
     }
-    let name: []u8 = try program.format_text(g.alloc, "tern.panic_site.{g.panic_sites}")
+    let name: [..]u8 = try program.format_text(g.alloc, "tern.panic_site.{g.panic_sites}")
     g.panic_sites += 1
     return define_data(inout g, name, items, "", u32.(layout.align), keel.constant | keel.local)
 }

@@ -52,7 +52,7 @@ fn global_of(input: Input, c: Checker, fx: Fx, e: syntax.ExprId) -> ?GlobalArg !
                             }
                         }
                     }
-                    let parts: []syntax.ExprId = try spine(c.alloc, input, fx, e)
+                    let parts: [..]syntax.ExprId = try spine(c.alloc, input, fx, e)
                     var i: usize = parts.len
                     for i > 0 {
                         i -= 1
@@ -219,7 +219,8 @@ fn check_effects(input: Input, c: inout Checker) -> ! OutOfMemory {
             }
         }
     }
-    for let call: CallSite in c.call_sites {
+    for let n: usize in 0..c.call_sites.len {
+        let call: CallSite = c.call_sites[n]
         let set: []maps.DeclRef = sets[usize.(decl_number(c.types, call.callee))]
         for let k: u32 in 0..call.count {
             let a: GlobalArg = c.call_args[usize.(call.first + k)]
@@ -231,12 +232,30 @@ fn check_effects(input: Input, c: inout Checker) -> ! OutOfMemory {
             }
         }
     }
-    for let v: ValueUse in c.values {
+    for let n: usize in 0..c.values.len {
+        let v: ValueUse = c.values[n]
         let set: []maps.DeclRef = sets[usize.(decl_number(c.types, v.decl))]
         if set.len > 0 {
             let f: []u8 = file_text(input, v.file, v.span)
             let g: [..]u8 = try global_shown(input, c, set[0], v.file)
             try report(inout c, v.file, v.span.start, "`{f}` writes {g}, so it cannot be a function value: a function type writes no globals")
+        }
+    }
+    for let n: usize in 0..c.global_loans.len {
+        let loan: GlobalLoan = c.global_loans[n]
+        let set: []maps.DeclRef = sets[usize.(decl_number(c.types, loan.callee))]
+        if has_decl(set, loan.global) {
+            let f: []u8 = file_text(input, loan.file, loan.span)
+            let g: [..]u8 = try global_shown(input, c, loan.global, loan.file)
+            match loan.borrower {
+                some(value as id: u32) {
+                    let who: []u8 = local_text(input, loan.file, id)
+                    try report(inout c, loan.file, loan.span.start, "`{f}` writes {g}, which `{who}` borrows and uses later")
+                }
+                none {
+                    try report(inout c, loan.file, loan.span.start, "`{f}` writes {g}, which the `for` loop borrows")
+                }
+            }
         }
     }
     return ok

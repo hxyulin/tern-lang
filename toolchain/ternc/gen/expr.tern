@@ -34,7 +34,7 @@ fn expr(input: Input, g: inout Gen, fx: inout Fx, e: syntax.ExprId) -> V ! OutOf
             return int_value(input, inout g, fx, e, ty)
         }
         float {
-            let value: f64 = try float_value(g, span_text(fx, span))
+            let value: f64 = try float_value(g, span_text(fx.src, span))
             match try scalar_of(input, inout g, ty) {
                 float32 {
                     return ok.(value: V.scalar.(value: keel.fconst(fx.m, fx.block, keel.Type.float32, u64.(f32_bits(f32.(value))))))
@@ -356,7 +356,7 @@ fn addr_of(input: Input, g: inout Gen, fx: inout Fx, e: syntax.ExprId) -> keel.V
                     match item_of(input, fx, value) {
                         value(ty as base_ty: check.TyId) {
                             let core: check.TyId = core_ty(g, base_ty)
-                            let name_text: []u8 = span_text(fx, name)
+                            let name_text: []u8 = span_text(fx.src, name)
                             let record: bool = match check.get(g.types, core) {
                                 view(elem: _) { false }
                                 growable(elem: _) { false }
@@ -365,7 +365,7 @@ fn addr_of(input: Input, g: inout Gen, fx: inout Fx, e: syntax.ExprId) -> keel.V
                             }
                             if record {
                                 match try fields_of(input, inout g, core) {
-                                    some(value as fields: []FieldInfo) {
+                                    some(value as fields: [..]FieldInfo) {
                                         for let f: FieldInfo in fields {
                                             if same_text(check.name_of(g.types, f.name), name_text) {
                                                 let base: keel.Value = try addr_of(input, inout g, inout fx, value)
@@ -445,7 +445,7 @@ fn empty_value(input: Input, g: inout Gen, fx: Fx, v: keel.Value, ty: check.TyId
         }
     }
     match try fields_of(input, inout g, core) {
-        some(value as fields: []FieldInfo) {
+        some(value as fields: [..]FieldInfo) {
             for let f: FieldInfo in fields {
                 if holds_growable(g, f.ty) {
                     let addr: keel.Value = offset_by(fx, v, f.offset)
@@ -687,7 +687,7 @@ fn field_value(input: Input, g: inout Gen, fx: inout Fx, e: syntax.ExprId, value
         none {
         }
     }
-    let name_text: []u8 = span_text(fx, name)
+    let name_text: []u8 = span_text(fx.src, name)
     match item_of(input, fx, value) {
         type_item(ty as enum_ty: check.TyId) {
             return enum_value(input, inout g, inout fx, enum_ty, name_text, none)
@@ -794,7 +794,7 @@ fn tuple_into(input: Input, g: inout Gen, fx: inout Fx, addr: keel.Value, ty: ch
     let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     for let i: u32 in syntax.items(ast.extra, items) {
         let item: syntax.TupleItem = ast.tuple_items[usize.(i)]
-        let f: FieldInfo = try field_of(input, inout g, core, span_text(fx, item.name))
+        let f: FieldInfo = try field_of(input, inout g, core, span_text(fx.src, item.name))
         let at: keel.Value = offset_by(fx, addr, f.offset)
         try write_record(input, inout g, inout fx, at, f.ty, item.value)
     }
@@ -824,10 +824,10 @@ fn construct(input: Input, g: inout Gen, fx: inout Fx, target: syntax.ExprId, va
     }
     match item_of(input, fx, target) {
         variant(ty as enum_ty: check.TyId, index: u32) {
-            var name: []u8 = ""
+            var name: [..]u8 = make(g.alloc)
             match try shape_of(input, inout g, enum_ty) {
                 some(value as shape: EnumShape) {
-                    name = check.name_of(g.types, shape_variant(g, shape, usize.(index)).name)
+                    name = try program.own(g.alloc, check.name_of(g.types, shape_variant(g, shape, usize.(index)).name))
                 }
                 none {
                 }
@@ -863,7 +863,7 @@ fn construct(input: Input, g: inout Gen, fx: inout Fx, target: syntax.ExprId, va
     }
 }
 
-fn shown(g: Gen, ty: check.TyId) -> []u8 ! OutOfMemory {
+fn shown(g: Gen, ty: check.TyId) -> [..]u8 ! OutOfMemory {
     var out: [..]u8 = make(g.alloc)
     try check.show_into(g.types, ty, inout out)
     return ok.(value: out)
@@ -911,8 +911,8 @@ fn convert(input: Input, g: inout Gen, fx: inout Fx, v: V, from: check.TyId, to:
                                             let eq: keel.Value = compare_ints(fx, keel.IntCC.eq, converted, c)
                                             valid = binop(fx, keel.BinaryOp.or, valid, eq)
                                         }
-                                        let name: []u8 = try shown(g, to)
-                                        let message: []u8 = try program.format_text(g.alloc, "no variant of `{name}` has this value")
+                                        let name: [..]u8 = try shown(g, to)
+                                        let message: [..]u8 = try program.format_text(g.alloc, "no variant of `{name}` has this value")
                                         let pieces: [1]Piece = [Piece.text.(text: message)]
                                         try check_or_panic(input, inout g, inout fx, valid, pieces, span)
                                     }
@@ -1065,8 +1065,8 @@ fn convert_int(input: Input, g: inout Gen, fx: inout Fx, x: keel.Value, from: ch
     }
     match fits {
         some(value as all: keel.Value) {
-            let name: []u8 = try shown(g, to_ty)
-            let message: []u8 = try program.format_text(g.alloc, " does not fit in `{name}`")
+            let name: [..]u8 = try shown(g, to_ty)
+            let message: [..]u8 = try program.format_text(g.alloc, " does not fit in `{name}`")
             let wide: keel.Value = widen(fx, x, from)
             var first: Piece = Piece.unsigned.(value: wide)
             if from_signed {
@@ -1463,7 +1463,7 @@ fn arith(input: Input, g: inout Gen, fx: inout Fx, op: syntax.BinaryOp, l: keel.
             let o: keel.Overflow = keel.overflow(fx.m, fx.block, oop, l, r)
             let one: keel.Value = iconst(fx, keel.Type.int8, 1)
             let fine: keel.Value = binop(fx, keel.BinaryOp.xor, o.overflow, one)
-            let message: []u8 = try program.format_text(g.alloc, "`{text}` overflowed")
+            let message: [..]u8 = try program.format_text(g.alloc, "`{text}` overflowed")
             try check_text(input, inout g, inout fx, fine, message, span)
             return ok.(value: o.result)
         }
@@ -1479,7 +1479,7 @@ fn arith(input: Input, g: inout Gen, fx: inout Fx, op: syntax.BinaryOp, l: keel.
                 let both_v: keel.Value = binop(fx, keel.BinaryOp.and, is_min, is_m1)
                 let one: keel.Value = iconst(fx, keel.Type.int8, 1)
                 let fine: keel.Value = binop(fx, keel.BinaryOp.xor, both_v, one)
-                let message: []u8 = try program.format_text(g.alloc, "`{text}` overflowed")
+                let message: [..]u8 = try program.format_text(g.alloc, "`{text}` overflowed")
                 try check_text(input, inout g, inout fx, fine, message, span)
             }
             let dop: keel.BinaryOp = match op {
@@ -1497,7 +1497,7 @@ fn arith(input: Input, g: inout Gen, fx: inout Fx, op: syntax.BinaryOp, l: keel.
             let bits: u32 = check.int_bits(int)
             let limit: keel.Value = iconst(fx, rt, i64.(bits))
             let fine: keel.Value = compare_ints(fx, keel.IntCC.ult, r, limit)
-            let message: []u8 = try program.format_text(g.alloc, "shift by at least {bits} bits")
+            let message: [..]u8 = try program.format_text(g.alloc, "shift by at least {bits} bits")
             try check_text(input, inout g, inout fx, fine, message, span)
             let sop: keel.BinaryOp = match op {
                 shl { keel.BinaryOp.shl }
@@ -1549,7 +1549,7 @@ fn string_lit(input: Input, g: inout Gen, fx: inout Fx, parts: syntax.List, ty: 
         match ast.str_parts[usize.(i)] {
             text(span: syntax.Span) {
                 var bytes: [..]u8 = make(g.alloc)
-                try unescape(span_text(fx, span), inout bytes)
+                try unescape(span_text(fx.src, span), inout bytes)
                 if bytes.len > 0 {
                     try push(inout pieces, FormatPiece.text.(bytes: take(inout bytes)))
                 }
@@ -1675,7 +1675,7 @@ fn format(input: Input, g: inout Gen, fx: inout Fx, pieces: []FormatPiece, forma
             some(value as p: check.TyId) {
                 // Every payload's first field holds the value.
                 match try fields_of(input, inout g, p) {
-                    some(value as fields: []FieldInfo) {
+                    some(value as fields: [..]FieldInfo) {
                         if fields.len > 0 {
                             let dst: keel.Value = offset_by(fx, payload, fields[0].offset)
                             try store_v(input, inout g, fx, value, vty, dst, false)

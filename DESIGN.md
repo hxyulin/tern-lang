@@ -1229,8 +1229,28 @@ the program it would reject still compiles.
   `inout` parameters and dropping the copy of a `let` argument rooted
   at a global; and the `shared` checks that need read sets.
 - **Rule 3: built (2026-11-09)** in both checkers: a `[..]T` element, a
-  `var` or `shared` global and a C global cannot hold a view. Rule 2
-  is not built yet, so a local view can still dangle.
+  `var` or `shared` global and a C global cannot hold a view. A
+  declared type can still hold a view, such as an iterator or
+  `fmt.Part`: rule 2 binds its values like any other view. Interpolation
+  takes a `[..]u8` as well as a `[]u8`, so messages are built as owned
+  text.
+- **Rule 2: built (2026-11-09)** in both checkers, which print the
+  same errors. Each function is checked alone after its body: borrows
+  start where a view is made from an array or growable array, by
+  coercion, slicing or a call, and a borrowed place cannot change
+  before the borrower's last use. A function that writes a borrowed
+  global cannot be called then, which is checked against the write
+  sets of rule 4. Known gaps, all on the side of rejecting:
+  - The check does not follow control flow: a borrow made by a
+    reassignment counts from there until the borrower's last use, even
+    on paths that never reach it.
+  - A change followed by `return` inside a loop is treated as if it
+    reached the next iteration.
+  - A call's result borrows every candidate argument, as above.
+
+  Bringing ternc under the rule made helpers such as `show`,
+  `record_fields` and `fields_of` return owned copies, and some loops
+  read shared arrays by index instead of through a view.
 
 ### Bounds checks, no null, no pointer arithmetic
 
@@ -1358,7 +1378,7 @@ Rejected:
 **Decided.** A reference parameter is a way to pass a parameter, not a
 type. It cannot be stored in a variable or a field, or returned. It
 always points into a caller's frame and ends when the call returns.
-Views, below, are the storable kind of reference, and are not checked.
+Views, below, are the storable kind of reference; rule 2 checks them.
 
 Parameter modes:
 
@@ -1405,6 +1425,15 @@ within one function:
 - The rule needs no annotation: the source of a result is always all of
   its candidate arguments, as Rust's lifetime elision assumes for one
   input. Code that wants a narrower source passes fewer arguments.
+- **Decided (2026-11-09): an `inout` parameter keeps views only of
+  itself.** A callee can store a view in an `inout` parameter, as
+  `it.rest = it.rest[1..]` in an iterator's `next`, only when the view
+  points into that same parameter. Views of other arguments do not flow
+  into it, so a caller never has to assume that `f(inout a, b)` leaves
+  `a` borrowing `b`. Letting them flow gave 89 errors in ternc, in
+  parsers and builders that store owned values.
+- A `for` loop over an array or growable array borrows it for the whole
+  loop: the loop body cannot change it.
 
 A place returned for writing, so `slot(inout m, k) += 1` works, is
 planned on the same rule, after Hylo's subscripts.

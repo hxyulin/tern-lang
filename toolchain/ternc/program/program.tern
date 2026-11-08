@@ -311,17 +311,17 @@ fn add_file(l: inout Loader, path: inout [..]u8, text: inout [..]u8, ast: inout 
     return ok
 }
 
-// An import's dotted path and the name it binds.
-type ImportName (segments: []u32, local: []u8, start: u32)
+// An import: the names of its dotted path, the name it binds, and where
+// it starts. Copied out of the file, since loading an import adds files.
+type ImportName (segments: [..]u32, named: syntax.Span, start: u32)
 
 fn load_imports(l: inout Loader, file: u32, package: u32) -> ! OutOfMemory {
+    var imports: [..]ImportName = make(l.alloc)
     let f: File = l.program.files[usize.(file)]
-    // The local names so far, to report one imported twice.
-    var locals: [..]syntax.Span = make(l.alloc)
     for let imp: syntax.Import in f.ast.imports {
-        let segments: []u32 = syntax.items(f.ast.extra, imp.path)
-        let last: syntax.Span = f.ast.names[usize.(segments[segments.len - 1])]
-        var named: syntax.Span = last
+        var segments: [..]u32 = make(l.alloc)
+        try append(inout segments, syntax.items(f.ast.extra, imp.path))
+        var named: syntax.Span = f.ast.names[usize.(segments[segments.len - 1])]
         match imp.alias {
             none {
             }
@@ -329,19 +329,26 @@ fn load_imports(l: inout Loader, file: u32, package: u32) -> ! OutOfMemory {
                 named = alias
             }
         }
-        let local: []u8 = slice(f, named.start, named.end)
+        try push(inout imports, ImportName.(segments: take(inout segments), named: named, start: imp.span.start))
+    }
+    // The local names so far, to report one imported twice.
+    var locals: [..]syntax.Span = make(l.alloc)
+    for let k: usize in 0..imports.len {
+        let named: syntax.Span = imports[k].named
+        let start: u32 = imports[k].start
+        let local: [..]u8 = try own(l.alloc, slice(l.program.files[usize.(file)], named.start, named.end))
         var twice: bool = false
         for let seen: syntax.Span in locals {
-            if bytes_equal(slice(f, seen.start, seen.end), local) {
+            if bytes_equal(slice(l.program.files[usize.(file)], seen.start, seen.end), local) {
                 twice = true
             }
         }
         if twice {
-            try report(inout l, file, imp.span.start, "`{local}` is imported twice; rename one with `as`")
+            try report(inout l, file, start, "`{local}` is imported twice; rename one with `as`")
         } else {
             try push(inout locals, named)
         }
-        match try resolve_import(inout l, file, segments, imp.span.start) {
+        match try resolve_import(inout l, file, imports[k].segments, start) {
             none {
             }
             some(value as imported: u32) {
@@ -388,6 +395,17 @@ fn resolve_import(l: inout Loader, file: u32, segments: []u32, start: u32) -> ?u
     let first_span: syntax.Span = f.ast.names[usize.(segments[0])]
     let first: []u8 = slice(f, first_span.start, first_span.end)
     let is_std: bool = bytes_equal(first, "std")
+    // The directory, worked out before anything changes the loader.
+    var dir: [..]u8 = try own(l.alloc, l.root)
+    var rest: usize = 0
+    if is_std {
+        dir = try own(l.alloc, l.std_dir)
+        rest = 1
+    }
+    for let i: usize in rest..segments.len {
+        let s: syntax.Span = f.ast.names[usize.(segments[i])]
+        dir = try join(l.alloc, dir, slice(f, s.start, s.end))
+    }
     let importer: []u8 = l.program.packages[usize.(f.package)].path
     if starts_with(importer, "std.") && !is_std {
         try report(inout l, file, start, "a standard library package imports only `std` packages")
@@ -414,19 +432,9 @@ fn resolve_import(l: inout Loader, file: u32, segments: []u32, start: u32) -> ?u
             return ok.(value: some.(value: id))
         }
     }
-    var dir: [..]u8 = try own(l.alloc, l.root)
-    var rest: usize = 0
-    if is_std {
-        if segments.len == 1 {
-            try report(inout l, file, start, "name a package inside `std`, such as `std.io`")
-            return ok.(value: none)
-        }
-        dir = try own(l.alloc, l.std_dir)
-        rest = 1
-    }
-    for let i: usize in rest..segments.len {
-        let s: syntax.Span = f.ast.names[usize.(segments[i])]
-        dir = try join(l.alloc, dir, slice(f, s.start, s.end))
+    if is_std && segments.len == 1 {
+        try report(inout l, file, start, "name a package inside `std`, such as `std.io`")
+        return ok.(value: none)
     }
     match try read_package(inout l, path, dir) {
         loaded(id: u32) {

@@ -182,11 +182,12 @@ fn compute_layout(input: Input, g: inout Gen, ty: check.TyId) -> TyLayout ! OutO
                 none {
                 }
             }
-            match union_members(g, ty) {
-                some(value as members: []check.TupleField) {
+            match union_range(g, ty) {
+                some(value as members: check.Range) {
                     var size: u64 = 0
                     var align: u64 = 1
-                    for let member: check.TupleField in members {
+                    for let k: u32 in 0..members.len {
+                        let member: check.TupleField = g.types.fields[usize.(members.start + k)]
                         let l: TyLayout = try ty_layout(input, inout g, member.ty)
                         size = max_u64(size, l.size)
                         align = max_u64(align, l.align)
@@ -261,7 +262,7 @@ fn enum_layout(input: Input, g: inout Gen, shape: EnumShape) -> TyLayout ! OutOf
 fn record_layout(input: Input, g: inout Gen, ty: check.TyId) -> TyLayout ! OutOfMemory {
     var layouts: [..]TyLayout = make(g.alloc)
     match try fields_of(input, inout g, ty) {
-        some(value as fields: []FieldInfo) {
+        some(value as fields: [..]FieldInfo) {
             for let f: FieldInfo in fields {
                 try push(inout layouts, try ty_layout(input, inout g, f.ty))
             }
@@ -323,14 +324,15 @@ pub fn core_ty(g: Gen, ty: check.TyId) -> check.TyId {
     }
 }
 
-fn union_members(g: Gen, ty: check.TyId) -> ?[]check.TupleField {
+// The members of a union, if ty is one.
+fn union_range(g: Gen, ty: check.TyId) -> ?check.Range {
     match check.get(g.types, ty) {
         named(id: check.NamedId) {
             match check.named_info(g.types, id) {
                 some(value as info: check.NamedInfo) {
                     match info.def {
                         union_def(fields: check.Range) {
-                            return some.(value: check.tuple_fields(g.types, fields))
+                            return some.(value: fields)
                         }
                         _ {
                             return none
@@ -349,7 +351,7 @@ fn union_members(g: Gen, ty: check.TyId) -> ?[]check.TupleField {
 }
 
 fn is_union(g: Gen, ty: check.TyId) -> bool {
-    return match union_members(g, ty) {
+    return match union_range(g, ty) {
         some(value: _) { true }
         none { false }
     }
@@ -357,12 +359,16 @@ fn is_union(g: Gen, ty: check.TyId) -> bool {
 
 // A record's fields with their offsets: records, tuples, views and
 // growable arrays. A union's members all sit at offset 0.
-fn fields_of(input: Input, g: inout Gen, ty: check.TyId) -> ?[]FieldInfo ! OutOfMemory {
+// A copy of ty's fields, since a caller often changes g while it reads
+// them.
+fn fields_of(input: Input, g: inout Gen, ty: check.TyId) -> ?[..]FieldInfo ! OutOfMemory {
     let index: usize = usize.(ty)
     if index < g.fields_cache.len {
         match g.fields_cache[index] {
             found(fields: [..]FieldInfo) {
-                return ok.(value: some.(value: fields))
+                var out: [..]FieldInfo = make(g.alloc)
+                try append(inout out, fields)
+                return ok.(value: some.(value: out))
             }
             absent {
                 return ok.(value: none)
@@ -382,8 +388,6 @@ fn fields_of(input: Input, g: inout Gen, ty: check.TyId) -> ?[]FieldInfo ! OutOf
             g.fields_cache[index] = FieldsSlot.absent
         }
     }
-    // Each type's fields have an array of their own, which never grows,
-    // so the view stays valid as the cache grows.
     return fields_of(input, inout g, ty)
 }
 
@@ -459,7 +463,7 @@ fn compute_fields(input: Input, g: inout Gen, ty: check.TyId) -> FieldsSlot ! Ou
 // The field the checker found.
 fn field_of(input: Input, g: inout Gen, ty: check.TyId, name: []u8) -> FieldInfo ! OutOfMemory {
     match try fields_of(input, inout g, ty) {
-        some(value as fields: []FieldInfo) {
+        some(value as fields: [..]FieldInfo) {
             for let f: FieldInfo in fields {
                 if same_text(check.name_of(g.types, f.name), name) {
                     return ok.(value: f)
@@ -700,7 +704,7 @@ fn compute_abi_layout(input: Input, g: inout Gen, ty: check.TyId) -> keel.Layout
     }
     if !is_union(g, ty) {
         match try fields_of(input, inout g, ty) {
-            some(value as fields: []FieldInfo) {
+            some(value as fields: [..]FieldInfo) {
                 var parts: [..]keel.Layout = make(g.alloc)
                 for let f: FieldInfo in fields {
                     try push(inout parts, try abi_layout(input, inout g, f.ty))
