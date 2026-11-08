@@ -1,0 +1,218 @@
+================================================================================
+If statement with else if
+================================================================================
+
+fn f() {
+    if a < b {
+        g()
+    } else if a == b {
+        return
+    } else {
+        h()
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (if_statement
+        (comparison_expression
+          (identifier)
+          (identifier))
+        (block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (argument_list))))
+        (if_statement
+          (comparison_expression
+            (identifier)
+            (identifier))
+          (block
+            (return_statement))
+          (block
+            (expression_statement
+              (call_expression
+                (identifier)
+                (argument_list)))))))))
+
+================================================================================
+If expression
+================================================================================
+
+fn f() {
+    let x: i32 = if c { a } else { b }
+    let s: str = if n == 0 { "none" } else if n == 1 { "one" } else { "many" }
+    let y: i32 = if c {
+        a
+    } else {
+        b
+    }
+    g(if c { 1 } else { 2 })
+    return if c { a } else { b }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (if_expression
+          (identifier)
+          (branch
+            (identifier))
+          (branch
+            (identifier))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (if_expression
+          (comparison_expression
+            (identifier)
+            (integer_literal))
+          (branch
+            (string_literal
+              (string_content)))
+          (if_expression
+            (comparison_expression
+              (identifier)
+              (integer_literal))
+            (branch
+              (string_literal
+                (string_content)))
+            (branch
+              (string_literal
+                (string_content))))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (if_expression
+          (identifier)
+          (branch
+            (identifier))
+          (branch
+            (identifier))))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (if_expression
+                (identifier)
+                (branch
+                  (integer_literal))
+                (branch
+                  (integer_literal)))))))
+      (return_statement
+        (if_expression
+          (identifier)
+          (branch
+            (identifier))
+          (branch
+            (identifier)))))))
+
+================================================================================
+Loops
+================================================================================
+
+fn f() {
+    for {
+        break
+    }
+    for i < n {
+        i += 1
+        continue
+    }
+    for p: Point in points {
+        draw(p)
+    }
+    for i: u32 in 0..n {
+        g(i)
+    }
+    for j: u32 in a + 1..len(v) - 1 {
+        g(j)
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (for_statement
+        (block
+          (break_statement)))
+      (for_statement
+        (comparison_expression
+          (identifier)
+          (identifier))
+        (block
+          (assignment_statement
+            (identifier)
+            (integer_literal))
+          (continue_statement)))
+      (for_statement
+        (for_in_clause
+          (identifier)
+          (type_name
+            (identifier))
+          (identifier))
+        (block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (argument_list
+                (argument
+                  (identifier)))))))
+      (for_statement
+        (for_in_clause
+          (identifier)
+          (type_name
+            (identifier))
+          (range
+            (integer_literal)
+            (identifier)))
+        (block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (argument_list
+                (argument
+                  (identifier)))))))
+      (for_statement
+        (for_in_clause
+          (identifier)
+          (type_name
+            (identifier))
+          (range
+            (additive_expression
+              (identifier)
+              (integer_literal))
+            (additive_expression
+              (call_expression
+                (identifier)
+                (argument_list
+                  (argument
+                    (identifier))))
+              (integer_literal))))
+        (block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (argument_list
+                (argument
+                  (identifier))))))))))

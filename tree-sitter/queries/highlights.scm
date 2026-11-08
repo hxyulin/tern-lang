@@ -1,4 +1,9 @@
-["fn" "type" "let" "var" "return"] @keyword
+["fn" "type" "let" "var" "return" "if" "else" "for" "in"] @keyword
+
+(break_statement) @keyword
+(continue_statement) @keyword
+
+".." @operator
 
 (parameter_mode) @keyword
 (argument "inout" @keyword)

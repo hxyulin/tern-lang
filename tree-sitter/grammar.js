@@ -32,7 +32,21 @@ module.exports = grammar({
   // Keywords are reserved everywhere, as in the compiler's lexer.
   // Tree-sitter keywords are contextual unless listed here.
   reserved: {
-    global: (_) => ['fn', 'type', 'let', 'var', 'return', 'inout', 'sink'],
+    global: (_) => [
+      'fn',
+      'type',
+      'let',
+      'var',
+      'return',
+      'inout',
+      'sink',
+      'if',
+      'else',
+      'for',
+      'in',
+      'break',
+      'continue',
+    ],
   },
 
   rules: {
@@ -117,11 +131,47 @@ module.exports = grammar({
         $.let_declaration,
         $.var_declaration,
         $.return_statement,
+        $.if_statement,
+        $.for_statement,
+        $.break_statement,
+        $.continue_statement,
         $.assignment_statement,
         $.expression_statement,
       ),
 
     return_statement: ($) => seq('return', optional(field('value', $._expression))),
+
+    // No parentheses around the condition; braces always.
+    if_statement: ($) =>
+      seq(
+        'if',
+        field('condition', $._expression),
+        field('consequence', $.block),
+        optional(seq('else', field('alternative', choice($.block, $.if_statement)))),
+      ),
+
+    // for { }, for cond { }, for x: T in xs { }, for i: u32 in 0..n { }
+    for_statement: ($) =>
+      seq('for', optional(choice(field('condition', $._expression), $.for_in_clause)), field('body', $.block)),
+
+    // The loop variable is `name: Type`. A destructuring pattern here
+    // would be ambiguous with a tuple-literal condition until `in`.
+    for_in_clause: ($) =>
+      seq(
+        field('name', choice($.identifier, $.discard)),
+        ':',
+        field('type', $._type),
+        'in',
+        field('iterable', choice($._expression, $.range)),
+      ),
+
+    // Only in for loops for now. The end is excluded; there is no
+    // inclusive form.
+    range: ($) => seq(field('start', $._additive_level), '..', field('end', $._additive_level)),
+
+    break_statement: (_) => 'break',
+
+    continue_statement: (_) => 'continue',
 
     // The left side is a postfix expression, so `a + b = c` does not
     // parse. Compound assignment is a statement too, and there is no ++.
@@ -152,7 +202,23 @@ module.exports = grammar({
     //   - ! ~             prefix
     //   call . .( [ ]     postfix
 
-    _expression: ($) => choice($._comparison_level, $.and_expression, $.or_expression),
+    // An if expression sits at the top level only, so it is never an
+    // operand: `1 + if c { a } else { b }` does not parse.
+    _expression: ($) =>
+      choice($._comparison_level, $.and_expression, $.or_expression, $.if_expression),
+
+    // let x: i32 = if c { a } else { b }. The else is required and each
+    // branch is one expression.
+    if_expression: ($) =>
+      seq(
+        'if',
+        field('condition', $._expression),
+        field('consequence', $.branch),
+        'else',
+        field('alternative', choice($.branch, $.if_expression)),
+      ),
+
+    branch: ($) => seq('{', field('value', $._expression), '}'),
 
     or_expression: ($) =>
       seq(

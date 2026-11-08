@@ -90,8 +90,12 @@ The running list. Each new keyword needs a reason.
 | `inout` | read-write parameter, written at the call site too |
 | `sink` | consuming parameter |
 | `defer` | cleanup at block exit |
+| `if`, `else` | branches, as a statement or an expression |
+| `for`, `in` | the one loop form |
+| `break`, `continue` | leave or restart the innermost loop |
 
-Planned by earlier decisions: `if`, `for`, `break`, `continue`, `unsafe`.
+Planned by earlier decisions: `unsafe`. `true` and `false` are predeclared
+names, not keywords, as in Go.
 `_` is a reserved token for discards, not a keyword.
 
 ### Keyword-led declarations and statements
@@ -306,6 +310,65 @@ would add three keywords.
   does not parse.
 - Only a call can stand alone as a statement, as in Go. `a + b` on its
   own line is a syntax error.
+
+## Control flow
+
+### `if`
+
+**Decided (2026-11-08).** `if cond { ... } else if cond { ... } else
+{ ... }`. No parentheses around the condition; braces always. From Go and
+Rust. The semicolon rule requires `else` on the same line as the `}`
+before it.
+
+Struct literals never use braces (see
+[Struct literals](#struct-literals)), so a `{` after a condition always
+starts the body. Rust and Go need a special rule for that.
+
+### `if` as an expression
+
+**Decided (2026-11-08).** The user's reason: it simplifies a lot of code.
+A value chosen by a condition can be a `let` binding instead of a `var`
+assigned in each branch.
+
+```
+let x: i32 = if c { a } else { b }
+let s: str = if n == 0 { "none" } else if n == 1 { "one" } else { "many" }
+```
+
+- The `else` is required.
+- Each branch is one expression, not a block of statements.
+- An `if` expression is never an operand: `1 + if c { a } else { b }`
+  does not parse. It can be a binding's value, an argument or a return
+  value.
+- No ternary `?:`.
+
+### Loops: one `for`
+
+**Decided (2026-11-08).** From Go.
+
+```
+for { ... }                     // forever
+for i < n { ... }               // while
+for p: Point in points { ... }  // over an array or view
+for i: u32 in 0..n { ... }      // over a range
+```
+
+- No C-style three-part `for`.
+- `a..b` excludes `b`, and there is no inclusive form. A range appears
+  only in a `for` header for now; slicing is part of the view design.
+- The loop variable is `name: Type`, following the rule that every
+  binding shows its type. A destructuring pattern is not allowed there:
+  `for (a: b, c: d) ...` reads as either a pattern before `in` or a
+  tuple-literal condition, and the parser cannot tell which until `in`.
+  The tree-sitter grammar found this conflict on 2026-11-08.
+
+### `break` and `continue`
+
+**Decided (2026-11-08).** They act on the innermost loop.
+
+**Deferred:** labels. Each spelling clashes with existing syntax:
+`outer: for` reuses `name:` and needs two tokens of lookahead, and Rust's
+`'outer` clashes with character literals.
 
 ### Indexing and type arguments share `[ ]`
 
