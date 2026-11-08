@@ -284,7 +284,8 @@ stays valid if UTF-8 moves into the language later.
 - Escapes: `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\'`, `\{`, and `\x00`
   to `\x7F`. Every escape uses a backslash; `{{` is not an escape.
 - Interpolation is `{expr}`. A `}` outside an interpolation is plain
-  text.
+  text. A literal with interpolation is a `Format`, not a `[]u8`; see
+  [Formatting without a heap](#formatting-without-a-heap).
 - No format-specifier language. Formatting is an ordinary call:
   `"addr={hex(a, 8)}"`, not `"addr={a:08x}"`.
 - `'a'` is an integer literal holding an ASCII code. Like a number, it
@@ -645,10 +646,9 @@ provides a few: arrays, views, optional and result. Go 1.0 did this with
 slices, maps and channels. It removes monomorphization, the main source of
 flux's backend cost.
 
-**Decided (2026-11-08):** the language also provides an owned string and a
-growable array. Their API depends on the allocator model, which is open,
-but it does not block the syntax design. Whether a built-in map exists is
-open too.
+**Decided (2026-11-08):** the language also provides a growable array,
+`[..]T`, which is also the owned string (`[..]u8`). See
+[Allocation](#allocation). There is no built-in map in the first version.
 
 ### Named tuples
 
@@ -1080,8 +1080,10 @@ The compiler avoids the copies. An assignment from a variable that is not
 used again is a move. A large read-only parameter is passed by pointer,
 which no code can observe.
 
-**Leaning:** types that own resources are move-only, and copying one is
-written out (`copy(a)`), so a reviewer sees every expensive copy.
+**Decided (2026-11-08):** types that own resources are move-only.
+`var b: [..]u8 = a` moves if `a` is not used again and is an error
+otherwise. Copying is written out (`try copy(alloc, a)`), so a reviewer
+sees every expensive copy.
 
 Sources: Hylo (formerly Val) and Swift structs. Paper: Dimitri Racordon,
 Denys Shabalin, Daniel Zheng, Dave Abrahams and Brennan Saeta,
@@ -1182,13 +1184,14 @@ types that hold views.
 
 ### Length
 
-**Decided (2026-11-08).** Arrays and views have a `.len` property:
+**Decided (2026-11-08).** Arrays, views and growable arrays have a
+`.len` property:
 `buf.len`, `s[1..].len`. Length is part of what these values are, so it
 reads as a property, not a call. For `[N]T` it is the constant `N`. The
 name `len` is still free for fields of user types.
 
-Library types such as the growable array use functions, as in Java,
-where an array has `length` and a list has `size()`.
+Library types use functions, as in Java, where an array has `length`
+and a list has `size()`.
 
 ### Slicing
 
@@ -1350,6 +1353,89 @@ left.
 Also rejected earlier: Swift's dynamic exclusivity checks for globals,
 and requiring `unsafe` for every access to a global.
 
+### Allocation
+
+**Decided (2026-11-08).** No global allocator. Code that creates an
+allocating value is given an `Allocator`, and the value stores it.
+
+```
+fn names(alloc: Allocator, text: []u8) -> [..][]u8 ! OutOfMemory {
+    var out: [..][]u8 = make(alloc)
+    for let line: []u8 in lines(text) {
+        try push(inout out, line)
+    }
+    return ok.(value: out)
+}
+
+var v: [..][]u8 = try names(heap.c_allocator, text)
+defer free(sink v)
+```
+
+- A function that creates allocating values takes an `Allocator`, so its
+  signature shows that it allocates. A program without a heap never
+  creates one. From Zig.
+- The container stores its allocator, so `push` does not repeat it. This
+  is Zig's "managed" container. The cost: a function that only grows an
+  existing container allocates without its signature saying so.
+- `Allocator` is a built-in record: a context pointer and function
+  pointers. Function values capture nothing, so it needs no closures.
+  The standard library provides a C heap allocator, an arena, and a
+  fixed-buffer allocator over a `[N]u8` for embedded targets.
+- Allocating operations return `! OutOfMemory`, as in Zig. Every
+  allocation shows as a `try`, and kernels and embedded code can handle
+  the failure. Rejected: Rust's `push`, which stops the program instead,
+  hiding each allocation point and making the failure fatal.
+- Release is explicit, with `free(sink v)` and usually `defer`.
+  Containers are move-only (see
+  [Mutable value semantics](#mutable-value-semantics)).
+
+### Growable arrays: `[..]T`
+
+**Decided (2026-11-08).** `[..]T` is the growable array. With `[N]T` and
+`[]T` it completes the family: fixed, view, growable. The spelling is
+Jai's. `[..]u8` is the owned string; there is no separate `String`.
+
+- `make(alloc)` creates an empty one. Like an array literal, it takes its
+  type from the binding.
+- It has `.len`, and passing it where a `[]T` is expected makes a view.
+- It needs no generic type syntax such as `List[T]`, which the grammar
+  does not have.
+- `push` can move the elements, which leaves earlier views of them
+  dangling. Nothing checks this (see
+  [Temporal safety](#temporal-safety-not-checked)); a debug allocator
+  catches it.
+
+### Formatting without a heap
+
+**Decided (2026-11-08).** A string literal with interpolation produces a
+built-in `Format` value. It holds the literal parts and the interpolated
+values, and never allocates. From Rust's `format_args!`.
+
+```
+io.print("x={x}\n")                         // print(f: Format)
+let s: [..]u8 = try format(alloc, "x={x}")   // owned text, explicitly
+```
+
+- A literal without interpolation is still a `[]u8`.
+- `{}` accepts integers, `bool`, `[]u8` and other `Format` values.
+- A function takes `f: Format` and writes each part where it wants: a
+  file, a buffer, or a UART register on a board with no heap. The UART
+  example prints this way.
+- Rejected: interpolation that returns an allocated string. Every literal
+  would hide an allocation, and targets without a heap could not use it.
+
+**Open:** the API for consuming a `Format`, and how helpers such as
+`hex(a, 8)` produce text.
+
+### No built-in map
+
+**Decided (2026-11-08):** no map in the first version. A map needs
+hashing and equality for every key type, which only the compiler can
+provide without generics or traits; that is why Go 1.0 built `map` in.
+It would also cost a keyword or new type syntax. The cost of waiting:
+users cannot write generic types, so a map added later must again be
+built in.
+
 ### Cleanup: `defer`
 
 **Decided (2026-11-08).** Cleanup is written out with `defer`, as in Go
@@ -1457,9 +1543,9 @@ Not in the first version. `[T]` is reserved for type arguments.
 
 ## Open questions
 
-- What an interpolated string produces at runtime, which depends on the
-  allocator model.
-- The allocator model, and whether a built-in map exists.
+- The API for consuming a `Format`, and how helpers such as `hex`
+  produce text.
+- What `panic` does on each target.
 - Nested functions (see Deferred).
 - The language's name.
 

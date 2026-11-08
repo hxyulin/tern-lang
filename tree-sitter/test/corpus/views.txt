@@ -369,3 +369,88 @@ type Line enum {
             (view_type
               (type_name
                 (identifier)))))))))
+
+================================================================================
+Growable arrays
+================================================================================
+
+fn names(alloc: Allocator, text: []u8) -> [..][]u8 ! OutOfMemory {
+    var out: [..][]u8 = make(alloc)
+    try push(inout out, text)
+    defer free(sink out)
+    let n: usize = out.len
+    return ok.(value: out)
+}
+
+type Text [..]u8
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (type_name
+          (identifier)))
+      (parameter
+        (identifier)
+        (view_type
+          (type_name
+            (identifier)))))
+    (result_type
+      (growable_type
+        (view_type
+          (type_name
+            (identifier))))
+      (type_name
+        (identifier)))
+    (block
+      (var_declaration
+        (identifier)
+        (growable_type
+          (view_type
+            (type_name
+              (identifier))))
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (identifier)))))
+      (expression_statement
+        (try_expression
+          (call_expression
+            (identifier)
+            (argument_list
+              (argument
+                (parameter_mode)
+                (identifier))
+              (argument
+                (identifier))))))
+      (defer_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (parameter_mode)
+              (identifier)))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (field_expression
+          (identifier)
+          (identifier)))
+      (return_statement
+        (construct_expression
+          (identifier)
+          (tuple_literal
+            (tuple_field
+              (identifier)
+              (identifier)))))))
+  (type_declaration
+    (identifier)
+    (growable_type
+      (type_name
+        (identifier)))))

@@ -2,6 +2,7 @@
 // wait in a ring until the main loop reads them. Sending polls.
 
 import ring
+import std.fmt
 
 type Regs (
     data: u32,
@@ -74,6 +75,12 @@ pub fn write_byte(b: u8) {
     unsafe {
         volatile_store(&regs.*.data, u32.(b))
     }
+}
+
+// Prints an interpolated string. Nothing is allocated: fmt calls
+// write_byte for each byte of the text.
+pub fn print(f: Format) {
+    fmt.each_byte(f, write_byte)
 }
 
 pub fn write_str(s: []u8) {

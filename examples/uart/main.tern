@@ -57,9 +57,7 @@ fn run(line: []u8) {
             set_led(false)
         }
         status {
-            board.write_str("overruns: ")
-            write_decimal(board.take_overruns())
-            board.write_str("\r\n")
+            board.print("overruns: {board.take_overruns()}\r\n")
         }
         unknown {
             board.write_str("unknown command\r\n")
@@ -85,23 +83,5 @@ fn set_led(on: bool) {
         } else {
             volatile_store(gpio_out, v & ~led_pin)
         }
-    }
-}
-
-// Writes n in base 10 without a heap.
-fn write_decimal(n: u32) {
-    var digits: [10]u8 = fill[10](0)
-    var i: usize = digits.len
-    var rest: u32 = n
-    for {
-        i -= 1
-        digits[i] = '0' + truncate[u8](rest % 10)
-        rest /= 10
-        if rest == 0 {
-            break
-        }
-    }
-    for let d: u8 in digits[i..] {
-        board.write_byte(d)
     }
 }

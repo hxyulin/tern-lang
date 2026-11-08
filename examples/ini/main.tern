@@ -1,6 +1,7 @@
 // inicheck FILE: prints each section and key of an INI file, or the first
 // line that does not parse. Exits with 0 on success and 1 on any error.
 
+import std.heap
 import std.io
 import std.os
 import ini
@@ -28,9 +29,10 @@ fn run() -> ! AppError {
     if args.len != 2 {
         return err.(error: AppError.usage)
     }
-    match read_all(args[1]) {
-        ok(value: String) {
-            return check(value)
+    match read_all(heap.c_allocator, args[1]) {
+        ok(value as text: [..]u8) {
+            defer free(sink text)
+            return check(text)
         }
         err(error: io.Error) {
             return err.(error: AppError.read_failed.(error: error))
@@ -38,10 +40,12 @@ fn run() -> ! AppError {
     }
 }
 
-fn read_all(path: []u8) -> String ! io.Error {
+// io.Error has an out_of_memory variant, so one error type covers both
+// reading and allocating.
+fn read_all(alloc: Allocator, path: []u8) -> [..]u8 ! io.Error {
     var f: io.File = try io.open(path)
     defer io.close(inout f)
-    return io.read_to_end(inout f)
+    return io.read_to_end(alloc, inout f)
 }
 
 fn check(text: []u8) -> ! AppError {

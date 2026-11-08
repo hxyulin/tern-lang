@@ -240,6 +240,7 @@ module.exports = grammar({
         $.tuple_type,
         $.view_type,
         $.array_type,
+        $.growable_type,
         $.pointer_type,
         $.optional_type,
       ),
@@ -286,6 +287,9 @@ module.exports = grammar({
       ),
 
     view_type: ($) => seq('[', ']', field('element', $._simple_type)),
+
+    // [..]u8: a growable array, and the owned string.
+    growable_type: ($) => seq('[', '..', ']', field('element', $._simple_type)),
 
     pointer_type: ($) => seq('*', field('pointee', $._simple_type)),
 
@@ -660,6 +664,7 @@ module.exports = grammar({
             $.optional_type,
             $.view_type,
             $.array_type,
+            $.growable_type,
             $.function_type,
           ),
         ),
