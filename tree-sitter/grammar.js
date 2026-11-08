@@ -65,6 +65,8 @@ module.exports = grammar({
       'uses',
       'extern',
       'union',
+      'shared',
+      'lock',
     ],
   },
 
@@ -140,8 +142,15 @@ module.exports = grammar({
       seq(
         attributes($),
         optional(field('visibility', $.visibility)),
-        field('binding', choice($.let_declaration, $.var_declaration)),
+        choice(
+          field('binding', choice($.let_declaration, $.var_declaration)),
+          seq(field('sharing', $.shared), field('binding', $.var_declaration)),
+        ),
       ),
+
+    // shared var rx: Ring = ...: reachable from interrupt handlers and
+    // other contexts, and accessed only inside `lock`.
+    shared: (_) => 'shared',
 
     visibility: (_) => 'pub',
 
@@ -174,11 +183,10 @@ module.exports = grammar({
     uses_clause: ($) => seq('uses', commaSep1($.global_use)),
 
     global_use: ($) =>
-      seq(
-        optional(field('mode', alias('inout', $.parameter_mode))),
-        optional(seq(field('package', $.identifier), '.')),
-        field('name', $.identifier),
-      ),
+      seq(optional(field('mode', alias('inout', $.parameter_mode))), field('global', $.global_name)),
+
+    global_name: ($) =>
+      seq(optional(seq(field('package', $.identifier), '.')), field('name', $.identifier)),
 
     parameter_list: ($) => seq('(', commaSep($.parameter), ')'),
 
@@ -317,6 +325,7 @@ module.exports = grammar({
         $.continue_statement,
         $.defer_statement,
         $.unsafe_statement,
+        $.lock_statement,
         $.assignment_statement,
         $.expression_statement,
       ),
@@ -376,6 +385,16 @@ module.exports = grammar({
 
     // unsafe { ... }: a block where unchecked operations are allowed.
     unsafe_statement: ($) => seq('unsafe', field('body', $.block)),
+
+    // lock rx { ... }, lock a, b { ... }. Locks do not nest; several
+    // globals are taken together, in a fixed order.
+    lock_statement: ($) =>
+      seq(
+        'lock',
+        field('global', $.global_name),
+        repeat(seq(',', field('global', $.global_name))),
+        field('body', $.block),
+      ),
 
     // Runs the call when the enclosing block ends.
     defer_statement: ($) => seq('defer', field('call', $.call_expression)),

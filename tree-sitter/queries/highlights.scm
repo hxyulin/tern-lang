@@ -1,4 +1,6 @@
-["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as" "unsafe" "uses" "extern" "union"] @keyword
+["fn" "type" "let" "var" "return" "if" "else" "for" "in" "enum" "match" "try" "defer" "import" "as" "unsafe" "uses" "extern" "union" "lock"] @keyword
+
+(shared) @keyword
 
 (unsafe) @keyword
 
@@ -46,6 +48,7 @@
 
 (variant name: (identifier) @constant)
 (variant_pattern name: (identifier) @constant)
-(global_use name: (identifier) @variable)
+(global_name name: (identifier) @variable)
+(global_name package: (identifier) @module)
 (attribute_name) @attribute
 (variadic) @punctuation.special

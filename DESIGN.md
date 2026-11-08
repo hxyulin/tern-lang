@@ -102,6 +102,8 @@ The running list. Each new keyword needs a reason.
 | `uses` | the mutable globals a function reads or writes |
 | `extern` | a C function declared without a body |
 | `union` | untagged unions, for C interop |
+| `shared` | a global reachable from interrupt handlers or other contexts |
+| `lock` | the only place a `shared` global can be accessed |
 
 `true` and `false` are predeclared names, not keywords, as in Go.
 
@@ -758,8 +760,77 @@ compile time. No new literal form like Rust's `c"..."`.
 
 ### Interrupt handlers
 
-`@interrupt fn uart_isr()` sets the handler ABI. What a handler may
-safely touch is part of the concurrency design.
+`@interrupt fn uart_isr()` sets the handler ABI. What a handler may touch
+is in [Concurrency](#concurrency).
+
+## Concurrency
+
+Without storable references, tasks can share memory only through mutable
+globals, raw pointers (already `unsafe`), and library types built on
+`unsafe`. Everything else is a value that moves. So safe concurrency only
+needs rules for shared globals.
+
+The user asked on 2026-11-08 for the syntax and design now. A compiler
+will not implement this for a long time.
+
+### `shared` globals and `lock`
+
+**Decided (2026-11-08).** Thread safety is opt-in: only a global marked
+`shared` can be reached from more than one context.
+
+```
+shared var rx: Ring = Ring.(head: 0, tail: 0)
+
+@interrupt
+fn uart_isr() uses inout rx {
+    lock rx {
+        push(inout rx, read_data_register())
+    }
+}
+
+fn next_byte() -> ?u8 uses inout rx {
+    lock rx {
+        return pop(inout rx)
+    }
+}
+```
+
+- `shared var` marks a global reachable from interrupt handlers and other
+  contexts. Plain `var` globals belong to the main context. `shared let`
+  does not exist; a `let` global never changes and is safe to read
+  anywhere.
+- A `shared` global is accessed only inside `lock g { ... }`. The target
+  decides what a lock does: mask interrupts on a single-core
+  microcontroller, save interrupt state and take a spinlock in an SMP
+  kernel, take a mutex in user space. The same source works in all three.
+- An `@interrupt` function's `uses` list may name only `shared` globals.
+  Since `uses` covers everything a function reaches, this is checked from
+  the handler's signature alone, with no whole-program analysis. The user
+  asked whether the compiler can check code in a parallel context or must
+  rely on the user; `uses` makes the check cheap.
+- `lock` blocks do not nest. `lock a, b { ... }` takes several globals in
+  a fixed order. A call inside a `lock` block cannot reach a function that
+  locks, which the callee's `uses` list shows. Together these rule out
+  deadlock.
+- `lock` names globals only, not expressions.
+
+`shared` is a keyword, not an attribute, because it changes which rules
+apply; attributes never change what code means.
+
+### Deferred
+
+- **`parallel`**, structured fork-join: `parallel (a: f(x), b: g(y))`,
+  checked like one call with several arguments, so branches can borrow
+  from the caller. The user judged it too much for the initial design.
+- **Threads and channels.** A spawned function would take only `sink`
+  parameters and use only `shared` globals. The API needs the allocator
+  model and generics.
+- **Atomics.** `lock` covers flags and counters at the cost of an
+  interrupt mask or lock per access. An `atomic u32` usable without a lock
+  can come later.
+- **Per-instance shared state**, such as a concurrent hash map with its
+  own lock. For now a library uses `unsafe` internally, as Rust's `Mutex`
+  does.
 
 ## Packages
 
@@ -1123,10 +1194,11 @@ signatures, but a flag check per access and a rule invisible in review.
 Also rejected: the earlier leaning, which required `unsafe` for every
 access.
 
-**Open:** interrupt handlers. They preempt even on one core, so `uses`
-does not make a global safe to share with one. This belongs to the
-concurrency design, as does whether `unsafe` code may touch a global
-without listing it.
+Interrupt handlers preempt even on one core, so a plain `var` global is
+not safe to share with one. See [Concurrency](#concurrency) for `shared`
+globals.
+
+**Open:** whether `unsafe` code may touch a global without listing it.
 
 ### Cleanup: `defer`
 

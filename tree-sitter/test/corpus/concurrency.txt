@@ -1,0 +1,140 @@
+================================================================================
+Shared globals and lock blocks
+================================================================================
+
+shared var rx: Ring = Ring.(head: 0, tail: 0)
+pub shared var ticks: u64 = 0
+
+@interrupt
+fn uart_isr() uses inout rx {
+    lock rx {
+        push(inout rx, read_data_register())
+    }
+}
+
+fn next_byte() -> ?u8 uses inout rx, ticks {
+    lock rx, ticks {
+        if ticks == 0 {
+            return none
+        }
+        return pop(inout rx)
+    }
+}
+
+fn read_remote() uses inout net.queue {
+    lock net.queue {
+        clear(inout net.queue)
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (global_declaration
+    (shared)
+    (var_declaration
+      (identifier)
+      (type_name
+        (identifier))
+      (construct_expression
+        (identifier)
+        (tuple_literal
+          (tuple_field
+            (identifier)
+            (integer_literal))
+          (tuple_field
+            (identifier)
+            (integer_literal))))))
+  (global_declaration
+    (visibility)
+    (shared)
+    (var_declaration
+      (identifier)
+      (type_name
+        (identifier))
+      (integer_literal)))
+  (function_declaration
+    (attribute
+      (attribute_name))
+    (identifier)
+    (parameter_list)
+    (uses_clause
+      (global_use
+        (parameter_mode)
+        (global_name
+          (identifier))))
+    (block
+      (lock_statement
+        (global_name
+          (identifier))
+        (block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (argument_list
+                (argument
+                  (parameter_mode)
+                  (identifier))
+                (argument
+                  (call_expression
+                    (identifier)
+                    (argument_list))))))))))
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (optional_type
+      (type_name
+        (identifier)))
+    (uses_clause
+      (global_use
+        (parameter_mode)
+        (global_name
+          (identifier)))
+      (global_use
+        (global_name
+          (identifier))))
+    (block
+      (lock_statement
+        (global_name
+          (identifier))
+        (global_name
+          (identifier))
+        (block
+          (if_statement
+            (comparison_expression
+              (identifier)
+              (integer_literal))
+            (block
+              (return_statement
+                (identifier))))
+          (return_statement
+            (call_expression
+              (identifier)
+              (argument_list
+                (argument
+                  (parameter_mode)
+                  (identifier)))))))))
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (uses_clause
+      (global_use
+        (parameter_mode)
+        (global_name
+          (identifier)
+          (identifier))))
+    (block
+      (lock_statement
+        (global_name
+          (identifier)
+          (identifier))
+        (block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (argument_list
+                (argument
+                  (parameter_mode)
+                  (field_expression
+                    (identifier)
+                    (identifier)))))))))))

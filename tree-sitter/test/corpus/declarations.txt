@@ -390,7 +390,8 @@ fn report(s: str, t: str) -> str in s uses counter, inout log.out {
     (uses_clause
       (global_use
         (parameter_mode)
-        (identifier)))
+        (global_name
+          (identifier))))
     (block
       (assignment_statement
         (identifier)
@@ -411,11 +412,13 @@ fn report(s: str, t: str) -> str in s uses counter, inout log.out {
     (identifier)
     (uses_clause
       (global_use
-        (identifier))
+        (global_name
+          (identifier)))
       (global_use
         (parameter_mode)
-        (identifier)
-        (identifier)))
+        (global_name
+          (identifier)
+          (identifier))))
     (block
       (expression_statement
         (call_expression
