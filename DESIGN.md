@@ -40,19 +40,26 @@ Two observations about AI-assisted programming motivated a new language:
    review it. Extra keystrokes cost the writer nothing. This rule decides
    most of the choices below.
 2. **Fast compilation.** Every function body can be checked from
-   signatures alone, in parallel. No checks cross function boundaries.
+   signatures alone, in parallel. No type checks cross function
+   boundaries; inferring which globals a function writes is a separate
+   pass over the call graph (2026-11-09, see
+   [Mutable globals](#mutable-globals)).
 3. **Systems level.** No garbage collector and no required runtime, so
    the language works for embedded targets and OS development.
-4. **Spatial memory safety.** Indexing is bounds-checked, there is no
-   null, and pointer arithmetic is a built-in. Use after free and
-   dangling views are not checked in the first version (see
-   [Temporal safety](#temporal-safety-not-checked)). Hardware access and
-   other unchecked operations go in `unsafe` blocks.
+4. **Memory safety.** Indexing is bounds-checked, there is no null, and
+   pointer arithmetic is a built-in. Since 2026-11-09 the design also
+   makes safe code free of use after free and dangling views, without
+   lifetimes, and the compilers are being changed to match (see
+   [Temporal safety](#temporal-safety-without-lifetimes)). Hardware
+   access and other unchecked operations go in `unsafe` blocks.
 5. **One way to do each thing at the syntax level**, with no paradigm
    forced on program structure. The user's first framing was
    "unopinionated, but not many ways to do the same thing".
 6. **Easy tooling.** A highlighter only needs the lexer. The parser is
    simple enough to write by hand.
+7. **Verifiable** (added 2026-11-09). A safe program can be proved free
+   of runtime errors automatically, and correct against written
+   contracts. See [Verification](#verification).
 
 ## Not in the first version
 
@@ -990,6 +997,10 @@ names, makes the change visible through the parameter; this is defined
 behavior, as for `inout` under [Exclusivity](#exclusivity). The
 `borrow` run test covers each case.
 
+Rule 4 (2026-11-09) changes this once it is built: a callee that writes
+a global cannot take that global as an argument, so the copy for
+globals and the visible change through an alias both go away.
+
 ### Untagged unions
 
 **Decided (2026-11-08).**
@@ -1026,8 +1037,8 @@ is in [Concurrency](#concurrency).
 
 Tasks share memory through mutable globals, views, raw pointers and
 library types built on `unsafe`. The design gives rules for globals only.
-A view shared with another context is unchecked, like every other view
-lifetime (see [Temporal safety](#temporal-safety-not-checked)).
+A view cannot be stored (see [Views](#views)), so only a global or a
+raw pointer reaches another context.
 
 The user asked on 2026-11-08 for the syntax and design now. A compiler
 will not implement this for a long time.
@@ -1068,10 +1079,11 @@ fn next_byte() -> ?u8 {
   globals in a fixed order.
 - `lock` names globals only, not expressions.
 
-Not checked, since `uses` lists were dropped on 2026-11-08: that an
-interrupt handler reaches only `shared` globals, and that a call inside
-`lock` does not reach another `lock`, which could deadlock. Both need to
-know every global a callee touches. The author and the reviewer check
+Checkable again since write sets are inferred (2026-11-09), and planned:
+that an interrupt handler reaches only `shared` globals, and that a call
+inside `lock` does not reach another `lock`, which could deadlock. Both
+need every global a callee touches, which the inferred sets give once
+they record reads too. Until then the author and the reviewer check
 them, as in C.
 
 `shared` is a keyword, not an attribute, because it changes which rules
@@ -1161,34 +1173,44 @@ which inflates the diff a reviewer reads.
 No garbage collector, because the language targets embedded and kernel
 code (goal 3). The model has these layers.
 
-### Temporal safety: not checked
+### Temporal safety without lifetimes
 
-**Decided (2026-11-08).** The first version checks spatial safety only:
-bounds and null. It does not check that a view or
-pointer outlives what it points into. This is where Zig and Odin stand.
+**Decided (2026-11-09), replacing "temporal safety: not checked".** The
+user made mathematical verification a priority (see
+[Verification](#verification)), so safe code is now free of use after
+free and dangling views, without lifetime annotations. Five rules do it,
+each local to a function or a signature:
 
-The earlier design checked temporal safety without lifetimes: views could
-not be stored in fields or globals, a returned view named its source with
-`in`, and functions listed their globals with `uses`. The example programs
-showed the cost. A parser that returns `pair(key: str, value: str)` needed
-a new kind of type, a view type, that every containing type inherits. The
-user judged that this is not clearly simpler than Rust's lifetimes, and
-asked to drop the requirement from the initial design.
+1. **One owner per buffer.** A type that holds a `[..]T` does not copy
+   implicitly; `take` and `copy` say what happens. See
+   [Values and buffers](#values-and-buffers).
+2. **References do not escape, and a function can return a view
+   derived from its parameters.** See
+   [Second-class references](#second-class-references-and-parameter-modes).
+3. **Records store indices, not views.** A view is a local, a
+   parameter or a result, never a field or a `[..]T` element. See
+   [Views](#views).
+4. **The compiler infers which globals each function writes.** Nothing
+   can alias an `inout` argument. See
+   [Exclusivity](#exclusivity) and [Mutable globals](#mutable-globals).
+5. **`unsafe` is the trusted boundary.** Raw pointers, C calls and
+   allocators sit behind contracts the checker assumes. See
+   [`unsafe`](#unsafe).
 
-What safe code can now do wrong:
+Together they make every safe function a mathematical function from its
+inputs, `inout` arguments included, to its result and new `inout`
+values. A verifier can model a `[..]T` as a sequence, with no heap.
 
-```
-var all: List[Line] = ...
-push(inout all, try ini.parse_line(text[0..n]))
-free(inout text)        // compiles; each Line in all now dangles
-```
+The earlier design, from 2026-11-08, checked bounds and null only, as
+Zig and Odin do. The one before it checked views with `in` clauses and
+`uses` lists, and the user rejected it because a type holding a view
+needed a new kind of type. Rule 3 avoids that: views never go in types,
+so no type inherits anything.
 
-A reviewer has to catch this, as in C and Zig. The mitigations need no
-syntax: a debug allocator that poisons freed memory and detects use after
-free, as Zig's does, and sanitizers.
-
-The syntax keeps the door open. A later checker could be a lint over the
-same code, so this decision can be reversed without changing programs.
+**Status.** Decided and being built in this order, in stage 1 and ternc
+together: rule 1, rule 4, then rules 3 and 2, which need std and ternc
+to store spans and owned text instead of views. Until a rule is built,
+the program it would reject still compiles.
 
 ### Bounds checks, no null, no pointer arithmetic
 
@@ -1226,53 +1248,59 @@ against the Google Research listing and the authors' preprint.
 
 ### Values and buffers
 
-**Decided (2026-11-08), replacing move-only types.** Every type copies,
-byte for byte. Nothing moves, and the compiler tracks no ownership.
+**Decided (2026-11-08), revised 2026-11-09 for rule 1.** A type is
+*owning* if it holds a `[..]T`: a growable array, or a record, tuple,
+fixed array, optional, result or enum with an owning part. Every other
+type copies byte for byte, as before.
 
-- A `[..]T` is a handle: a pointer to its buffer, a length, a capacity
-  and an allocator. Copying it copies the handle, not the buffer, so
-  two copies refer to the same elements, as in Zig. A deep copy is
-  written out: `try copy(alloc, v)`.
-- `free(inout v)` frees the buffer and leaves `v` empty: no buffer,
-  length and capacity 0, the same allocator. Freeing an empty array
-  does nothing, so freeing a variable twice is harmless, and the array
-  can grow again.
-- `take(inout v)` returns the array and leaves `v` empty. It is the
-  explicit hand-off, for when a local stays alive after its buffer
-  goes elsewhere: `try push(inout words, take(inout line))`. From
-  Rust's `mem::take`.
-- `free` frees one level. `free(inout words)` on a `[..][..]u8` frees
-  the outer buffer only; each element needs its own `free`. A deep
-  `free` would need to know which copies own their buffer, which is the
-  tracking this design removes. Structures built together belong in an
-  arena, freed with one call (see [Arenas](#arenas)).
-- A resource handle follows the same convention. `io.File` is a plain
-  record; `io.close(inout f)` sets the descriptor to -1, so a second
-  `close` does nothing.
-- What this gives up: the compiler no longer reports a double free or a
-  use after free of a container. Both need two live copies of one
-  handle; a debug allocator catches them in tests, as it catches a
-  dangling view.
+- **An owning value never copies implicitly.** `let b: T = a`,
+  `b = a`, a field in a construction, a `[..]T` element and an argument
+  to `push` all need a value that nothing else holds: a call result, a
+  construction, a literal, `make(alloc)`, `take(inout a)` or
+  `try copy(alloc, a)`. Reading a place of owning type into a new home
+  is an error that names both.
+- **`take(inout v)`** returns the value and leaves `v` empty: no
+  buffer, length and capacity 0, the same allocator. For a record it
+  empties every owning part. `v` stays valid, so the checker tracks no
+  moved-from state; this is what made the earlier move-only types heavy.
+- **`return` of a local takes it.** `return v` or `return ok.(value:
+  r.items)`, where the place starts at a local of the function, leaves
+  the local empty before any `defer` runs, so `defer free(inout v)`
+  frees nothing. A parameter or a global still needs `take`.
+- **`try copy(alloc, v)`** is a deep copy into a new buffer from
+  `alloc`.
+- **Borrowing needs no copy.** A `let` argument, a `for let` element and
+  a `match` payload bound from a place read the value where it lives;
+  they cannot be stored without `take` or `copy`. A `var` payload of
+  owning type needs a scrutinee that is not a place, such as
+  `match take(inout x)` or `match try f()`.
+- **`free(inout v)` is deep.** It frees every buffer `v` owns, at every
+  level, and leaves `v` empty. Freeing an empty value does nothing, so a
+  second `free` is harmless. With one owner per buffer this is
+  well-defined; before rule 1, two copies could share a buffer and a
+  deep `free` could not know which one owned it.
+- A resource handle follows the convention. `io.File` is a plain record;
+  `io.close(inout f)` sets the descriptor to -1, so a second `close`
+  does nothing.
 
-The user chose this on 2026-11-08 because the earlier model was neither
-simple nor intuitive. It tracked ownership without freeing anything
-automatically, and without making memory safe, since views were already
-unchecked. Every friction item from porting the lexer and parser came
-from that tracking: destructuring a record to free it, partial moves,
-the rule that `clear` could not drop owning elements, and who owned a
-`match` payload.
+The user chose copying handles on 2026-11-08 because tracking moves was
+neither simple nor intuitive: every friction item from porting the
+lexer and parser came from it. Rule 1 keeps what that fixed, since
+nothing moves and every variable is always valid, and adds back one
+owner per buffer, which verification needs. Under the handle design,
+`var all: [..]V = args` followed by `push(inout all, x)` left `args`
+pointing at a freed buffer whenever the push moved the elements.
 
-Rejected on 2026-11-08:
+Rejected:
 
-- **Move-only types** (decided earlier that day): a type that held a
-  `[..]T` or a `move type` moved instead of copying, so `let b: T = a`
-  copied or moved depending on what `T` held, possibly several levels
-  down. The checker tracked moved locals and fields through each
-  function's control flow, with rules for loops, `defer` and `match`
-  payloads.
-- **Declared owners with a deep `free`:** owners stay tracked, but a
-  record holding a `[..]T` must say `move type`, and `free` frees every
-  owning part. It removed the invisible part and kept every move rule.
+- **Copyable handles** (2026-11-08 to 2026-11-09): a copy of a `[..]T`
+  shared its buffer, as in Zig. A verifier would need a heap model, and
+  the compiler could not report a double free or a use after free.
+- **Move-only types with flow tracking** (decided earlier on
+  2026-11-08): `let b: T = a` moved or copied depending on what `T`
+  held, and the checker tracked moved locals and fields through each
+  function's control flow.
+- **Declared owners (`move type`):** kept every move rule.
 
 ### Second-class references and parameter modes
 
@@ -1307,6 +1335,29 @@ Values for Fun and (Co-)Effect", OOPSLA 2016, pages 234 to 251,
 doi:10.1145/2983990.2984009. Checked on 2026-11-08 against the SPLASH 2016
 program and researchr.
 
+**Decided (2026-11-09): a function can return a reference derived from
+its parameters** (rule 2). A function whose result holds a view, such
+as `fn trim(s: []u8) -> []u8`, returns something that points into its
+arguments, never into its own frame. The checker enforces both sides
+within one function:
+
+- In the callee, a returned view must come from a parameter, from
+  static data such as a string literal, or from another call that
+  follows this rule. A view of a local is an error.
+- In the caller, the result borrows every argument that can hold or
+  own the memory: each argument whose type holds a view or is owning.
+  Until the result's last use, those places cannot be passed `inout`,
+  assigned, taken or freed, and a function that writes them, as a
+  global, cannot be called. A borrow of a temporary, as in
+  `trim(read_line())`, is an error, since the temporary dies at the end
+  of the statement.
+- The rule needs no annotation: the source of a result is always all of
+  its candidate arguments, as Rust's lifetime elision assumes for one
+  input. Code that wants a narrower source passes fewer arguments.
+
+A place returned for writing, so `slot(inout m, k) += 1` works, is
+planned on the same rule, after Hylo's subscripts.
+
 ### Exclusivity
 
 **Decided.** In one call, an argument passed as `inout` must not overlap any
@@ -1321,46 +1372,64 @@ swap(inout v[i], inout v[j])    // error: i != j is not provable
 Built-ins such as `swap_at(inout v, i, j)` cover the indexed case. From
 Swift's Law of Exclusivity (Swift Evolution proposal SE-0176).
 
-The check stays after temporal safety was dropped, because it is local to
-one call. It no longer proves that an `inout` parameter is unaliased: the
-callee can reach the same value through a global, a view or a pointer.
+**Decided (2026-11-09): nothing aliases an `inout` argument** (rule 4).
+An argument rooted at a global cannot be passed `inout`, or as a `let`
+reference, to a function that writes that global, which the compiler
+knows from the inferred write sets (see
+[Mutable globals](#mutable-globals)). Views cannot be stored (rule 3),
+so a view that reaches the same value is another argument of the same
+call, which the path check above already covers. Only a raw pointer
+dereference inside `unsafe` can still alias, and that is the trusted
+boundary.
 
-**Decided (2026-11-08):** that aliasing is defined behavior. The
-backend marks a parameter `noalias` only where it proves it, for example
-in a function that touches no globals and no pointers. Fortran's rule,
-which makes the aliasing undefined so every `inout` gets `noalias`, would
-add a second kind of undefined behavior that nothing in the code shows.
-C code mostly runs without `restrict` and does fine. An attribute that
-opts one function into `noalias` can come later; it would change speed,
-not meaning.
+So every `inout` parameter is unaliased, and keel can mark it
+`noalias`. This replaces the decision of 2026-11-08 that made such
+aliasing defined behavior, and the copy a `let` argument rooted at a
+global needed.
 
 ### Views
 
-**Decided.** Slices are a built-in view type, `[]T`. Text is `[]u8`. A view is a pointer and a length into memory owned by something
-else.
+**Decided.** Slices are a built-in view type, `[]T`. Text is `[]u8`. A
+view is a pointer and a length into memory owned by something else.
 
-**Decided (2026-11-08):** views are ordinary values. A view can be a
-local, a parameter, a return value, a field, an enum payload or a global.
-Nothing checks that it outlives what it points into (see
-[Temporal safety](#temporal-safety-not-checked)).
+**Decided (2026-11-09): a view is a local, a parameter or a result**
+(rule 3). It cannot be a field of a declared type, an enum payload, a
+`[..]T` element or a `var` global. A named tuple can hold views, and is
+then bound by the same rule, so a function can still return
+`(head: []u8, tail: []u8)`. A `let` global can be a view of static
+data, such as a string literal, since that memory never goes away.
+
+```
+fn trim(s: []u8) -> []u8 { ... }
+fn find(haystack: []u8, needle: []u8) -> ?[]u8 { ... }
+fn split(s: []u8, at: usize) -> (head: []u8, tail: []u8) { ... }
+
+let prompt: []u8 = "> "
+```
+
+Data structures hold what a view would have pointed at, or the means to
+find it again: owned text as `[..]u8`, a span of indexes into a buffer
+the structure owns, or a typed index or generational handle. ternc
+already works this way: `Span`, `TyId` and `DeclRef` are indexes.
 
 ```
 pub type Line enum {
-    section(name: []u8)
-    pair(key: []u8, value: []u8)
+    section(name: Span)
+    pair(key: Span, value: Span)
 }
-
-fn trim(s: []u8) -> []u8 { ... }
-fn find(haystack: []u8, needle: []u8) -> ?[]u8 { ... }
 ```
 
-A string literal is a view of static data, so `let prompt: []u8 = "> "`
-is a valid global.
+The cost: the ini parser's `pair(key: []u8, value: []u8)` becomes a
+pair of spans into the line, or owned copies. The user accepted it on
+2026-11-09. The `Format` rule, which keeps a `Format` out of everything
+but parameters, is the same kind of check.
 
-Rejected on 2026-11-08 with temporal safety: views only as locals,
-parameters and results; `-> ?str in haystack` to name the source of a
-returned view; a borrow check within each function; and `view type` for
-types that hold views.
+Rejected:
+
+- **Views anywhere, unchecked** (2026-11-08 to 2026-11-09): no
+  temporal safety.
+- **`view type` for types that hold views, with `-> ?str in haystack`**
+  (until 2026-11-08): every containing type inherited the restriction.
 
 ### Length
 
@@ -1475,20 +1544,22 @@ unsafe {
 - A lint requires a `// SAFETY:` comment above each `unsafe` block, so the
   reviewer reads why it is sound. From Rust's lints.
 
-**Decided (2026-11-08):** `unsafe` stays after temporal safety was
-dropped, with a narrower promise. It marks raw pointer dereferences, union
-reads, C calls and other operations that can break spatial safety, the
-lines a reviewer should read twice. It does not mean code outside it is
-free of memory errors: a view can dangle anywhere.
+**Decided (2026-11-09): `unsafe` is the trusted boundary** (rule 5). It
+marks raw pointer dereferences, union reads, C calls and other
+operations the checker cannot see through. Code outside it is free of
+memory errors, given that each `unsafe` block and `unsafe fn` keeps the
+promise its `// SAFETY:` comment states. A verifier assumes those
+promises as contracts, as SPARK assumes code outside SPARK.
 
 Untagged unions, attributes and `extern` functions are in
 [C interop and layout](#c-interop-and-layout).
 
 The user asked whether a systems language needs storable references.
-With temporal safety dropped, views are the storable reference, and raw
-pointers cover the rest. Rust's safe references stored in structs
-(`&'a T`) need lifetime parameters, variance and region inference across
-functions, which this design leaves out.
+Data structures store indexes and owned values instead (see
+[Views](#views)), and raw pointers cover the rest. Rust's safe
+references stored in structs (`&'a T`) need lifetime parameters,
+variance and region inference across functions, which this design
+leaves out.
 
 ### Mutable globals
 
@@ -1521,14 +1592,41 @@ let mask: u32 = 1 << 5
 - A global reachable from an interrupt handler is declared `shared` and
   accessed inside `lock`. See [Concurrency](#concurrency).
 
-Rejected on 2026-11-08 with temporal safety: `uses` lists, where each
-function named the globals it and its callees read, or with `inout`
-wrote. They let the compiler check that a callee could not free what the
-caller held a view into, and check interrupt handlers from their
-signatures. The cost was a list that propagates up every caller, as with
-Java's checked exceptions, and it leaked private globals into other
-packages' signatures. Without view checks, little of the benefit was
-left.
+**Decided (2026-11-09): the compiler infers which globals each function
+writes** (rule 4). Nobody writes the list.
+
+- The write set of a function is the `var` globals it assigns, takes,
+  frees or passes `inout`, plus its callees' write sets. The compiler
+  computes it bottom up over the call graph, with a fixpoint over each
+  group of mutually recursive functions, after type checking.
+- **Outside its package, a private global appears as the package's
+  state.** If `io.print` writes a private buffer, callers in other
+  packages see that it writes `io`, not which global. Changing which
+  private globals a function touches changes nothing outside the
+  package. A `pub var` global keeps its own name. From SPARK's abstract
+  state.
+- **A function type writes nothing unless it says so:**
+  `fn(u8) uses io`. Passing a function that writes a package's state
+  where the type does not allow it is an error, so a call through a
+  function value has a known write set, and comparators and similar
+  callbacks stay pure.
+- **An `extern` function writes "the outside world"**, which no tern
+  global belongs to, unless it is given a contract (see
+  [Verification](#verification)).
+- `ternc` prints each public function's write set, so a reviewer sees
+  it without the source, and a change to one across a package boundary
+  can be flagged.
+
+Type checking stays local to each function, from signatures alone.
+Write-set inference is a separate pass after it; it still runs in
+parallel across independent parts of the call graph, but not fully per
+function. The user accepted this relaxation of goal 2 on 2026-11-09.
+
+Rejected on 2026-11-08 and replaced: written `uses` lists, where each
+function named the globals it and its callees read or wrote. They
+propagated up every caller, as Java's checked exceptions do, and leaked
+private globals into other packages' signatures. Inference with package
+state removes both costs.
 
 Also rejected earlier: Swift's dynamic exclusivity checks for globals,
 and requiring `unsafe` for every access to a global.
@@ -1590,8 +1688,11 @@ let alloc: Allocator = heap.arena_allocator(&arena)
 - `free_arena` returns every chunk and block; the arena can be used
   again.
 - The `Allocator` points at the `Arena`, so the arena must stay where
-  it is while the allocator is in use. Nothing checks this, as nothing
-  checks a view.
+  it is while the allocator is in use, and outlive every value
+  allocated from it. The checker cannot see either, so
+  `arena_allocator` and `free_arena` are `unsafe fn` (decided
+  2026-11-09, rule 5), and the `// SAFETY:` comment at the call states
+  the promise. `c_allocator` lives forever and needs neither.
 - A resize that moves copies with C's `memcpy`, so the arena needs
   libc, as `c_allocator` does. A bare-metal arena needs a copy that is
   not C's; that comes with the fixed-buffer allocator.
@@ -1611,14 +1712,12 @@ Jai's. `[..]u8` is the owned string; there is no separate `String`.
 - It has `.len`, and passing it where a `[]T` is expected makes a view.
 - It needs no generic type syntax such as `List[T]`, which the grammar
   does not have.
-- `pop(inout v)` removes the last element and returns it as a `?T`.
-  `clear(inout v)` sets the length to 0 and keeps the memory; elements
-  that hold buffers of their own are not freed. Added on 2026-11-08 for
-  the lexer's stack.
-- `push` can move the elements, which leaves earlier views of them
-  dangling. Nothing checks this (see
-  [Temporal safety](#temporal-safety-not-checked)); a debug allocator
-  catches it.
+- `pop(inout v)` removes the last element and returns it as a `?T`;
+  the caller owns it. `clear(inout v)` frees what the elements own,
+  sets the length to 0 and keeps the memory (deep since 2026-11-09).
+  Added on 2026-11-08 for the lexer's stack.
+- `push` can move the elements. A view of them is a borrow of the
+  array, so the checker rejects a `push` while one is in use (rule 2).
 
 ### Formatting without a heap
 
@@ -1732,9 +1831,36 @@ Rejected on 2026-11-08:
 - **First-class references with lifetimes** (Rust): the frontend cost flux
   ran into, and the main source of difficulty when reading Rust.
 - **Second-class views with `uses` lists** (this design until
-  2026-11-08): see [Temporal safety](#temporal-safety-not-checked).
+  2026-11-08): see [Temporal safety](#temporal-safety-without-lifetimes).
 - **Move-only types with ownership tracking** (this design until
   2026-11-08): see [Values and buffers](#values-and-buffers).
+- **Unchecked temporal safety with copyable handles**, Zig's model
+  (this design from 2026-11-08 to 2026-11-09): a verifier would need a
+  heap model, and use after free went unreported.
+
+## Verification
+
+**Decided (2026-11-09).** The user made mathematical verification a
+priority. The aim is SPARK's, for a systems language: proofs over
+ordinary code, with the language rules doing most of the work.
+
+- **Two levels.** Absence of runtime errors is proved automatically:
+  every runtime error in tern is an explicit check (bounds, overflow,
+  division, conversions, `unwrap`-like matches), so the proof is that
+  no check fails. Functional correctness needs written contracts.
+- **Why it is tractable.** Mutable value semantics, second-class
+  references and one owner per buffer make each safe function a
+  function from values to values, with `inout` parameters as extra
+  results. Rust verifiers such as Creusot need prophecy variables for
+  `&mut`, because a Rust reference can be stored; a tern reference
+  cannot, so a direct translation works. There are no generics,
+  closures, exceptions or hidden control flow to model.
+- **The trusted base** is `unsafe` code, `extern` functions and
+  allocators, each with a contract the proof assumes.
+- **Open:** the contract syntax (`requires`, `ensures`, loop
+  invariants, ghost values), and whether to translate to Why3, Viper
+  or straight to an SMT solver. Rules 1 to 5 of
+  [Temporal safety](#temporal-safety-without-lifetimes) come first.
 
 ## Runtime
 
@@ -2173,6 +2299,28 @@ name in every import.
 ### Generics and traits
 
 Not in the first version. `[T]` is reserved for type arguments.
+
+**Constraints decided on 2026-11-09,** so the memory model fits them
+later:
+
+- **Checked at the definition, not per use.** A generic function is
+  checked against its constraints once, and verified once for every
+  type. Zig's comptime and C++ templates can only be checked and
+  verified per instantiation, which breaks goals 2 and 7.
+- **Owning is the first constraint.** Rule 1 splits types into those
+  that copy and those that do not, as Swift's `~Copyable` and Rust's
+  `Copy` do. A type parameter states which it accepts.
+- **Constraints carry contracts.** An interface's operations have
+  `requires` and `ensures`, as Dafny's traits and SPARK's generic
+  formal parameters do, so a verified `sort[T]` can rely on `less`
+  being a strict order.
+- **The built-in generic types follow the same rules.** `[..]T`, `?T`
+  and `T ! E` behave as user generics will, so they can become library
+  types.
+- **Implementation is open.** Monomorphizing everything brings back
+  the compile time flux ran into; passing operation tables, as Swift
+  does, compiles each generic function once. It does not change the
+  language.
 
 ## Open questions
 
