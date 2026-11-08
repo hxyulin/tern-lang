@@ -8,7 +8,6 @@
 ".." @operator
 
 (parameter_mode) @keyword
-(argument "inout" @keyword)
 
 (type_name name: (identifier) @type)
 (type_name package: (identifier) @module)

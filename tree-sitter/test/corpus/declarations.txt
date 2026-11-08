@@ -224,6 +224,7 @@ fn consume(f: sink File, _: Event) {
           function: (identifier)
           arguments: (argument_list
             (argument
+              mode: (parameter_mode)
               value: (identifier))))))))
 
 ================================================================================

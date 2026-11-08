@@ -743,17 +743,21 @@ returns, so it cannot dangle and needs no lifetime annotations.
 Parameter modes:
 
 - `let` (the default): read-only. The callee gets a reference or a copy,
-  whichever is cheaper.
+  whichever is cheaper. The mode is never written: `p: Point`, not
+  `p: let Point`, so it has one spelling (decided 2026-11-08).
 - `inout`: read and write. The call site writes `inout` too, so a reviewer
   knows a call can change only the arguments marked `inout`.
-- `sink`: takes ownership. The caller cannot use the value afterward.
+- `sink`: takes ownership. The caller cannot use the value afterward. The
+  call site writes `sink` too (decided 2026-11-08), so a reviewer sees
+  where a value stops being usable.
 
 ```
 fn bump(p: inout Point) {
-    p.x = p.x + 1
+    p.x += 1
 }
 
 bump(inout a)
+consume(sink f)
 ```
 
 Sources: Hylo's `let`, `inout`, `sink` modes; Swift's `inout` with `&` at
@@ -795,10 +799,11 @@ Rules:
    parameter, and the result borrows from that argument. This is Rust's
    lifetime elision without named lifetimes.
 
-   **Leaning (2026-11-08):** a function with more than one such parameter
-   names the one the result borrows from, for example
-   `fn find(haystack: str, needle: str) -> str from haystack`. Without the
-   annotation, `find` would be illegal. The spelling is open.
+   **Decided (2026-11-08):** a function with more than one such parameter
+   names the one the result borrows from with `in`:
+   `fn find(haystack: str, needle: str) -> ?str in haystack`. It reads
+   "returns a str inside haystack" and reuses a keyword where `from` would
+   add one.
 3. While a view of `v` is live in a function, the function cannot mutate,
    move or resize `v`.
 
@@ -808,7 +813,7 @@ fn trim(s: str) -> str { ... }
 var line: String = read_line()
 let t: str = trim(line)       // t borrows line
 print(t)
-line.push('x')                // fine: t is not used again
+push(inout line, 'x')         // fine: t is not used again
 ```
 
 Rule 3 needs a borrow check, but only within one function: compare each
@@ -816,11 +821,59 @@ view's live range with later writes to what it borrows. That is the cheap
 part of Rust's non-lexical lifetimes. Rust's cost comes from lifetimes in
 signatures and structs, which rules 1 and 2 exclude.
 
+### Slicing
+
+**Decided (2026-11-08).** `s[a..b]` makes a view of `s` from `a` up to,
+not including, `b`. `s[a..]` and `s[..b]` omit an end, which is allowed
+only inside brackets. `s[..]` is not allowed; it is just `s`.
+
+**Open:** what indexing and slicing a `str` mean now that `str` is a byte
+view: byte offsets, as in Go, are the likely answer.
+
 **Open:** a `static str` type that points only to static data and can be
 stored anywhere, so string literals can go in struct fields.
 
 **Open:** a struct that holds input across calls, such as a parser. It
 stores an owned buffer plus offsets, or a raw pointer in `unsafe` code.
+
+### Fixed arrays
+
+**Decided (2026-11-08).** `[N]T` is an array of `N` values of type `T`,
+stored inline. It is a value like any other: assigning it copies it.
+
+```
+type Mac [6]u8
+
+let primes: [4]u32 = [2, 3, 5, 7]
+var table: [256]u8 = fill[256](0)
+```
+
+- An array literal `[a, b, c]` takes its type from context, like a number
+  literal.
+- A repeated value uses the built-in `fill[N](value)`. Rust's `[0; 256]`
+  would put a `;` inside brackets, which reads badly next to the semicolon
+  rule.
+
+### Function values
+
+**Decided (2026-11-08).** A function type lists parameter modes and
+types, without names: `fn(inout []i32, u32) -> bool`. A function is
+passed by its name.
+
+```
+type Less fn(i32, i32) -> bool
+
+fn sort(v: inout []i32, less: fn(i32, i32) -> bool) { ... }
+
+sort(inout v, by_size)
+```
+
+- A function value is a code address and captures nothing, so it is safe
+  to store in fields and variables. Only nested functions, which are
+  deferred, would capture and be second-class.
+- Like a result type, a function type sits only at the top of a type:
+  `fn() -> u8 ! E` returns a result. A view of function values needs a
+  named type.
 
 ### Generational handles
 
@@ -962,9 +1015,9 @@ with no heap. From Pascal and Ada (downward funargs) and Swift's
 non-escaping closures.
 
 ```
-fn total_size(dir: let Dir) -> u64 {
+fn total_size(dir: Dir) -> u64 {
     var sum: u64 = 0
-    fn add(f: let File) {
+    fn add(f: File) {
         sum = sum + f.size
     }
     walk(dir, add)
@@ -985,9 +1038,6 @@ Not in the first version. `[T]` is reserved for type arguments.
 
 - Whether a fallible function with no value is `-> ! E` with a bare
   `return ok`.
-- Function value syntax: the type of a function and how a function is
-  passed. Everything beyond the syntax is deferred.
-- Spelling of the view source annotation (`-> str from haystack`).
 - What an interpolated string produces at runtime, which depends on the
   allocator model.
 - The allocator model, and whether a built-in map exists.

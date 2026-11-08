@@ -1,0 +1,227 @@
+================================================================================
+Borrowed result and sink at the call site
+================================================================================
+
+fn find(haystack: str, needle: str) -> ?str in haystack {
+    consume(sink f)
+    return none
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (type_name
+          (identifier)))
+      (parameter
+        (identifier)
+        (type_name
+          (identifier))))
+    (optional_type
+      (type_name
+        (identifier)))
+    (identifier)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (parameter_mode)
+              (identifier)))))
+      (return_statement
+        (identifier)))))
+
+================================================================================
+Slices
+================================================================================
+
+fn f() {
+    let a: []u8 = buf[2..n]
+    let b: []u8 = buf[i + 1..]
+    let c: []u8 = buf[..len(buf) - 1]
+    let d: u8 = buf[i]
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_declaration
+        (identifier)
+        (view_type
+          (type_name
+            (identifier)))
+        (index_expression
+          (identifier)
+          (slice
+            (integer_literal)
+            (identifier))))
+      (let_declaration
+        (identifier)
+        (view_type
+          (type_name
+            (identifier)))
+        (index_expression
+          (identifier)
+          (slice
+            (additive_expression
+              (identifier)
+              (integer_literal)))))
+      (let_declaration
+        (identifier)
+        (view_type
+          (type_name
+            (identifier)))
+        (index_expression
+          (identifier)
+          (slice
+            (additive_expression
+              (call_expression
+                (identifier)
+                (argument_list
+                  (argument
+                    (identifier))))
+              (integer_literal)))))
+      (let_declaration
+        (identifier)
+        (type_name
+          (identifier))
+        (index_expression
+          (identifier)
+          (identifier))))))
+
+================================================================================
+Function types
+================================================================================
+
+type Less fn(i32, i32) -> bool
+type Handler (name: str, run: fn(inout Ctx) -> ! Error)
+
+fn sort(v: inout []i32, less: fn(i32, i32) -> bool) {
+    sort(inout v, less)
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_declaration
+    (identifier)
+    (function_type
+      (function_type_parameter
+        (type_name
+          (identifier)))
+      (function_type_parameter
+        (type_name
+          (identifier)))
+      (type_name
+        (identifier))))
+  (type_declaration
+    (identifier)
+    (tuple_type
+      (tuple_type_field
+        (identifier)
+        (type_name
+          (identifier)))
+      (tuple_type_field
+        (identifier)
+        (function_type
+          (function_type_parameter
+            (parameter_mode)
+            (type_name
+              (identifier)))
+          (result_type
+            (type_name
+              (identifier)))))))
+  (function_declaration
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (parameter_mode)
+        (view_type
+          (type_name
+            (identifier))))
+      (parameter
+        (identifier)
+        (function_type
+          (function_type_parameter
+            (type_name
+              (identifier)))
+          (function_type_parameter
+            (type_name
+              (identifier)))
+          (type_name
+            (identifier)))))
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (argument_list
+            (argument
+              (parameter_mode)
+              (identifier))
+            (argument
+              (identifier))))))))
+
+================================================================================
+Arrays
+================================================================================
+
+type Mac [6]u8
+
+fn f() {
+    let primes: [4]u32 = [2, 3, 5, 7]
+    var table: [256]u8 = fill[256](0)
+    table[0] = 1
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_declaration
+    (identifier)
+    (array_type
+      (integer_literal)
+      (type_name
+        (identifier))))
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_declaration
+        (identifier)
+        (array_type
+          (integer_literal)
+          (type_name
+            (identifier)))
+        (array_literal
+          (integer_literal)
+          (integer_literal)
+          (integer_literal)
+          (integer_literal)))
+      (var_declaration
+        (identifier)
+        (array_type
+          (integer_literal)
+          (type_name
+            (identifier)))
+        (call_expression
+          (index_expression
+            (identifier)
+            (integer_literal))
+          (argument_list
+            (argument
+              (integer_literal)))))
+      (assignment_statement
+        (index_expression
+          (identifier)
+          (integer_literal))
+        (integer_literal)))))

@@ -99,7 +99,13 @@ module.exports = grammar({
         'fn',
         field('name', $.identifier),
         field('parameters', $.parameter_list),
-        optional(seq('->', field('result', $._type))),
+        optional(
+          seq(
+            '->',
+            field('result', $._type),
+            optional(seq('in', field('borrows', $.identifier))),
+          ),
+        ),
         field('body', $.block),
       ),
 
@@ -143,10 +149,35 @@ module.exports = grammar({
 
     // A result type sits at the top of a type only: `[]T ! E` is a
     // result whose value is a view. A view of results needs a named type.
-    _type: ($) => choice($._simple_type, $.result_type),
+    _type: ($) => choice($._simple_type, $.result_type, $.function_type),
 
     _simple_type: ($) =>
-      choice($.type_name, $.tuple_type, $.view_type, $.pointer_type, $.optional_type),
+      choice(
+        $.type_name,
+        $.tuple_type,
+        $.view_type,
+        $.array_type,
+        $.pointer_type,
+        $.optional_type,
+      ),
+
+    // fn(inout []i32, u32) -> bool. Like a result type, a function type
+    // sits at the top of a type only, so fn() -> u8 ! E returns a result.
+    function_type: ($) =>
+      seq(
+        'fn',
+        '(',
+        commaSep($.function_type_parameter),
+        ')',
+        optional(seq('->', field('result', $._type))),
+      ),
+
+    function_type_parameter: ($) =>
+      seq(optional(field('mode', $.parameter_mode)), field('type', $._type)),
+
+    // [4]u8
+    array_type: ($) =>
+      seq('[', field('length', $._expression), ']', field('element', $._simple_type)),
 
     // usize ! IoError. Without a value type, `! IoError` is a function
     // that returns nothing but can fail.
@@ -438,6 +469,7 @@ module.exports = grammar({
         $.tuple_literal,
         $.string_literal,
         $.char_literal,
+        $.array_literal,
       ),
 
     // "count: {n}\n". Printable ASCII only; other bytes need escapes.
@@ -475,8 +507,9 @@ module.exports = grammar({
 
     argument_list: ($) => seq('(', commaSep($.argument), ')'),
 
-    // The call site writes `inout` too.
-    argument: ($) => seq(optional('inout'), field('value', $._expression)),
+    // The call site writes `inout` and `sink` too.
+    argument: ($) =>
+      seq(optional(field('mode', $.parameter_mode)), field('value', $._expression)),
 
     field_expression: ($) =>
       seq(field('value', $._postfix), '.', field('field', $.identifier)),
@@ -493,7 +526,17 @@ module.exports = grammar({
     // v[i]. Also type arguments to built-ins, as in truncate[u8](x); the
     // checker tells them apart, as Go's does.
     index_expression: ($) =>
-      seq(field('value', $._postfix), '[', field('index', $._expression), ']'),
+      seq(field('value', $._postfix), '[', field('index', choice($._expression, $.slice)), ']'),
+
+    // s[a..b], s[a..], s[..b]. Ends can be omitted only here.
+    slice: ($) =>
+      choice(
+        seq(field('start', $._additive_level), '..', optional(field('end', $._additive_level))),
+        seq('..', field('end', $._additive_level)),
+      ),
+
+    // [1, 2, 3], typed from context.
+    array_literal: ($) => seq('[', commaSep($._expression), ']'),
 
     // Tokens
 

@@ -145,6 +145,7 @@ fn copy(path: str) -> usize ! IoError {
           (identifier)
           (argument_list
             (argument
+              (parameter_mode)
               (identifier)))))
       (expression_statement
         (try_expression
@@ -152,6 +153,7 @@ fn copy(path: str) -> usize ! IoError {
             (identifier)
             (argument_list
               (argument
+                (parameter_mode)
                 (identifier))))))
       (let_declaration
         (identifier)
@@ -163,8 +165,10 @@ fn copy(path: str) -> usize ! IoError {
               (identifier)
               (argument_list
                 (argument
+                  (parameter_mode)
                   (identifier))
                 (argument
+                  (parameter_mode)
                   (identifier)))))
           (integer_literal)))
       (return_statement
@@ -233,8 +237,10 @@ fn f() {
           (identifier)
           (argument_list
             (argument
+              (parameter_mode)
               (identifier))
             (argument
+              (parameter_mode)
               (identifier))))
         (match_arm
           (variant_pattern
