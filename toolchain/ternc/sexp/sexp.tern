@@ -1,0 +1,703 @@
+// Prints a syntax tree in tree-sitter's S-expression form, with the node
+// names of tree-sitter/grammar.js, as stage 1 does. The tests compare the
+// two compilers' output.
+
+import syntax
+
+type Printer (out: [..]u8, depth: u32, text: []u8)
+
+pub fn print(alloc: Allocator, ast: syntax.Ast, text: []u8) -> [..]u8 ! OutOfMemory {
+    var pr: Printer = Printer.(out: make(alloc), depth: 0, text: text)
+    match file(inout pr, ast) {
+        ok {
+            return ok.(value: pr.out)
+        }
+        err(error: OutOfMemory) {
+            free(sink pr.out)
+            return err.(error: error)
+        }
+    }
+}
+
+fn file(pr: inout Printer, ast: syntax.Ast) -> ! OutOfMemory {
+    try open(inout pr, "source_file")
+    for let i: syntax.Import in ast.imports {
+        try import_decl(inout pr, ast, i)
+    }
+    for let d: syntax.Decl in ast.decls {
+        try decl(inout pr, ast, d)
+    }
+    return close(inout pr)
+}
+
+fn open(pr: inout Printer, node: []u8) -> ! OutOfMemory {
+    if pr.out.len > 0 {
+        try push(inout pr.out, '\n')
+    }
+    for let _: u32 in 0..pr.depth {
+        try append(inout pr.out, "  ")
+    }
+    try push(inout pr.out, '(')
+    try append(inout pr.out, node)
+    pr.depth += 1
+    return ok
+}
+
+fn close(pr: inout Printer) -> ! OutOfMemory {
+    try push(inout pr.out, ')')
+    pr.depth -= 1
+    return ok
+}
+
+fn leaf(pr: inout Printer, node: []u8) -> ! OutOfMemory {
+    try open(inout pr, node)
+    return close(inout pr)
+}
+
+fn ident(pr: inout Printer) -> ! OutOfMemory {
+    return leaf(inout pr, "identifier")
+}
+
+// `identifier`, or `discard` for `_`.
+fn binder(pr: inout Printer, name: ?syntax.Span) -> ! OutOfMemory {
+    match name {
+        some(value: _) {
+            return ident(inout pr)
+        }
+        none {
+            return leaf(inout pr, "discard")
+        }
+    }
+}
+
+fn mode(pr: inout Printer, m: syntax.Mode) -> ! OutOfMemory {
+    if m != syntax.Mode.let_mode {
+        try leaf(inout pr, "parameter_mode")
+    }
+    return ok
+}
+
+fn import_decl(pr: inout Printer, ast: syntax.Ast, i: syntax.Import) -> ! OutOfMemory {
+    try open(inout pr, "import_declaration")
+    try open(inout pr, "import_path")
+    for let _: u32 in syntax.items(ast.extra, i.path) {
+        try ident(inout pr)
+    }
+    try close(inout pr)
+    match i.alias {
+        some(value: _) {
+            try ident(inout pr)
+        }
+        none {
+        }
+    }
+    return close(inout pr)
+}
+
+fn decl(pr: inout Printer, ast: syntax.Ast, d: syntax.Decl) -> ! OutOfMemory {
+    let node: []u8 = match d.kind {
+        function(is_unsafe: _, name: _, params: _, result: _, body: _) { "function_declaration" }
+        extern_fn(name: _, params: _, variadic: _, result: _) { "extern_declaration" }
+        extern_var(mutable: _, name: _, ty: _) { "extern_variable" }
+        type_decl(moves: _, name: _, def: _) { "type_declaration" }
+        global(is_shared: _, local: _) { "global_declaration" }
+    }
+    try open(inout pr, node)
+    for let a: u32 in syntax.items(ast.extra, d.attributes) {
+        try attribute(inout pr, ast, ast.attributes[usize.(a)])
+    }
+    if d.public {
+        try leaf(inout pr, "visibility")
+    }
+    match d.kind {
+        function(is_unsafe: bool, name: _, params: syntax.List, result: ?syntax.TypeId, body: syntax.Block) {
+            if is_unsafe {
+                try leaf(inout pr, "unsafe")
+            }
+            try ident(inout pr)
+            try open(inout pr, "parameter_list")
+            try params_of(inout pr, ast, params)
+            try close(inout pr)
+            try opt_ty(inout pr, ast, result)
+            try block(inout pr, ast, body)
+        }
+        extern_fn(name: _, params: syntax.List, variadic: bool, result: ?syntax.TypeId) {
+            try ident(inout pr)
+            try open(inout pr, "extern_parameter_list")
+            try params_of(inout pr, ast, params)
+            if variadic {
+                try leaf(inout pr, "variadic")
+            }
+            try close(inout pr)
+            try opt_ty(inout pr, ast, result)
+        }
+        extern_var(mutable: _, name: _, ty as t: syntax.TypeId) {
+            try ident(inout pr)
+            try ty(inout pr, ast, t)
+        }
+        type_decl(moves: bool, name: _, def: syntax.TypeDef) {
+            if moves {
+                try leaf(inout pr, "moving")
+            }
+            try ident(inout pr)
+            try type_def(inout pr, ast, def)
+        }
+        global(is_shared: bool, local: syntax.Local) {
+            if is_shared {
+                try leaf(inout pr, "shared")
+            }
+            try local_decl(inout pr, ast, local)
+        }
+    }
+    return close(inout pr)
+}
+
+fn attribute(pr: inout Printer, ast: syntax.Ast, a: syntax.Attribute) -> ! OutOfMemory {
+    try open(inout pr, "attribute")
+    try leaf(inout pr, "attribute_name")
+    for let e: u32 in syntax.items(ast.extra, a.args) {
+        try expr(inout pr, ast, syntax.ExprId.(e))
+    }
+    return close(inout pr)
+}
+
+fn params_of(pr: inout Printer, ast: syntax.Ast, list: syntax.List) -> ! OutOfMemory {
+    for let i: u32 in syntax.items(ast.extra, list) {
+        let param: syntax.Param = ast.params[usize.(i)]
+        try open(inout pr, "parameter")
+        try binder(inout pr, param.name)
+        try mode(inout pr, param.mode)
+        try ty(inout pr, ast, param.ty)
+        try close(inout pr)
+    }
+    return ok
+}
+
+fn type_def(pr: inout Printer, ast: syntax.Ast, def: syntax.TypeDef) -> ! OutOfMemory {
+    match def {
+        plain(ty as t: syntax.TypeId) {
+            return ty(inout pr, ast, t)
+        }
+        enum_type(int_type: ?syntax.TypeId, variants: syntax.List) {
+            try open(inout pr, "enum_type")
+            try opt_ty(inout pr, ast, int_type)
+            for let i: u32 in syntax.items(ast.extra, variants) {
+                try variant(inout pr, ast, ast.variants[usize.(i)])
+            }
+            return close(inout pr)
+        }
+        union_type(fields: syntax.List) {
+            try open(inout pr, "union_type")
+            try fields_of(inout pr, ast, fields)
+            return close(inout pr)
+        }
+    }
+}
+
+fn variant(pr: inout Printer, ast: syntax.Ast, v: syntax.Variant) -> ! OutOfMemory {
+    match v {
+        named(name: _, payload: ?syntax.TypeId, value: ?syntax.ExprId) {
+            try open(inout pr, "variant")
+            try ident(inout pr)
+            try opt_ty(inout pr, ast, payload)
+            try opt_expr(inout pr, ast, value)
+            return close(inout pr)
+        }
+        open(span: _) {
+            return leaf(inout pr, "discard")
+        }
+    }
+}
+
+fn fields_of(pr: inout Printer, ast: syntax.Ast, list: syntax.List) -> ! OutOfMemory {
+    for let i: u32 in syntax.items(ast.extra, list) {
+        let f: syntax.Field = ast.fields[usize.(i)]
+        try open(inout pr, "tuple_type_field")
+        if f.public {
+            try leaf(inout pr, "visibility")
+        }
+        try ident(inout pr)
+        try ty(inout pr, ast, f.ty)
+        try close(inout pr)
+    }
+    return ok
+}
+
+fn opt_ty(pr: inout Printer, ast: syntax.Ast, t: ?syntax.TypeId) -> ! OutOfMemory {
+    match t {
+        some(value: syntax.TypeId) {
+            return ty(inout pr, ast, value)
+        }
+        none {
+            return ok
+        }
+    }
+}
+
+fn ty(pr: inout Printer, ast: syntax.Ast, id: syntax.TypeId) -> ! OutOfMemory {
+    match ast.types[usize.(id)].kind {
+        name(package: ?syntax.Span, name: _) {
+            try open(inout pr, "type_name")
+            match package {
+                some(value: _) {
+                    try ident(inout pr)
+                }
+                none {
+                }
+            }
+            try ident(inout pr)
+            return close(inout pr)
+        }
+        tuple(fields: syntax.List) {
+            try open(inout pr, "tuple_type")
+            try fields_of(inout pr, ast, fields)
+            return close(inout pr)
+        }
+        view(elem: syntax.TypeId) {
+            return wrap_ty(inout pr, ast, "view_type", elem)
+        }
+        growable(elem: syntax.TypeId) {
+            return wrap_ty(inout pr, ast, "growable_type", elem)
+        }
+        pointer(elem: syntax.TypeId) {
+            return wrap_ty(inout pr, ast, "pointer_type", elem)
+        }
+        optional(elem: syntax.TypeId) {
+            return wrap_ty(inout pr, ast, "optional_type", elem)
+        }
+        array(len: syntax.ExprId, elem: syntax.TypeId) {
+            try open(inout pr, "array_type")
+            try expr(inout pr, ast, len)
+            try ty(inout pr, ast, elem)
+            return close(inout pr)
+        }
+        result(value: ?syntax.TypeId, error: syntax.TypeId) {
+            try open(inout pr, "result_type")
+            try opt_ty(inout pr, ast, value)
+            try ty(inout pr, ast, error)
+            return close(inout pr)
+        }
+        function(params: syntax.List, result: ?syntax.TypeId) {
+            try open(inout pr, "function_type")
+            for let i: u32 in syntax.items(ast.extra, params) {
+                let param: syntax.Param = ast.params[usize.(i)]
+                try open(inout pr, "function_type_parameter")
+                try mode(inout pr, param.mode)
+                try ty(inout pr, ast, param.ty)
+                try close(inout pr)
+            }
+            try opt_ty(inout pr, ast, result)
+            return close(inout pr)
+        }
+    }
+}
+
+fn wrap_ty(pr: inout Printer, ast: syntax.Ast, node: []u8, inner: syntax.TypeId) -> ! OutOfMemory {
+    try open(inout pr, node)
+    try ty(inout pr, ast, inner)
+    return close(inout pr)
+}
+
+fn local_decl(pr: inout Printer, ast: syntax.Ast, l: syntax.Local) -> ! OutOfMemory {
+    if l.mutable {
+        try open(inout pr, "var_declaration")
+    } else {
+        try open(inout pr, "let_declaration")
+    }
+    try binding(inout pr, ast, l.binding)
+    try expr(inout pr, ast, l.value)
+    return close(inout pr)
+}
+
+fn binding(pr: inout Printer, ast: syntax.Ast, b: syntax.Binding) -> ! OutOfMemory {
+    match b {
+        single(name: ?syntax.Span, ty as t: syntax.TypeId) {
+            try binder(inout pr, name)
+            return ty(inout pr, ast, t)
+        }
+        destructure(fields: syntax.List) {
+            return destructuring(inout pr, ast, fields)
+        }
+    }
+}
+
+fn destructuring(pr: inout Printer, ast: syntax.Ast, list: syntax.List) -> ! OutOfMemory {
+    try open(inout pr, "destructuring_pattern")
+    for let i: u32 in syntax.items(ast.extra, list) {
+        let f: syntax.DestructField = ast.destructs[usize.(i)]
+        try open(inout pr, "destructuring_field")
+        try ident(inout pr)
+        match f.rename {
+            some(value: _) {
+                try ident(inout pr)
+            }
+            none {
+            }
+        }
+        match f.ty {
+            some(value: syntax.TypeId) {
+                try ty(inout pr, ast, value)
+            }
+            none {
+                try leaf(inout pr, "discard")
+            }
+        }
+        try close(inout pr)
+    }
+    return close(inout pr)
+}
+
+fn block(pr: inout Printer, ast: syntax.Ast, b: syntax.Block) -> ! OutOfMemory {
+    try open(inout pr, "block")
+    for let s: u32 in syntax.items(ast.extra, b.stmts) {
+        try stmt(inout pr, ast, syntax.StmtId.(s))
+    }
+    return close(inout pr)
+}
+
+fn stmt(pr: inout Printer, ast: syntax.Ast, id: syntax.StmtId) -> ! OutOfMemory {
+    match ast.stmts[usize.(id)].kind {
+        local(local: syntax.Local) {
+            return local_decl(inout pr, ast, local)
+        }
+        return_stmt(value: ?syntax.ExprId) {
+            try open(inout pr, "return_statement")
+            try opt_expr(inout pr, ast, value)
+            return close(inout pr)
+        }
+        if_stmt(cond: syntax.ExprId, then: syntax.Block, otherwise: ?syntax.Else) {
+            try open(inout pr, "if_statement")
+            try expr(inout pr, ast, cond)
+            try block(inout pr, ast, then)
+            match otherwise {
+                some(value: syntax.Else) {
+                    match value {
+                        block(body: syntax.Block) {
+                            try block(inout pr, ast, body)
+                        }
+                        if_stmt(stmt as next: syntax.StmtId) {
+                            try stmt(inout pr, ast, next)
+                        }
+                    }
+                }
+                none {
+                }
+            }
+            return close(inout pr)
+        }
+        match_stmt(value: syntax.ExprId, arms: syntax.List) {
+            try open(inout pr, "match_statement")
+            try expr(inout pr, ast, value)
+            try arms_of(inout pr, ast, arms)
+            return close(inout pr)
+        }
+        for_stmt(kind: syntax.ForKind, body: syntax.Block) {
+            try open(inout pr, "for_statement")
+            match kind {
+                forever {
+                }
+                while_loop(cond: syntax.ExprId) {
+                    try expr(inout pr, ast, cond)
+                }
+                for_in(mutable: _, binding as b: syntax.Binding, iterable: syntax.Iterable) {
+                    try open(inout pr, "for_in_clause")
+                    try binding(inout pr, ast, b)
+                    match iterable {
+                        value(value: syntax.ExprId) {
+                            try expr(inout pr, ast, value)
+                        }
+                        range(start: syntax.ExprId, end: syntax.ExprId) {
+                            try open(inout pr, "range")
+                            try expr(inout pr, ast, start)
+                            try expr(inout pr, ast, end)
+                            try close(inout pr)
+                        }
+                    }
+                    try close(inout pr)
+                }
+            }
+            try block(inout pr, ast, body)
+            return close(inout pr)
+        }
+        break_stmt {
+            return leaf(inout pr, "break_statement")
+        }
+        continue_stmt {
+            return leaf(inout pr, "continue_statement")
+        }
+        defer_stmt(call: syntax.ExprId) {
+            return wrap_expr(inout pr, ast, "defer_statement", call)
+        }
+        unsafe_stmt(body: syntax.Block) {
+            try open(inout pr, "unsafe_statement")
+            try block(inout pr, ast, body)
+            return close(inout pr)
+        }
+        lock_stmt(globals: syntax.List, body: syntax.Block) {
+            try open(inout pr, "lock_statement")
+            for let i: u32 in syntax.items(ast.extra, globals) {
+                try open(inout pr, "global_name")
+                match ast.globals[usize.(i)].package {
+                    some(value: _) {
+                        try ident(inout pr)
+                    }
+                    none {
+                    }
+                }
+                try ident(inout pr)
+                try close(inout pr)
+            }
+            try block(inout pr, ast, body)
+            return close(inout pr)
+        }
+        assign(left: syntax.ExprId, op: _, right: syntax.ExprId) {
+            try open(inout pr, "assignment_statement")
+            try expr(inout pr, ast, left)
+            try expr(inout pr, ast, right)
+            return close(inout pr)
+        }
+        expr(value: syntax.ExprId) {
+            return wrap_expr(inout pr, ast, "expression_statement", value)
+        }
+    }
+}
+
+// Match arms, of a statement or an expression.
+fn arms_of(pr: inout Printer, ast: syntax.Ast, list: syntax.List) -> ! OutOfMemory {
+    for let i: u32 in syntax.items(ast.extra, list) {
+        let arm: syntax.Arm = ast.arms[usize.(i)]
+        match arm.body {
+            block(body: syntax.Block) {
+                try open(inout pr, "match_arm")
+                try patterns(inout pr, ast, arm.patterns)
+                try block(inout pr, ast, body)
+            }
+            branch(value: syntax.ExprId) {
+                try open(inout pr, "match_expression_arm")
+                try patterns(inout pr, ast, arm.patterns)
+                try wrap_expr(inout pr, ast, "branch", value)
+            }
+        }
+        try close(inout pr)
+    }
+    return ok
+}
+
+fn patterns(pr: inout Printer, ast: syntax.Ast, list: syntax.List) -> ! OutOfMemory {
+    for let i: u32 in syntax.items(ast.extra, list) {
+        match ast.pats[usize.(i)].kind {
+            variant(name: _, payload: ?syntax.List) {
+                try open(inout pr, "variant_pattern")
+                try ident(inout pr)
+                match payload {
+                    some(value as fields: syntax.List) {
+                        try destructuring(inout pr, ast, fields)
+                    }
+                    none {
+                    }
+                }
+                try close(inout pr)
+            }
+            literal(value: syntax.ExprId) {
+                try expr(inout pr, ast, value)
+            }
+            negative(value: syntax.ExprId) {
+                try wrap_expr(inout pr, ast, "negative_literal", value)
+            }
+            discard {
+                try leaf(inout pr, "discard")
+            }
+        }
+    }
+    return ok
+}
+
+fn wrap_expr(pr: inout Printer, ast: syntax.Ast, node: []u8, inner: syntax.ExprId) -> ! OutOfMemory {
+    try open(inout pr, node)
+    try expr(inout pr, ast, inner)
+    return close(inout pr)
+}
+
+fn opt_expr(pr: inout Printer, ast: syntax.Ast, e: ?syntax.ExprId) -> ! OutOfMemory {
+    match e {
+        some(value: syntax.ExprId) {
+            return expr(inout pr, ast, value)
+        }
+        none {
+            return ok
+        }
+    }
+}
+
+fn expr(pr: inout Printer, ast: syntax.Ast, id: syntax.ExprId) -> ! OutOfMemory {
+    match ast.exprs[usize.(id)].kind {
+        name(name: _) {
+            return ident(inout pr)
+        }
+        int {
+            return leaf(inout pr, "integer_literal")
+        }
+        float {
+            return leaf(inout pr, "float_literal")
+        }
+        char {
+            return leaf(inout pr, "char_literal")
+        }
+        str(parts: syntax.List) {
+            try open(inout pr, "string_literal")
+            for let i: u32 in syntax.items(ast.extra, parts) {
+                match ast.str_parts[usize.(i)] {
+                    text(span: syntax.Span) {
+                        try string_text(inout pr, span)
+                    }
+                    interpolation(value: syntax.ExprId) {
+                        try wrap_expr(inout pr, ast, "interpolation", value)
+                    }
+                }
+            }
+            return close(inout pr)
+        }
+        paren(inner: syntax.ExprId) {
+            return wrap_expr(inout pr, ast, "parenthesized_expression", inner)
+        }
+        tuple(items: syntax.List) {
+            try open(inout pr, "tuple_literal")
+            for let i: u32 in syntax.items(ast.extra, items) {
+                try open(inout pr, "tuple_field")
+                try ident(inout pr)
+                try expr(inout pr, ast, ast.tuple_items[usize.(i)].value)
+                try close(inout pr)
+            }
+            return close(inout pr)
+        }
+        call(callee: syntax.ExprId, args: syntax.List) {
+            try open(inout pr, "call_expression")
+            try expr(inout pr, ast, callee)
+            try open(inout pr, "argument_list")
+            for let i: u32 in syntax.items(ast.extra, args) {
+                let arg: syntax.Arg = ast.args[usize.(i)]
+                try open(inout pr, "argument")
+                try mode(inout pr, arg.mode)
+                try expr(inout pr, ast, arg.value)
+                try close(inout pr)
+            }
+            try close(inout pr)
+            return close(inout pr)
+        }
+        field(value: syntax.ExprId, name: _) {
+            try open(inout pr, "field_expression")
+            try expr(inout pr, ast, value)
+            try ident(inout pr)
+            return close(inout pr)
+        }
+        construct(ty as t: syntax.ExprId, value: syntax.ExprId) {
+            try open(inout pr, "construct_expression")
+            try expr(inout pr, ast, t)
+            try expr(inout pr, ast, value)
+            return close(inout pr)
+        }
+        index(value: syntax.ExprId, index: syntax.Index) {
+            try open(inout pr, "index_expression")
+            try expr(inout pr, ast, value)
+            match index {
+                value(value as i: syntax.ExprId) {
+                    try expr(inout pr, ast, i)
+                }
+                ty(ty as t: syntax.TypeId) {
+                    try ty(inout pr, ast, t)
+                }
+                slice(start: ?syntax.ExprId, end: ?syntax.ExprId) {
+                    try open(inout pr, "slice")
+                    try opt_expr(inout pr, ast, start)
+                    try opt_expr(inout pr, ast, end)
+                    try close(inout pr)
+                }
+            }
+            return close(inout pr)
+        }
+        deref(inner: syntax.ExprId) {
+            return wrap_expr(inout pr, ast, "dereference_expression", inner)
+        }
+        unary(op: _, operand: syntax.ExprId) {
+            return wrap_expr(inout pr, ast, "unary_expression", operand)
+        }
+        try_expr(operand: syntax.ExprId) {
+            return wrap_expr(inout pr, ast, "try_expression", operand)
+        }
+        binary(op: syntax.BinaryOp, left: syntax.ExprId, right: syntax.ExprId) {
+            try open(inout pr, binary_node(op))
+            try expr(inout pr, ast, left)
+            try expr(inout pr, ast, right)
+            return close(inout pr)
+        }
+        if_expr(cond: syntax.ExprId, then: syntax.ExprId, otherwise: syntax.IfElse) {
+            try open(inout pr, "if_expression")
+            try expr(inout pr, ast, cond)
+            try wrap_expr(inout pr, ast, "branch", then)
+            match otherwise {
+                branch(value: syntax.ExprId) {
+                    try wrap_expr(inout pr, ast, "branch", value)
+                }
+                if_expr(value: syntax.ExprId) {
+                    try expr(inout pr, ast, value)
+                }
+            }
+            return close(inout pr)
+        }
+        match_expr(value: syntax.ExprId, arms: syntax.List) {
+            try open(inout pr, "match_expression")
+            try expr(inout pr, ast, value)
+            try arms_of(inout pr, ast, arms)
+            return close(inout pr)
+        }
+        unsafe_expr(body: syntax.ExprId) {
+            try open(inout pr, "unsafe_expression")
+            try wrap_expr(inout pr, ast, "branch", body)
+            return close(inout pr)
+        }
+        array(elems: syntax.List) {
+            try open(inout pr, "array_literal")
+            for let e: u32 in syntax.items(ast.extra, elems) {
+                try expr(inout pr, ast, syntax.ExprId.(e))
+            }
+            return close(inout pr)
+        }
+    }
+}
+
+// Splits string text into tree-sitter's string_content and
+// escape_sequence nodes.
+fn string_text(pr: inout Printer, span: syntax.Span) -> ! OutOfMemory {
+    let bytes: []u8 = pr.text[usize.(span.start)..usize.(span.end)]
+    var i: usize = 0
+    for i < bytes.len {
+        if bytes[i] == '\\' {
+            try leaf(inout pr, "escape_sequence")
+            if i + 1 < bytes.len && bytes[i + 1] == 'x' {
+                i += 4
+            } else {
+                i += 2
+            }
+        } else {
+            try leaf(inout pr, "string_content")
+            for i < bytes.len && bytes[i] != '\\' {
+                i += 1
+            }
+        }
+    }
+    return ok
+}
+
+fn binary_node(op: syntax.BinaryOp) -> []u8 {
+    return match syntax.op_group(op) {
+        or { "or_expression" }
+        and { "and_expression" }
+        comparison { "comparison_expression" }
+        additive { "additive_expression" }
+        multiplicative { "multiplicative_expression" }
+        bit_and { "bit_and_expression" }
+        bit_or { "bit_or_expression" }
+        bit_xor { "bit_xor_expression" }
+        shift { "shift_expression" }
+    }
+}

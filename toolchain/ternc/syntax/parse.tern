@@ -1,0 +1,866 @@
+// A recursive descent parser, one function per rule of
+// tree-sitter/grammar.js, ported from stage 1's parser.
+//
+// Every choice is made from the next token, with two exceptions: after
+// `(`, an identifier followed by `:` starts a tuple literal; and in an
+// index, `[e]` is an array literal when `]` follows it and an array type
+// otherwise.
+//
+// On an error, the parser records a diagnostic and skips to the end of the
+// statement or declaration, then continues.
+//
+// A list is gathered on the scratch stack, then copied into the tree's
+// `extra` once it is complete, since the items of a nested list are
+// gathered in the middle of it.
+
+pub type ParseProblem enum {
+    expected(what: []u8, found: Found)
+    // Syntax the port does not handle yet.
+    not_parsed_yet(what: []u8)
+    imports_first
+    variadic_first
+    empty_tuple_type
+    empty_destructuring
+    list_spans_lines
+    defer_needs_call
+    not_a_statement
+    range_bound
+    logic_mix
+    comparison_chain
+    shift_chain
+    operator_mix(first: BinaryOp, next: BinaryOp)
+}
+
+// The token an `expected` problem found, which its span covers.
+pub type Found enum {
+    end_of_file
+    end_of_line
+    token
+}
+
+pub type ParseDiagnostic (pub start: u32, pub end: u32, pub problem: ParseProblem)
+
+pub type Parsed (
+    pub ast: Ast,
+    pub lex_diagnostics: [..]Diagnostic,
+    pub diagnostics: [..]ParseDiagnostic,
+)
+
+// Why a parse function returned without a node. On `failed` the problem
+// is recorded and the caller recovers.
+type Stop enum {
+    failed
+    out_of_memory
+}
+
+type Parser (
+    text: []u8,
+    tokens: [..]Token,
+    pos: usize,
+    ast: Ast,
+    scratch: [..]u32,
+    diagnostics: [..]ParseDiagnostic,
+)
+
+// Parses one item of a list and returns its index in its arena.
+type Item fn(inout Parser) -> u32 ! Stop
+
+// Lexes and parses one file.
+pub fn parse(alloc: Allocator, text: []u8) -> Parsed ! OutOfMemory {
+    let lexed: Lexed = try lex(alloc, text)
+    var p: Parser = Parser.(
+        text: text,
+        tokens: lexed.tokens,
+        pos: 0,
+        ast: new_ast(alloc),
+        scratch: make(alloc),
+        diagnostics: make(alloc),
+    )
+    let result: ! Stop = file(inout p)
+    free(sink p.tokens)
+    free(sink p.scratch)
+    match result {
+        ok {
+            let parsed: Parsed = Parsed.(
+                ast: p.ast,
+                lex_diagnostics: lexed.diagnostics,
+                diagnostics: p.diagnostics,
+            )
+            return ok.(value: parsed)
+        }
+        err(error: _) {
+            free_ast(sink p.ast)
+            free(sink p.diagnostics)
+            free(sink lexed.diagnostics)
+            return err.(error: OutOfMemory.out_of_memory)
+        }
+    }
+}
+
+pub fn free_parsed(parsed: sink Parsed) {
+    free_ast(sink parsed.ast)
+    free(sink parsed.lex_diagnostics)
+    free(sink parsed.diagnostics)
+}
+
+fn memory(result: ! OutOfMemory) -> ! Stop {
+    match result {
+        ok {
+            return ok
+        }
+        err(error: _) {
+            return err.(error: Stop.out_of_memory)
+        }
+    }
+}
+
+// Token access.
+
+fn next_kind(p: Parser) -> TokenKind {
+    return kind_at(p, 0)
+}
+
+fn kind_at(p: Parser, ahead: usize) -> TokenKind {
+    let at: usize = p.pos + ahead
+    if at >= p.tokens.len {
+        return TokenKind.eof
+    }
+    return p.tokens[at].kind
+}
+
+fn current(p: Parser) -> Token {
+    if p.pos < p.tokens.len {
+        return p.tokens[p.pos]
+    }
+    return p.tokens[p.tokens.len - 1]
+}
+
+fn current_span(p: Parser) -> Span {
+    let t: Token = current(p)
+    return Span.(start: t.start, end: t.end)
+}
+
+// Moves past the current token, unless it is the end of the file.
+fn advance(p: inout Parser) {
+    if next_kind(p) != TokenKind.eof {
+        p.pos += 1
+    }
+}
+
+fn eat(p: inout Parser, k: TokenKind) -> bool {
+    if next_kind(p) == k {
+        advance(inout p)
+        return true
+    }
+    return false
+}
+
+// The end of the last token moved past.
+fn prev_end(p: Parser) -> u32 {
+    if p.pos == 0 {
+        return 0
+    }
+    return p.tokens[p.pos - 1].end
+}
+
+fn token_start(p: Parser) -> u32 {
+    return current(p).start
+}
+
+fn span_from(p: Parser, from: u32) -> Span {
+    var end: u32 = prev_end(p)
+    if end < from {
+        end = from
+    }
+    return Span.(start: from, end: end)
+}
+
+// Errors. Each returns the Stop to return with.
+
+// Records a problem. Problems at or before the last one are dropped,
+// since they usually follow from it.
+fn fail_at(p: inout Parser, span: Span, problem: ParseProblem) -> Stop {
+    let n: usize = p.diagnostics.len
+    if n > 0 && span.start <= p.diagnostics[n - 1].start {
+        return Stop.failed
+    }
+    let d: ParseDiagnostic = ParseDiagnostic.(start: span.start, end: span.end, problem: problem)
+    match push(inout p.diagnostics, d) {
+        ok {
+            return Stop.failed
+        }
+        err(error: _) {
+            return Stop.out_of_memory
+        }
+    }
+}
+
+fn fail_here(p: inout Parser, problem: ParseProblem) -> Stop {
+    let span: Span = current_span(p)
+    return fail_at(inout p, span, problem)
+}
+
+fn expected(p: inout Parser, what: []u8) -> Stop {
+    let t: Token = current(p)
+    var found: Found = Found.token
+    if t.kind == TokenKind.eof {
+        found = Found.end_of_file
+    } else if t.kind == TokenKind.semicolon && t.start == t.end {
+        found = Found.end_of_line
+    }
+    return fail_here(inout p, ParseProblem.expected.(what: what, found: found))
+}
+
+fn expect(p: inout Parser, k: TokenKind, what: []u8) -> ! Stop {
+    if eat(inout p, k) {
+        return ok
+    }
+    return err.(error: expected(inout p, what))
+}
+
+fn name(p: inout Parser) -> Span ! Stop {
+    if next_kind(p) != TokenKind.ident {
+        return err.(error: expected(inout p, "a name"))
+    }
+    let span: Span = current_span(p)
+    advance(inout p)
+    return ok.(value: span)
+}
+
+fn not_parsed_yet(p: inout Parser, what: []u8) -> Stop {
+    return fail_here(inout p, ParseProblem.not_parsed_yet.(what: what))
+}
+
+// Skips to the end of the current line item: past a `;`, or up to a `}`
+// that closes the enclosing braces. Brackets opened while skipping are
+// skipped whole.
+fn recover(p: inout Parser) {
+    var depth: u32 = 0
+    for {
+        match next_kind(p) {
+            eof {
+                return
+            }
+            semicolon {
+                if depth == 0 {
+                    advance(inout p)
+                    return
+                }
+            }
+            r_brace {
+                if depth == 0 {
+                    return
+                }
+                depth -= 1
+            }
+            l_paren, l_bracket, l_brace, str_start {
+                depth += 1
+            }
+            r_paren, r_bracket, str_end {
+                if depth > 0 {
+                    depth -= 1
+                }
+            }
+            _ {
+            }
+        }
+        advance(inout p)
+    }
+}
+
+// Lists.
+
+// Copies the scratch items from `mark` up into `extra`.
+fn finish(p: inout Parser, mark: usize) -> List ! Stop {
+    let start: usize = p.ast.extra.len
+    try memory(append(inout p.ast.extra, p.scratch[mark..]))
+    drop_scratch(inout p, mark)
+    return ok.(value: List.(start: u32.(start), len: u32.(p.ast.extra.len - start)))
+}
+
+fn drop_scratch(p: inout Parser, mark: usize) {
+    for p.scratch.len > mark {
+        let _: ?u32 = pop(inout p.scratch)
+    }
+}
+
+fn gather(p: inout Parser, index: u32) -> ! Stop {
+    return memory(push(inout p.scratch, index))
+}
+
+// Items between braces, separated by line ends or `;`. The `{` is
+// consumed already; this consumes the `}`.
+fn lines(p: inout Parser, item: Item) -> List ! Stop {
+    let mark: usize = p.scratch.len
+    for {
+        if eat(inout p, TokenKind.r_brace) {
+            return finish(inout p, mark)
+        }
+        if next_kind(p) == TokenKind.eof {
+            return err.(error: expected(inout p, "`}`"))
+        }
+        let before: usize = p.scratch.len
+        match item(inout p) {
+            ok(value as index: u32) {
+                try gather(inout p, index)
+                match next_kind(p) {
+                    semicolon {
+                        advance(inout p)
+                    }
+                    r_brace {
+                    }
+                    _ {
+                        let stop: Stop = expected(inout p, "the end of the line or `;`")
+                        if stop == Stop.out_of_memory {
+                            return err.(error: stop)
+                        }
+                        recover(inout p)
+                    }
+                }
+            }
+            err(error: Stop) {
+                if error == Stop.out_of_memory {
+                    return err.(error: error)
+                }
+                drop_scratch(inout p, before)
+                recover(inout p)
+            }
+        }
+    }
+}
+
+// Items between parentheses, separated by commas, with an optional
+// trailing comma. The `(` is consumed already; this consumes the `)`.
+fn comma_list(p: inout Parser, item: Item) -> List ! Stop {
+    let mark: usize = p.scratch.len
+    for {
+        if eat(inout p, TokenKind.r_paren) {
+            return finish(inout p, mark)
+        }
+        let index: u32 = try item(inout p)
+        try gather(inout p, index)
+        let t: Token = current(p)
+        if t.kind == TokenKind.semicolon && t.start == t.end {
+            return err.(error: fail_here(inout p, ParseProblem.list_spans_lines))
+        }
+        if !eat(inout p, TokenKind.comma) {
+            try expect(inout p, TokenKind.r_paren, "`,` or `)`")
+            return finish(inout p, mark)
+        }
+    }
+}
+
+// Arenas.
+
+fn add_type(p: inout Parser, k: TypeKind, from: u32) -> TypeId ! Stop {
+    let t: Type = Type.(kind: k, span: span_from(p, from))
+    try memory(push(inout p.ast.types, t))
+    return ok.(value: TypeId.(u32.(p.ast.types.len - 1)))
+}
+
+fn add_name(p: inout Parser, span: Span) -> u32 ! Stop {
+    try memory(push(inout p.ast.names, span))
+    return ok.(value: u32.(p.ast.names.len - 1))
+}
+
+// Declarations.
+
+fn file(p: inout Parser) -> ! Stop {
+    for next_kind(p) == TokenKind.kw_import {
+        match import_decl(inout p) {
+            ok(value as i: Import) {
+                try memory(push(inout p.ast.imports, i))
+                try end_top_level_item(inout p)
+            }
+            err(error: Stop) {
+                try recovered(inout p, error)
+                recover(inout p)
+            }
+        }
+    }
+    for next_kind(p) != TokenKind.eof {
+        if next_kind(p) == TokenKind.kw_import {
+            let stop: Stop = fail_here(inout p, ParseProblem.imports_first)
+            try recovered(inout p, stop)
+            recover(inout p)
+            continue
+        }
+        match declaration(inout p) {
+            ok(value as d: Decl) {
+                try memory(push(inout p.ast.decls, d))
+                try end_top_level_item(inout p)
+            }
+            err(error: Stop) {
+                try recovered(inout p, error)
+                recover_top_level(inout p)
+            }
+        }
+    }
+    return ok
+}
+
+// Passes out_of_memory on, and clears the scratch items a failed
+// top-level item left.
+fn recovered(p: inout Parser, stop: Stop) -> ! Stop {
+    if stop == Stop.out_of_memory {
+        return err.(error: stop)
+    }
+    drop_scratch(inout p, 0)
+    return ok
+}
+
+fn end_top_level_item(p: inout Parser) -> ! Stop {
+    if !eat(inout p, TokenKind.semicolon) && next_kind(p) != TokenKind.eof {
+        let stop: Stop = expected(inout p, "the end of the line or `;`")
+        try recovered(inout p, stop)
+        recover_top_level(inout p)
+    }
+    return ok
+}
+
+fn recover_top_level(p: inout Parser) {
+    recover(inout p)
+    // A stray `}` at the top level would stop recovery forever.
+    for eat(inout p, TokenKind.r_brace) {
+        recover(inout p)
+    }
+}
+
+fn import_decl(p: inout Parser) -> Import ! Stop {
+    let from: u32 = token_start(p)
+    advance(inout p)
+    let mark: usize = p.scratch.len
+    for {
+        let n: Span = try name(inout p)
+        let index: u32 = try add_name(inout p, n)
+        try gather(inout p, index)
+        if !eat(inout p, TokenKind.dot) {
+            break
+        }
+    }
+    let path: List = try finish(inout p, mark)
+    var alias: ?Span = none
+    if eat(inout p, TokenKind.kw_as) {
+        alias = some.(value: try name(inout p))
+    }
+    return ok.(value: Import.(path: path, alias: alias, span: span_from(p, from)))
+}
+
+fn declaration(p: inout Parser) -> Decl ! Stop {
+    let from: u32 = token_start(p)
+    let mark: usize = p.scratch.len
+    for next_kind(p) == TokenKind.attribute {
+        let index: u32 = try attribute(inout p)
+        try gather(inout p, index)
+        // An attribute on its own line ends with an inserted `;`.
+        let _: bool = eat(inout p, TokenKind.semicolon)
+    }
+    let attributes: List = try finish(inout p, mark)
+    let public: bool = eat(inout p, TokenKind.kw_pub)
+    let k: DeclKind = try declaration_kind(inout p)
+    let d: Decl = Decl.(attributes: attributes, public: public, kind: k, span: span_from(p, from))
+    return ok.(value: d)
+}
+
+fn declaration_kind(p: inout Parser) -> DeclKind ! Stop {
+    match next_kind(p) {
+        kw_fn {
+            return function(inout p, false)
+        }
+        kw_unsafe {
+            advance(inout p)
+            if next_kind(p) != TokenKind.kw_fn {
+                return err.(error: expected(inout p, "`fn` after `unsafe`"))
+            }
+            return function(inout p, true)
+        }
+        kw_extern {
+            advance(inout p)
+            match next_kind(p) {
+                kw_fn {
+                    return extern_function(inout p)
+                }
+                kw_let, kw_var {
+                    let mutable: bool = next_kind(p) == TokenKind.kw_var
+                    advance(inout p)
+                    let n: Span = try name(inout p)
+                    try expect(inout p, TokenKind.colon, "`:`")
+                    let ty: TypeId = try type_expr(inout p)
+                    return ok.(value: DeclKind.extern_var.(mutable: mutable, name: n, ty: ty))
+                }
+                _ {
+                    return err.(error: expected(inout p, "`fn`, `let` or `var` after `extern`"))
+                }
+            }
+        }
+        kw_type {
+            return type_declaration(inout p, false)
+        }
+        kw_move {
+            advance(inout p)
+            if next_kind(p) != TokenKind.kw_type {
+                return err.(error: expected(inout p, "`type` after `move`"))
+            }
+            return type_declaration(inout p, true)
+        }
+        kw_let, kw_var {
+            let l: Local = try local(inout p)
+            return ok.(value: DeclKind.global.(is_shared: false, local: l))
+        }
+        kw_shared {
+            advance(inout p)
+            if next_kind(p) != TokenKind.kw_var {
+                return err.(error: expected(inout p, "`var` after `shared`"))
+            }
+            let l: Local = try local(inout p)
+            return ok.(value: DeclKind.global.(is_shared: true, local: l))
+        }
+        _ {
+            return err.(error: expected(inout p, "a declaration"))
+        }
+    }
+}
+
+// `@name` or `@name(args)`, with the `(` written right after the name.
+fn attribute(p: inout Parser) -> u32 ! Stop {
+    let n: Span = current_span(p)
+    advance(inout p)
+    var args: List = List.(start: 0, len: 0)
+    if next_kind(p) == TokenKind.l_paren && token_start(p) == n.end {
+        advance(inout p)
+        args = try comma_list(inout p, attribute_arg)
+    }
+    try memory(push(inout p.ast.attributes, Attribute.(name: n, args: args)))
+    return ok.(value: u32.(p.ast.attributes.len - 1))
+}
+
+fn attribute_arg(p: inout Parser) -> u32 ! Stop {
+    match next_kind(p) {
+        int, str, str_start {
+            return ok.(value: u32.(try primary(inout p)))
+        }
+        _ {
+            return err.(error: expected(inout p, "an integer or string literal"))
+        }
+    }
+}
+
+fn function(p: inout Parser, is_unsafe: bool) -> DeclKind ! Stop {
+    advance(inout p)
+    let n: Span = try name(inout p)
+    try expect(inout p, TokenKind.l_paren, "`(`")
+    let params: List = try comma_list(inout p, parameter)
+    let result: ?TypeId = try result_type(inout p)
+    let body: Block = try block(inout p)
+    return ok.(value: DeclKind.function.(
+        is_unsafe: is_unsafe,
+        name: n,
+        params: params,
+        result: result,
+        body: body,
+    ))
+}
+
+fn result_type(p: inout Parser) -> ?TypeId ! Stop {
+    if eat(inout p, TokenKind.arrow) {
+        return ok.(value: some.(value: try type_expr(inout p)))
+    }
+    return ok.(value: none)
+}
+
+fn extern_function(p: inout Parser) -> DeclKind ! Stop {
+    advance(inout p)
+    let n: Span = try name(inout p)
+    try expect(inout p, TokenKind.l_paren, "`(`")
+    let mark: usize = p.scratch.len
+    var variadic: bool = false
+    for {
+        if eat(inout p, TokenKind.r_paren) {
+            break
+        }
+        if next_kind(p) == TokenKind.dot_dot_dot {
+            if p.scratch.len == mark {
+                return err.(error: fail_here(inout p, ParseProblem.variadic_first))
+            }
+            advance(inout p)
+            variadic = true
+            let _: bool = eat(inout p, TokenKind.comma)
+            try expect(inout p, TokenKind.r_paren, "`)` after `...`")
+            break
+        }
+        let index: u32 = try parameter(inout p)
+        try gather(inout p, index)
+        if !eat(inout p, TokenKind.comma) {
+            try expect(inout p, TokenKind.r_paren, "`,` or `)`")
+            break
+        }
+    }
+    let params: List = try finish(inout p, mark)
+    let result: ?TypeId = try result_type(inout p)
+    return ok.(value: DeclKind.extern_fn.(name: n, params: params, variadic: variadic, result: result))
+}
+
+fn mode(p: inout Parser) -> Mode {
+    if eat(inout p, TokenKind.kw_inout) {
+        return Mode.inout_mode
+    }
+    if eat(inout p, TokenKind.kw_sink) {
+        return Mode.sink_mode
+    }
+    return Mode.let_mode
+}
+
+fn parameter(p: inout Parser) -> u32 ! Stop {
+    var n: ?Span = none
+    if !eat(inout p, TokenKind.underscore) {
+        n = some.(value: try name(inout p))
+    }
+    try expect(inout p, TokenKind.colon, "`:` and a type")
+    let m: Mode = mode(inout p)
+    let ty: TypeId = try type_expr(inout p)
+    try memory(push(inout p.ast.params, Param.(name: n, mode: m, ty: ty)))
+    return ok.(value: u32.(p.ast.params.len - 1))
+}
+
+fn type_declaration(p: inout Parser, moves: bool) -> DeclKind ! Stop {
+    advance(inout p)
+    let n: Span = try name(inout p)
+    let def: TypeDef = try type_def(inout p)
+    return ok.(value: DeclKind.type_decl.(moves: moves, name: n, def: def))
+}
+
+fn type_def(p: inout Parser) -> TypeDef ! Stop {
+    match next_kind(p) {
+        kw_enum {
+            return enum_type(inout p)
+        }
+        kw_union {
+            advance(inout p)
+            try expect(inout p, TokenKind.l_paren, "`(`")
+            let fs: List = try fields(inout p)
+            return ok.(value: TypeDef.union_type.(fields: fs))
+        }
+        _ {
+            let ty: TypeId = try type_expr(inout p)
+            return ok.(value: TypeDef.plain.(ty: ty))
+        }
+    }
+}
+
+fn enum_type(p: inout Parser) -> TypeDef ! Stop {
+    advance(inout p)
+    var int_type: ?TypeId = none
+    if next_kind(p) == TokenKind.ident {
+        int_type = some.(value: try type_name(inout p))
+    }
+    try expect(inout p, TokenKind.l_brace, "`\{`")
+    let variants: List = try lines(inout p, variant)
+    return ok.(value: TypeDef.enum_type.(int_type: int_type, variants: variants))
+}
+
+fn variant(p: inout Parser) -> u32 ! Stop {
+    let underscore: Span = current_span(p)
+    var v: Variant = Variant.open.(span: underscore)
+    if !eat(inout p, TokenKind.underscore) {
+        let n: Span = try name(inout p)
+        var payload: ?TypeId = none
+        if next_kind(p) == TokenKind.l_paren {
+            payload = some.(value: try simple_type(inout p))
+        }
+        var value: ?ExprId = none
+        if eat(inout p, TokenKind.eq) {
+            value = some.(value: try expression(inout p))
+        }
+        v = Variant.named.(name: n, payload: payload, value: value)
+    }
+    try memory(push(inout p.ast.variants, v))
+    return ok.(value: u32.(p.ast.variants.len - 1))
+}
+
+// Fields of a tuple type, after the `(`. At least one.
+fn fields(p: inout Parser) -> List ! Stop {
+    let list: List = try comma_list(inout p, field)
+    if list.len == 0 {
+        let end: u32 = prev_end(p)
+        let span: Span = Span.(start: end - 1, end: end)
+        return err.(error: fail_at(inout p, span, ParseProblem.empty_tuple_type))
+    }
+    return ok.(value: list)
+}
+
+fn field(p: inout Parser) -> u32 ! Stop {
+    let public: bool = eat(inout p, TokenKind.kw_pub)
+    let n: Span = try name(inout p)
+    try expect(inout p, TokenKind.colon, "`:` and a type")
+    let ty: TypeId = try type_expr(inout p)
+    try memory(push(inout p.ast.fields, Field.(public: public, name: n, ty: ty)))
+    return ok.(value: u32.(p.ast.fields.len - 1))
+}
+
+// Types.
+
+// A type: a simple type, a result type or a function type.
+fn type_expr(p: inout Parser) -> TypeId ! Stop {
+    let from: u32 = token_start(p)
+    match next_kind(p) {
+        kw_fn {
+            advance(inout p)
+            try expect(inout p, TokenKind.l_paren, "`(`")
+            let params: List = try comma_list(inout p, function_type_param)
+            let result: ?TypeId = try result_type(inout p)
+            return add_type(inout p, TypeKind.function.(params: params, result: result), from)
+        }
+        bang {
+            advance(inout p)
+            let error: TypeId = try simple_type(inout p)
+            return add_type(inout p, TypeKind.result.(value: none, error: error), from)
+        }
+        _ {
+            let value: TypeId = try simple_type(inout p)
+            if !eat(inout p, TokenKind.bang) {
+                return ok.(value: value)
+            }
+            let error: TypeId = try simple_type(inout p)
+            let k: TypeKind = TypeKind.result.(value: some.(value: value), error: error)
+            return add_type(inout p, k, from)
+        }
+    }
+}
+
+fn function_type_param(p: inout Parser) -> u32 ! Stop {
+    let m: Mode = mode(inout p)
+    let ty: TypeId = try type_expr(inout p)
+    try memory(push(inout p.ast.params, Param.(name: none, mode: m, ty: ty)))
+    return ok.(value: u32.(p.ast.params.len - 1))
+}
+
+fn type_name(p: inout Parser) -> TypeId ! Stop {
+    let from: u32 = token_start(p)
+    let first: Span = try name(inout p)
+    if eat(inout p, TokenKind.dot) {
+        let second: Span = try name(inout p)
+        return add_type(inout p, TypeKind.name.(package: some.(value: first), name: second), from)
+    }
+    return add_type(inout p, TypeKind.name.(package: none, name: first), from)
+}
+
+fn simple_type(p: inout Parser) -> TypeId ! Stop {
+    let from: u32 = token_start(p)
+    match next_kind(p) {
+        ident {
+            return type_name(inout p)
+        }
+        l_paren {
+            advance(inout p)
+            let fs: List = try fields(inout p)
+            return add_type(inout p, TypeKind.tuple.(fields: fs), from)
+        }
+        star {
+            advance(inout p)
+            let elem: TypeId = try simple_type(inout p)
+            return add_type(inout p, TypeKind.pointer.(elem: elem), from)
+        }
+        question {
+            advance(inout p)
+            let elem: TypeId = try simple_type(inout p)
+            return add_type(inout p, TypeKind.optional.(elem: elem), from)
+        }
+        l_bracket {
+            advance(inout p)
+            if eat(inout p, TokenKind.r_bracket) {
+                let elem: TypeId = try simple_type(inout p)
+                return add_type(inout p, TypeKind.view.(elem: elem), from)
+            }
+            if eat(inout p, TokenKind.dot_dot) {
+                try expect(inout p, TokenKind.r_bracket, "`]` after `[..`")
+                let elem: TypeId = try simple_type(inout p)
+                return add_type(inout p, TypeKind.growable.(elem: elem), from)
+            }
+            let len: ExprId = try expression(inout p)
+            try expect(inout p, TokenKind.r_bracket, "`]`")
+            let elem: TypeId = try simple_type(inout p)
+            return add_type(inout p, TypeKind.array.(len: len, elem: elem), from)
+        }
+        _ {
+            return err.(error: expected(inout p, "a type"))
+        }
+    }
+}
+
+// Bindings.
+
+// `let` or `var`, a binding, `=` and a value.
+fn local(p: inout Parser) -> Local ! Stop {
+    let mutable: bool = next_kind(p) == TokenKind.kw_var
+    advance(inout p)
+    let b: Binding = try binding(inout p)
+    if !eat(inout p, TokenKind.eq) {
+        return err.(error: expected(inout p, "`=` and a value; every binding is initialized"))
+    }
+    let value: ExprId = try expression(inout p)
+    return ok.(value: Local.(mutable: mutable, binding: b, value: value))
+}
+
+fn binding(p: inout Parser) -> Binding ! Stop {
+    if eat(inout p, TokenKind.l_paren) {
+        return ok.(value: Binding.destructure.(fields: try destructuring(inout p)))
+    }
+    var n: ?Span = none
+    if !eat(inout p, TokenKind.underscore) {
+        n = some.(value: try name(inout p))
+    }
+    if !eat(inout p, TokenKind.colon) {
+        return err.(error: expected(inout p, "`:` and a type; every binding states its type"))
+    }
+    let ty: TypeId = try type_expr(inout p)
+    return ok.(value: Binding.single.(name: n, ty: ty))
+}
+
+// `(q: u32, r as rest: _)`, after the `(`. At least one field.
+fn destructuring(p: inout Parser) -> List ! Stop {
+    let list: List = try comma_list(inout p, destruct_field)
+    if list.len == 0 {
+        let end: u32 = prev_end(p)
+        let span: Span = span_from(p, end - 1)
+        return err.(error: fail_at(inout p, span, ParseProblem.empty_destructuring))
+    }
+    return ok.(value: list)
+}
+
+fn destruct_field(p: inout Parser) -> u32 ! Stop {
+    let f: Span = try name(inout p)
+    var rename: ?Span = none
+    if eat(inout p, TokenKind.kw_as) {
+        rename = some.(value: try name(inout p))
+    }
+    try expect(inout p, TokenKind.colon, "`:` and a type")
+    var ty: ?TypeId = none
+    if !eat(inout p, TokenKind.underscore) {
+        ty = some.(value: try type_expr(inout p))
+    }
+    try memory(push(inout p.ast.destructs, DestructField.(field: f, rename: rename, ty: ty)))
+    return ok.(value: u32.(p.ast.destructs.len - 1))
+}
+
+// Statements.
+
+fn block(p: inout Parser) -> Block ! Stop {
+    let from: u32 = token_start(p)
+    try expect(inout p, TokenKind.l_brace, "`\{`")
+    if next_kind(p) != TokenKind.r_brace {
+        return err.(error: not_parsed_yet(inout p, "statements"))
+    }
+    advance(inout p)
+    let stmts: List = List.(start: u32.(p.ast.extra.len), len: 0)
+    return ok.(value: Block.(stmts: stmts, span: span_from(p, from)))
+}
+
+// Expressions.
+
+fn expression(p: inout Parser) -> ExprId ! Stop {
+    return err.(error: not_parsed_yet(inout p, "expressions"))
+}
+
+fn primary(p: inout Parser) -> ExprId ! Stop {
+    return err.(error: not_parsed_yet(inout p, "expressions"))
+}

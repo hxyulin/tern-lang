@@ -1905,7 +1905,8 @@ then ternc is built one front-end part at a time, starting with the
 lexer and then the parser.
 
 - **Layout.** `main.tern` is the driver. The `syntax` package holds the
-  tokens, the lexer and line lookup, and later the parser.
+  tokens, the lexer, line lookup, the syntax tree and the parser. The
+  `sexp` package prints a tree as stage 1's `ternc parse` does.
 - **Tested against stage 1.** `ternc lex FILE` prints what stage 1's
   `ternc lex FILE` prints, errors included. A stage 1 test builds ternc,
   plain and with `-O`, and requires identical stdout, stderr and exit
@@ -1913,6 +1914,23 @@ lexer and then the parser.
   file, and the files in `toolchain/stage1/tests/lex`: `malformed.tern`
   triggers every lexer error, and the `utf8-*` files each break UTF-8 a
   different way.
+- **The tree is arenas and ranges** (decided 2026-11-08, the layout of
+  Zig's syntax tree). Each kind of node lives in an arena of the `Ast`
+  and is referred to by index, such as `ExprId`. A list of nodes is a
+  `List`, a range of one shared `extra: [..]u32` holding item indexes;
+  records that appear only in lists, such as `Param` and `Arg`, have
+  arenas of their own. The parser gathers a list on a scratch stack and
+  copies it into `extra` once it is complete. No node owns memory, so
+  freeing the tree is one `free` per arena. Rejected: nodes that own
+  `[..]T` lists as stage 1's do, which makes every node a move type and
+  freeing a walk over the tree.
+- **The parser is tested like the lexer.** `ternc parse FILE` prints
+  what stage 1's prints: the S-expression tree, or the diagnostics. The
+  test compares the two on every tern file and every tree-sitter corpus
+  case, which it writes to its own file. The parser is ported in four
+  parts (declarations and types, statements, expressions, error
+  recovery); until the last, an input on which ternc reports "not
+  parsed yet" is skipped.
 - **Diagnostics are enums.** A `Format` cannot be stored, so the lexer
   records a `Problem` with its values, such as
   `bad_digit(digit: u8, base: u32)`, and the driver turns it into text

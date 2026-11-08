@@ -1,0 +1,367 @@
+// The syntax tree.
+//
+// Nodes live in arenas inside Ast and refer to each other by index, so no
+// node owns memory and freeing the tree frees each arena once. A list of
+// nodes, such as a call's arguments, is a List: a range of `extra`, which
+// holds the index of each item in that item's arena.
+
+pub type ExprId u32
+pub type TypeId u32
+pub type StmtId u32
+pub type PatId u32
+
+// Bytes start..end of the source. A name is the span of its identifier.
+pub type Span (pub start: u32, pub end: u32)
+
+// Items extra[start..start + len].
+pub type List (pub start: u32, pub len: u32)
+
+pub type Ast (
+    pub imports: [..]Import,
+    pub decls: [..]Decl,
+    pub exprs: [..]Expr,
+    pub types: [..]Type,
+    pub stmts: [..]Stmt,
+    pub pats: [..]Pattern,
+    // The arenas of records that only appear in lists.
+    pub names: [..]Span,
+    pub attributes: [..]Attribute,
+    pub params: [..]Param,
+    pub fields: [..]Field,
+    pub variants: [..]Variant,
+    pub destructs: [..]DestructField,
+    pub arms: [..]Arm,
+    pub args: [..]Arg,
+    pub tuple_items: [..]TupleItem,
+    pub str_parts: [..]StrPart,
+    pub globals: [..]GlobalName,
+    pub extra: [..]u32,
+)
+
+pub fn new_ast(alloc: Allocator) -> Ast {
+    return Ast.(
+        imports: make(alloc),
+        decls: make(alloc),
+        exprs: make(alloc),
+        types: make(alloc),
+        stmts: make(alloc),
+        pats: make(alloc),
+        names: make(alloc),
+        attributes: make(alloc),
+        params: make(alloc),
+        fields: make(alloc),
+        variants: make(alloc),
+        destructs: make(alloc),
+        arms: make(alloc),
+        args: make(alloc),
+        tuple_items: make(alloc),
+        str_parts: make(alloc),
+        globals: make(alloc),
+        extra: make(alloc),
+    )
+}
+
+pub fn free_ast(ast: sink Ast) {
+    free(sink ast.imports)
+    free(sink ast.decls)
+    free(sink ast.exprs)
+    free(sink ast.types)
+    free(sink ast.stmts)
+    free(sink ast.pats)
+    free(sink ast.names)
+    free(sink ast.attributes)
+    free(sink ast.params)
+    free(sink ast.fields)
+    free(sink ast.variants)
+    free(sink ast.destructs)
+    free(sink ast.arms)
+    free(sink ast.args)
+    free(sink ast.tuple_items)
+    free(sink ast.str_parts)
+    free(sink ast.globals)
+    free(sink ast.extra)
+}
+
+// The arena indexes a list holds.
+pub fn items(extra: []u32, list: List) -> []u32 {
+    let start: usize = usize.(list.start)
+    return extra[start..start + usize.(list.len)]
+}
+
+// `import std.io as io2`. The path is a list of names.
+pub type Import (pub path: List, pub alias: ?Span, pub span: Span)
+
+// `@align(16)`. The arguments are integer or string literal expressions.
+pub type Attribute (pub name: Span, pub args: List)
+
+pub type Decl (pub attributes: List, pub public: bool, pub kind: DeclKind, pub span: Span)
+
+pub type DeclKind enum {
+    function(is_unsafe: bool, name: Span, params: List, result: ?TypeId, body: Block)
+    extern_fn(name: Span, params: List, variadic: bool, result: ?TypeId)
+    extern_var(mutable: bool, name: Span, ty: TypeId)
+    // `moves` is set for a `move type`.
+    type_decl(moves: bool, name: Span, def: TypeDef)
+    global(is_shared: bool, local: Local)
+}
+
+// How an argument is passed. `let_mode` is the default and is not written.
+pub type Mode enum {
+    let_mode
+    inout_mode
+    sink_mode
+}
+
+// A parameter, or a parameter of a function type, which has no name.
+// The name is none for `_`.
+pub type Param (pub name: ?Span, pub mode: Mode, pub ty: TypeId)
+
+pub type TypeDef enum {
+    plain(ty: TypeId)
+    enum_type(int_type: ?TypeId, variants: List)
+    union_type(fields: List)
+}
+
+pub type Variant enum {
+    // The payload is a tuple type.
+    named(name: Span, payload: ?TypeId, value: ?ExprId)
+    // A trailing `_`: the enum is open.
+    open(span: Span)
+}
+
+pub type Type (pub kind: TypeKind, pub span: Span)
+
+pub type TypeKind enum {
+    name(package: ?Span, name: Span)
+    tuple(fields: List)
+    view(elem: TypeId)
+    array(len: ExprId, elem: TypeId)
+    growable(elem: TypeId)
+    pointer(elem: TypeId)
+    optional(elem: TypeId)
+    result(value: ?TypeId, error: TypeId)
+    function(params: List, result: ?TypeId)
+}
+
+pub type Field (pub public: bool, pub name: Span, pub ty: TypeId)
+
+// `let` or `var` with its value.
+pub type Local (pub mutable: bool, pub binding: Binding, pub value: ExprId)
+
+pub type Binding enum {
+    // `x: T`, or `_: T` with no name.
+    single(name: ?Span, ty: TypeId)
+    // `(q: u32, r as rest: _)`: a list of destructuring fields.
+    destructure(fields: List)
+}
+
+// The rename is the name after `as`. The type is none for `_`, which
+// leaves the field unbound.
+pub type DestructField (pub field: Span, pub rename: ?Span, pub ty: ?TypeId)
+
+pub type Block (pub stmts: List, pub span: Span)
+
+pub type Stmt (pub kind: StmtKind, pub span: Span)
+
+pub type StmtKind enum {
+    local(local: Local)
+    return_stmt(value: ?ExprId)
+    if_stmt(cond: ExprId, then: Block, otherwise: ?Else)
+    match_stmt(value: ExprId, arms: List)
+    for_stmt(kind: ForKind, body: Block)
+    break_stmt
+    continue_stmt
+    // The value is a call.
+    defer_stmt(call: ExprId)
+    unsafe_stmt(body: Block)
+    lock_stmt(globals: List, body: Block)
+    assign(left: ExprId, op: AssignOp, right: ExprId)
+    // A call, or `try` applied to an expression.
+    expr(value: ExprId)
+}
+
+pub type Else enum {
+    block(body: Block)
+    // An if statement.
+    if_stmt(stmt: StmtId)
+}
+
+// A match arm: a statement's arm has a block, an expression's a branch.
+pub type Arm (pub patterns: List, pub body: ArmBody)
+
+pub type ArmBody enum {
+    block(body: Block)
+    branch(value: ExprId)
+}
+
+pub type ForKind enum {
+    forever
+    while_loop(cond: ExprId)
+    for_in(mutable: bool, binding: Binding, iterable: Iterable)
+}
+
+pub type Iterable enum {
+    value(value: ExprId)
+    range(start: ExprId, end: ExprId)
+}
+
+// `rx` or `board.rx` in a `lock`.
+pub type GlobalName (pub package: ?Span, pub name: Span)
+
+pub type AssignOp enum {
+    set
+    add
+    sub
+    mul
+    div
+    rem
+    bit_and
+    bit_or
+    bit_xor
+    shl
+    shr
+}
+
+pub type Pattern (pub kind: PatternKind, pub span: Span)
+
+pub type PatternKind enum {
+    // `none`, or `some(value: u8)` with a list of destructuring fields. A
+    // bare name is always a variant.
+    variant(name: Span, payload: ?List)
+    // An integer, character or string literal expression.
+    literal(value: ExprId)
+    // `-1`: an integer literal expression, negated.
+    negative(value: ExprId)
+    discard
+}
+
+pub type Expr (pub kind: ExprKind, pub span: Span)
+
+pub type ExprKind enum {
+    name(name: Span)
+    int
+    float
+    char
+    str(parts: List)
+    paren(inner: ExprId)
+    tuple(items: List)
+    call(callee: ExprId, args: List)
+    field(value: ExprId, name: Span)
+    // `Point.(x: 1, y: 2)`. The value is a tuple or parenthesized
+    // expression.
+    construct(ty: ExprId, value: ExprId)
+    index(value: ExprId, index: Index)
+    deref(inner: ExprId)
+    unary(op: UnaryOp, operand: ExprId)
+    try_expr(operand: ExprId)
+    binary(op: BinaryOp, left: ExprId, right: ExprId)
+    if_expr(cond: ExprId, then: ExprId, otherwise: IfElse)
+    match_expr(value: ExprId, arms: List)
+    unsafe_expr(body: ExprId)
+    array(elems: List)
+}
+
+// One piece of a string literal, in source order.
+pub type StrPart enum {
+    // Literal text, with its escapes still written out.
+    text(span: Span)
+    interpolation(value: ExprId)
+}
+
+pub type IfElse enum {
+    // `else { x }`
+    branch(value: ExprId)
+    // `else if ...`: an if expression.
+    if_expr(value: ExprId)
+}
+
+pub type Arg (pub mode: Mode, pub value: ExprId)
+
+// `(name: value)` in a tuple literal.
+pub type TupleItem (pub name: Span, pub value: ExprId)
+
+pub type Index enum {
+    value(value: ExprId)
+    slice(start: ?ExprId, end: ?ExprId)
+    // A type argument that is not a plain name: `from_address[*u32]`.
+    ty(ty: TypeId)
+}
+
+pub type UnaryOp enum {
+    neg
+    not
+    bit_not
+    address_of
+}
+
+pub type BinaryOp enum {
+    or
+    and
+    eq
+    ne
+    lt
+    le
+    gt
+    ge
+    add
+    sub
+    mul
+    div
+    rem
+    bit_and
+    bit_or
+    bit_xor
+    shl
+    shr
+}
+
+// Operators of different groups do not mix without parentheses; see
+// DESIGN.md.
+pub type OpGroup enum {
+    or
+    and
+    comparison
+    additive
+    multiplicative
+    bit_and
+    bit_or
+    bit_xor
+    shift
+}
+
+pub fn op_text(op: BinaryOp) -> []u8 {
+    return match op {
+        or { "||" }
+        and { "&&" }
+        eq { "==" }
+        ne { "!=" }
+        lt { "<" }
+        le { "<=" }
+        gt { ">" }
+        ge { ">=" }
+        add { "+" }
+        sub { "-" }
+        mul { "*" }
+        div { "/" }
+        rem { "%" }
+        bit_and { "&" }
+        bit_or { "|" }
+        bit_xor { "^" }
+        shl { "<<" }
+        shr { ">>" }
+    }
+}
+
+pub fn op_group(op: BinaryOp) -> OpGroup {
+    return match op {
+        or { OpGroup.or }
+        and { OpGroup.and }
+        eq, ne, lt, le, gt, ge { OpGroup.comparison }
+        add, sub { OpGroup.additive }
+        mul, div, rem { OpGroup.multiplicative }
+        bit_and { OpGroup.bit_and }
+        bit_or { OpGroup.bit_or }
+        bit_xor { OpGroup.bit_xor }
+        shl, shr { OpGroup.shift }
+    }
+}
