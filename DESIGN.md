@@ -106,6 +106,7 @@ The running list. Each new keyword needs a reason.
 | `union` | untagged unions, for C interop |
 | `shared` | a global reachable from interrupt handlers or other contexts |
 | `lock` | the only place a `shared` global can be accessed |
+| `move` | `move type`: a type whose values move instead of copying |
 
 `true` and `false` are predeclared names, not keywords, as in Go.
 
@@ -1159,6 +1160,23 @@ which no code can observe.
 otherwise. Copying is written out (`try copy(alloc, a)`), so a reviewer
 sees every expensive copy.
 
+**Decided (2026-11-08):** `move type` marks a type whose values move
+instead of copying, for a resource the compiler cannot see, such as a
+file descriptor held in a `c.int`.
+
+```
+pub move type File (fd: c.int)
+```
+
+- A type that holds a `move type` or a `[..]T` moves too.
+- It is a keyword, not an attribute, because it changes which rules
+  apply, as `shared` does.
+- Rejected: an attribute (`@move`), which would break the rule that
+  attributes never change meaning, and moving every record by default
+  with `copy type` to opt out, as Rust does. Most small records, such as
+  points and handles, copy, and copying by default matches mutable
+  value semantics and C.
+
 Sources: Hylo (formerly Val) and Swift structs. Paper: Dimitri Racordon,
 Denys Shabalin, Daniel Zheng, Dave Abrahams and Brennan Saeta,
 "Implementation Strategies for Mutable Value Semantics", Journal of Object
@@ -1771,11 +1789,9 @@ Decided the same day:
 follow the decided rules where those reach, and fill gaps where they do
 not. The user agreed to each.
 
-- **What moves.** A type moves instead of copying when it holds a
-  `[..]T`, directly or through a record, tuple, array, enum payload,
-  optional or result. The compiler cannot tell that a record such as
-  `io.File` owns a descriptor, so such a record still copies (see Open
-  questions).
+- **What moves.** A `move type` moves, and so does a type that holds a
+  `[..]T` or a `move type`, directly or through a record, tuple, array,
+  enum payload, optional or result. `io.File` is a `move type`.
 - **A move takes a whole local.** Moving a moving type out of a field,
   element, pointer or global is an error; code destructures the record
   instead, or passes the whole record `sink`. A parameter passed
@@ -1867,10 +1883,6 @@ Not in the first version. `[T]` is reserved for type arguments.
   allocator's `free`, can be called without `unsafe`. One option is
   `unsafe fn(...)` as a type. The same gap lets code call a C function
   through a function value without `unsafe`.
-- How to mark a type as moving. `io.File` owns a descriptor but holds
-  only a `c.int`, so it copies, and nothing stops `close` on both
-  copies. The user agreed on 2026-11-08 that a marker is needed; its
-  form is open.
 
 Raised by the programs in `examples/` on 2026-11-08. They parse, but a
 checker would have to settle these. Dropping temporal safety settled

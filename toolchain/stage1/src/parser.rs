@@ -355,7 +355,14 @@ impl Parser<'_> {
                     _ => return self.fail("`fn`, `let` or `var` after `extern`"),
                 }
             }
-            K::Type => self.type_declaration()?,
+            K::Type => self.type_declaration(false)?,
+            K::Move => {
+                self.bump();
+                if self.peek() != K::Type {
+                    return self.fail("`type` after `move`");
+                }
+                self.type_declaration(true)?
+            }
             K::Let | K::Var => DeclKind::Global {
                 shared: false,
                 local: self.local()?,
@@ -480,7 +487,7 @@ impl Parser<'_> {
         Ok(Param { name, mode, ty })
     }
 
-    fn type_declaration(&mut self) -> P<DeclKind> {
+    fn type_declaration(&mut self, moves: bool) -> P<DeclKind> {
         self.bump();
         let name = self.name()?;
         let def = match self.peek() {
@@ -492,7 +499,7 @@ impl Parser<'_> {
             }
             _ => TypeDef::Type(self.ty()?),
         };
-        Ok(DeclKind::Type { name, def })
+        Ok(DeclKind::Type { moves, name, def })
     }
 
     fn enum_type(&mut self) -> P<TypeDef> {

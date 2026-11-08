@@ -642,3 +642,30 @@ let where: *u32 = &count
         ]
     );
 }
+
+#[test]
+fn move_types() {
+    let source = "move type Handle (id: u32)
+
+type Holder (handle: Handle, count: u32)
+
+fn close(_: sink Handle) {
+}
+
+fn f() {
+    let a: Handle = Handle.(id: 1)
+    let b: Handle = a
+    close(sink a)
+    let held: Holder = Holder.(handle: b, count: 0)
+    let _: Holder = held
+    let _: u32 = held.count
+}
+";
+    assert_eq!(
+        one("move_types", source),
+        [
+            "`a` is used after it was moved on line 10",
+            "`held` is used after it was moved on line 13",
+        ]
+    );
+}

@@ -1,5 +1,5 @@
-//! Moves. A value passed `sink` cannot be used afterward, and a type that
-//! holds a `[..]T` moves instead of copying.
+//! Moves. A value passed `sink` cannot be used afterward, and a `move
+//! type`, or a type that holds one or a `[..]T`, moves instead of copying.
 //!
 //! The check follows each function's control flow. It records the locals
 //! moved on the way to each point; branches join by taking every local
@@ -45,8 +45,8 @@ pub(super) fn join(paths: Vec<(Moved, bool)>, before: Moved) -> Moved {
 }
 
 impl<'a> Checker<'a> {
-    /// Whether values of `ty` move instead of copying: types that hold a
-    /// `[..]T`, which owns memory.
+    /// Whether values of `ty` move instead of copying: `move type`s, and
+    /// types that hold a `[..]T` or a `move type`.
     pub(super) fn move_only(&mut self, ty: TyId) -> bool {
         if let Some(&known) = self.move_only.get(&ty) {
             return known;
@@ -62,6 +62,10 @@ impl<'a> Checker<'a> {
             Ty::Tuple(fields) => fields.iter().map(|(_, t)| *t).collect(),
             Ty::Array(_, elem) | Ty::Optional(elem) => vec![*elem],
             Ty::Result(value, error) => value.iter().copied().chain([*error]).collect(),
+            Ty::Named(NamedId::Decl(decl)) if self.declared_moving(*decl) => {
+                self.move_only.insert(ty, true);
+                return true;
+            }
             Ty::Named(NamedId::Decl(_)) => match self.named_info(ty).map(|i| &i.def) {
                 Some(NamedDef::Plain { underlying, .. }) => vec![*underlying],
                 Some(NamedDef::Enum(info)) => {
@@ -74,6 +78,13 @@ impl<'a> Checker<'a> {
         let result = parts.into_iter().any(|t| self.move_only(t));
         self.move_only.insert(ty, result);
         result
+    }
+
+    fn declared_moving(&self, decl: crate::resolve::DeclRef) -> bool {
+        matches!(
+            self.program.file(decl.file).ast.decls[decl.index].kind,
+            crate::ast::DeclKind::Type { moves: true, .. }
+        )
     }
 
     /// `e` is used where its value is kept: bound, returned, assigned,

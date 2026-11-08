@@ -441,3 +441,31 @@ fn report(s: []u8, t: []u8) -> []u8 {
                   (identifier)))))))
       (return_statement
         (identifier)))))
+
+================================================================================
+Move type
+================================================================================
+
+pub move type File (fd: i32)
+move type Pool enum {
+  empty
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_declaration
+    (visibility)
+    (moving)
+    (identifier)
+    (tuple_type
+      (tuple_type_field
+        (identifier)
+        (type_name
+          (identifier)))))
+  (type_declaration
+    (moving)
+    (identifier)
+    (enum_type
+      (variant
+        (identifier)))))

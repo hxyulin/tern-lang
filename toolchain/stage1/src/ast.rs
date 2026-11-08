@@ -117,6 +117,8 @@ pub enum DeclKind {
         ty: TypeId,
     },
     Type {
+        /// `move type`: values move instead of copying.
+        moves: bool,
         name: Name,
         def: TypeDef,
     },

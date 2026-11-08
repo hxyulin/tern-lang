@@ -23,7 +23,7 @@ pub fn describe(e: Error) -> []u8 {
     }
 }
 
-pub type File (fd: c.int)
+pub move type File (fd: c.int)
 
 let max_path: usize = 1024
 

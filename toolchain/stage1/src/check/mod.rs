@@ -279,7 +279,7 @@ impl<'a> Checker<'a> {
 
     fn named_decl(&mut self, decl: DeclRef) -> NamedInfo {
         let file = self.program.file(decl.file);
-        let DeclKind::Type { name, def } = &file.ast.decls[decl.index].kind else {
+        let DeclKind::Type { name, def, .. } = &file.ast.decls[decl.index].kind else {
             unreachable!("only type declarations are named types");
         };
         let package_path = &self.program.package(file.package).path;

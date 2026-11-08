@@ -66,6 +66,7 @@ module.exports = grammar({
       'union',
       'shared',
       'lock',
+      'move',
     ],
   },
 
@@ -205,10 +206,15 @@ module.exports = grammar({
       seq(
         attributes($),
         optional(field('visibility', $.visibility)),
+        optional(field('moving', $.moving)),
         'type',
         field('name', $.identifier),
         field('type', choice($._type, $.enum_type, $.union_type)),
       ),
+
+    // move type File (fd: c.int): values move instead of copying, like
+    // a type that holds a [..]T.
+    moving: (_) => 'move',
 
     // type Word union (bits: u32, value: f32). Reading a member is unsafe.
     union_type: ($) => seq('union', '(', commaSep1($.tuple_type_field), ')'),
