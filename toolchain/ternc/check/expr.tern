@@ -9,13 +9,6 @@ import syntax
 // finishes.
 fn check_expect(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, expected: TyId) -> TyId ! OutOfMemory {
     let actual: TyId = try check_value(input, inout c, inout fx, e, some.(value: expected))
-    let to_view: bool = match get(c.types, expected) {
-        view(elem: _) { true }
-        _ { false }
-    }
-    if to_view && is_array_or_growable(c, actual) {
-        try maps.put_int(inout fx.viewed, u32.(e), 1)
-    }
     try expect_ty(inout c, fx.file, expr_span(input, fx, e).start, actual, expected)
     if is_never(c.types, actual) {
         return ok.(value: actual)
@@ -309,7 +302,6 @@ fn expr_name(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, nam
                 }
                 decl(decl as d: maps.DeclRef) {
                     try use_decl(input, inout c, fx, e, d, name)
-                    try maybe_value_use(input, inout c, fx, e, d, name)
                     return decl_item(input, inout c, d, file_text(input, fx.file, name))
                 }
                 builtin(id as builtin_index: u32) {
@@ -637,7 +629,6 @@ fn field_access(input: Input, c: inout Checker, fx: inout Fx, e: syntax.ExprId, 
             match res {
                 decl(decl as d: maps.DeclRef) {
                     try use_decl(input, inout c, fx, e, d, expr_span(input, fx, e))
-                    try maybe_value_use(input, inout c, fx, e, d, expr_span(input, fx, e))
                     return decl_item(input, inout c, d, text)
                 }
                 _ {
@@ -1406,7 +1397,6 @@ fn call_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, callee: s
         }
     }
     try unsafe_callee(input, inout c, fx, callee)
-    try maps.put_int(inout fx.callees, u32.(callee), 1)
     match try check_expr(input, inout c, inout fx, callee, none) {
         builtin(id as builtin_index: u32) {
             let name: []u8 = resolve.builtin_name(builtin_index)
@@ -1423,11 +1413,6 @@ fn call_expr(input: Input, c: inout Checker, fx: inout Fx, start: u32, callee: s
             }
             match get(c.types, target) {
                 function(params: Range, result: ?TyId) {
-                    var values: [..]syntax.ExprId = make(c.alloc)
-                    for let i: usize in 0..list.len {
-                        try push(inout values, ast.args[usize.(list[i])].value)
-                    }
-                    try direct_call(input, inout c, fx, callee, values)
                     var ps: [..]FnParam = make(c.alloc)
                     try append(inout ps, fn_params(c.types, params))
                     var modes: [..]ArgMode = make(c.alloc)
@@ -1504,7 +1489,6 @@ fn argument(input: Input, c: inout Checker, fx: inout Fx, arg: syntax.Arg, mode:
             try report(inout c, fx.file, start, "expected `{want}`, found `{got}`")
         }
         try require_mutable(input, inout c, fx, arg.value, "pass `inout`")
-        try writes(input, inout c, fx, arg.value)
     } else {
         let _: TyId = try check_expect(input, inout c, inout fx, arg.value, param)
     }
@@ -1692,7 +1676,6 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
             try exclusive(input, inout c, fx, pair)
             let v: TyId = try check_value(input, inout c, inout fx, a, none)
             try require_mutable(input, inout c, fx, a, "pass `inout`")
-            try writes(input, inout c, fx, a)
             match get(c.types, v) {
                 growable(elem: TyId) {
                     if program.bytes_equal(name, "push") {
@@ -1716,7 +1699,6 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
         "pop", "clear" {
             let v: TyId = try check_value(input, inout c, inout fx, a, none)
             try require_mutable(input, inout c, fx, a, "pass `inout`")
-            try writes(input, inout c, fx, a)
             match get(c.types, v) {
                 growable(elem: TyId) {
                     if program.bytes_equal(name, "pop") {
@@ -1737,7 +1719,6 @@ fn builtin_call(input: Input, c: inout Checker, fx: inout Fx, start: u32, name: 
         "free", "take" {
             let v: TyId = try check_value(input, inout c, inout fx, a, none)
             try require_mutable(input, inout c, fx, a, "pass `inout`")
-            try writes(input, inout c, fx, a)
             let growable: bool = match get(c.types, v) {
                 growable(elem: _), error { true }
                 _ { false }

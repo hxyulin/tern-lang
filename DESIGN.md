@@ -5,6 +5,7 @@ marked:
 
 - **Decided**: agreed, change only with a reason.
 - **Leaning**: the current choice, not yet confirmed.
+- **Deferred**: designed, then set aside; kept as a starting point.
 - **Open**: needs a decision.
 
 ## Origin
@@ -41,15 +42,13 @@ Two observations about AI-assisted programming motivated a new language:
    most of the choices below.
 2. **Fast compilation.** Every function body can be checked from
    signatures alone, in parallel. No type checks cross function
-   boundaries; inferring which globals a function writes is a separate
-   pass over the call graph (2026-11-09, see
-   [Mutable globals](#mutable-globals)).
+   boundaries.
 3. **Systems level.** No garbage collector and no required runtime, so
    the language works for embedded targets and OS development.
 4. **Memory safety.** Indexing is bounds-checked, there is no null, and
-   pointer arithmetic is a built-in. Since 2026-11-09 the design also
-   makes safe code free of use after free and dangling views, without
-   lifetimes, and the compilers are being changed to match (see
+   pointer arithmetic is a built-in. Each buffer has one owner, so a
+   buffer cannot be freed twice through copies. Views are not checked
+   and can dangle; a check for that is deferred (see
    [Temporal safety](#temporal-safety-without-lifetimes)). Hardware
    access and other unchecked operations go in `unsafe` blocks.
 5. **One way to do each thing at the syntax level**, with no paradigm
@@ -997,9 +996,9 @@ names, makes the change visible through the parameter; this is defined
 behavior, as for `inout` under [Exclusivity](#exclusivity). The
 `borrow` run test covers each case.
 
-Rule 4 (2026-11-09) changes this once it is built: a callee that writes
-a global cannot take that global as an argument, so the copy for
-globals and the visible change through an alias both go away.
+Rule 4, deferred on 2026-11-09, would change this: a callee that writes
+a global could not take that global as an argument, so the copy for
+globals and the visible change through an alias would both go away.
 
 ### Untagged unions
 
@@ -1079,7 +1078,7 @@ fn next_byte() -> ?u8 {
   globals in a fixed order.
 - `lock` names globals only, not expressions.
 
-Checkable again since write sets are inferred (2026-11-09), and planned:
+Planned once write sets are inferred (rule 4, deferred):
 that an interrupt handler reaches only `shared` globals, and that a call
 inside `lock` does not reach another `lock`, which could deadlock. Both
 need every global a callee touches, which the inferred sets give once
@@ -1175,6 +1174,24 @@ code (goal 3). The model has these layers.
 
 ### Temporal safety without lifetimes
 
+**Revised (2026-11-09, later the same day): only rule 1 is checked.**
+Rules 2, 3 and 4 are deferred, and rule 5 stays as the meaning of
+`unsafe`. The user found the deferred rules hard to predict: the
+compiler rejected code for reasons the source did not show, such as a
+borrow made by an earlier call or a global written three calls away.
+The main goal of readability is a language that behaves as a reader
+expects, so for now views and `inout` are plain references, as in Zig
+and Odin. They are bounds-checked and never null, but a view can
+outlive what it points into, and a `let` alias of an owning value can
+read a buffer after `take` or `free` empties the original. Rule 1
+still gives each buffer one owner, so a deep `free` is well-defined
+and two copies cannot free one buffer twice.
+
+A verifier can no longer treat a safe function as a pure function of
+its inputs; that waits for a later memory model. The rules below are
+kept as its starting point. Commit `cce12bc` is the last version of
+both checkers with all of them built.
+
 **Decided (2026-11-09), replacing "temporal safety: not checked".** The
 user made mathematical verification a priority (see
 [Verification](#verification)), so safe code is now free of use after
@@ -1208,9 +1225,7 @@ needed a new kind of type. Rule 3 avoids that: whether a type holds a
 view is inferred, like whether it owns a buffer, and nothing is written
 for it.
 
-**Status.** Decided and being built in this order, in stage 1 and ternc
-together: rule 1, rule 4, rule 3, then rule 2. Until a rule is built,
-the program it would reject still compiles.
+**Status.**
 
 - **Rule 1: built (2026-11-09)** in both checkers, with `take` on
   records, tuples and optionals in both code generators. Not yet: a
@@ -1220,37 +1235,19 @@ the program it would reject still compiles.
   its state (see [Values and buffers](#values-and-buffers)), and made
   the code generator's enum shapes and signatures ranges into shared
   arrays instead of owning their own.
-- **Rule 4: built (2026-11-09)** in both checkers: write sets are
-  inferred, a call cannot pass a global its callee writes, and a
-  function that writes a global cannot be a function value. A call
-  through a function value writes nothing, by that rule. Not yet: the
-  `uses` clause on function types, so for now no function that writes
-  a global can be a value; `ternc` printing write sets; `noalias` on
-  `inout` parameters and dropping the copy of a `let` argument rooted
-  at a global; and the `shared` checks that need read sets.
-- **Rule 3: built (2026-11-09)** in both checkers: a `[..]T` element, a
-  `var` or `shared` global and a C global cannot hold a view. A
-  declared type can still hold a view, such as an iterator or
-  `fmt.Part`: rule 2 binds its values like any other view. Interpolation
-  takes a `[..]u8` as well as a `[]u8`, so messages are built as owned
-  text.
-- **Rule 2: built (2026-11-09)** in both checkers, which print the
-  same errors. Each function is checked alone after its body: borrows
-  start where a view is made from an array or growable array, by
-  coercion, slicing or a call, and a borrowed place cannot change
-  before the borrower's last use. A function that writes a borrowed
-  global cannot be called then, which is checked against the write
-  sets of rule 4. Known gaps, all on the side of rejecting:
-  - The check does not follow control flow: a borrow made by a
-    reassignment counts from there until the borrower's last use, even
+- **Rules 2, 3 and 4: built, then removed (2026-11-09).** Both checkers
+  had all three, with the same errors. ternc's code still follows
+  them: messages are owned `[..]u8` text, names are spans or interned
+  numbers, and helpers such as `show` and `fields_of` return owned
+  copies. That code is valid either way and was kept. Interpolation
+  still takes a `[..]u8` as well as a `[]u8`. Gaps found while building
+  rule 2, all on the side of rejecting safe code:
+  - The check did not follow control flow: a borrow made by a
+    reassignment counted from there until the borrower's last use, even
     on paths that never reach it.
-  - A change followed by `return` inside a loop is treated as if it
+  - A change followed by `return` inside a loop was treated as if it
     reached the next iteration.
-  - A call's result borrows every candidate argument, as above.
-
-  Bringing ternc under the rule made helpers such as `show`,
-  `record_fields` and `fields_of` return owned copies, and some loops
-  read shared arrays by index instead of through a view.
+  - A call's result borrowed every candidate argument.
 
 ### Bounds checks, no null, no pointer arithmetic
 
@@ -1378,7 +1375,7 @@ Rejected:
 **Decided.** A reference parameter is a way to pass a parameter, not a
 type. It cannot be stored in a variable or a field, or returned. It
 always points into a caller's frame and ends when the call returns.
-Views, below, are the storable kind of reference; rule 2 checks them.
+Views, below, are the storable kind of reference, and are not checked.
 
 Parameter modes:
 
@@ -1406,8 +1403,9 @@ Values for Fun and (Co-)Effect", OOPSLA 2016, pages 234 to 251,
 doi:10.1145/2983990.2984009. Checked on 2026-11-08 against the SPLASH 2016
 program and researchr.
 
-**Decided (2026-11-09): a function can return a reference derived from
-its parameters** (rule 2). A function whose result holds a view, such
+**Deferred (2026-11-09): a function can return a reference derived from
+its parameters** (rule 2). Until a later memory model, a function can
+return any view. A function whose result holds a view, such
 as `fn trim(s: []u8) -> []u8`, returns something that points into its
 arguments, never into its own frame. The checker enforces both sides
 within one function:
@@ -1452,7 +1450,8 @@ swap(inout v[i], inout v[j])    // error: i != j is not provable
 Built-ins such as `swap_at(inout v, i, j)` cover the indexed case. From
 Swift's Law of Exclusivity (Swift Evolution proposal SE-0176).
 
-**Decided (2026-11-09): nothing aliases an `inout` argument** (rule 4).
+**Deferred (2026-11-09): nothing aliases an `inout` argument** (rule 4).
+While it is deferred, the decision of 2026-11-08 above stands.
 An argument rooted at a global cannot be passed `inout`, or as a `let`
 reference, to a function that writes that global, which the compiler
 knows from the inferred write sets (see
@@ -1472,11 +1471,11 @@ global needed.
 **Decided.** Slices are a built-in view type, `[]T`. Text is `[]u8`. A
 view is a pointer and a length into memory owned by something else.
 
-**Decided (2026-11-09): a view is a local, a parameter or a result**
-(rule 3). A type that holds a view, a named tuple or a declared type,
-is bound by the same rule, so a function can still return
-`(head: []u8, tail: []u8)` and an iterator can still be
-`type Lines (rest: []u8)`. No such value can be a `[..]T` element or a
+**Deferred (2026-11-09): a view is a local, a parameter or a result**
+(rule 3). For now a view can be stored anywhere. A type that holds a
+view, a named tuple or a declared type, is bound by the same rule, so a
+function can still return `(head: []u8, tail: []u8)` and an iterator
+can still be `type Lines (rest: []u8)`. No such value can be a `[..]T` element or a
 `var` global, which outlive every frame, so every view lives in a
 frame where rule 2 follows what it borrows. A `let` global can be a
 view of static data, such as a string literal, since that memory never
@@ -1696,7 +1695,7 @@ let mask: u32 = 1 << 5
 - A global reachable from an interrupt handler is declared `shared` and
   accessed inside `lock`. See [Concurrency](#concurrency).
 
-**Decided (2026-11-09): the compiler infers which globals each function
+**Deferred (2026-11-09): the compiler infers which globals each function
 writes** (rule 4). Nobody writes the list.
 
 - The write set of a function is the `var` globals it assigns, takes,
@@ -1820,8 +1819,8 @@ Jai's. `[..]u8` is the owned string; there is no separate `String`.
   the caller owns it. `clear(inout v)` frees what the elements own,
   sets the length to 0 and keeps the memory (deep since 2026-11-09).
   Added on 2026-11-08 for the lexer's stack.
-- `push` can move the elements. A view of them is a borrow of the
-  array, so the checker rejects a `push` while one is in use (rule 2).
+- `push` can move the elements, so a view taken before a `push` can
+  dangle. Rule 2, deferred, would reject that `push`.
 
 ### Formatting without a heap
 
@@ -1964,8 +1963,13 @@ ordinary code, with the language rules doing most of the work.
   allocators, each with a contract the proof assumes.
 - **Open:** the contract syntax (`requires`, `ensures`, loop
   invariants, ghost values), and whether to translate to Why3, Viper
-  or straight to an SMT solver. Rules 1 to 5 of
-  [Temporal safety](#temporal-safety-without-lifetimes) come first.
+  or straight to an SMT solver.
+- **Deferred with rules 2 to 4** of
+  [Temporal safety](#temporal-safety-without-lifetimes): the claim
+  above that each safe function is a function from values to values
+  needs them, since a stored view can dangle and a callee can write a
+  global its argument names. Verification waits for a later memory
+  model.
 
 ## Runtime
 

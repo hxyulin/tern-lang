@@ -7,9 +7,7 @@
 //
 // The same pass checks the local safety rules: `unsafe`, `shared`
 // globals, exclusivity, the `Format` rule and constant initializers (in
-// rules.tern). It also records which globals each function writes, which
-// a last step closes over the call graph and checks (in effects.tern).
-// Expressions are in expr.tern.
+// rules.tern). Expressions are in expr.tern.
 
 import maps
 import program
@@ -66,18 +64,6 @@ type Checker (
     files: [..]FileTypes,
     // Which types hold a `[..]T`, as 1 or 0; see owning.
     owning: maps.IntMap,
-    // Which types hold a view, as 1 or 0; see holds_view.
-    views: maps.IntMap,
-    // Each written `[..]T`, checked once every type is known.
-    growables: [..]GrowableUse,
-    // What each function writes and calls directly, and the functions used
-    // as values; see effects.tern.
-    direct_writes: [..]DirectWrite,
-    call_sites: [..]CallSite,
-    call_args: [..]GlobalArg,
-    values: [..]ValueUse,
-    // Calls made while a local borrows a global; see borrow.tern.
-    global_loans: [..]GlobalLoan,
 )
 
 // A local: its type, whether it can change, and whether it holds its own
@@ -111,13 +97,6 @@ type Fx (
     // While checking a `defer`'s call: the locals it mentions.
     collecting: bool,
     mentioned: [..]u32,
-    // The function being checked, and the callees of its calls, by
-    // expression.
-    decl: ?maps.DeclRef,
-    callees: maps.IntMap,
-    // Arrays and growable arrays used where a view is expected, by
-    // expression: each lends its storage to the view.
-    viewed: maps.IntMap,
 )
 
 // Which arms a `match` has covered.
@@ -136,13 +115,6 @@ pub fn check(alloc: Allocator, p: inout program.Program, names: inout resolve.Re
         messages: make(alloc),
         files: make(alloc),
         owning: maps.new_ints(alloc),
-        views: maps.new_ints(alloc),
-        growables: make(alloc),
-        direct_writes: make(alloc),
-        call_sites: make(alloc),
-        call_args: make(alloc),
-        values: make(alloc),
-        global_loans: make(alloc),
     )
     for let _: usize in 0..c.types.decl_infos.len {
         try push(inout c.fn_tys, none)
@@ -164,8 +136,6 @@ pub fn check(alloc: Allocator, p: inout program.Program, names: inout resolve.Re
             try check_decl(input, inout c, d, decls[index].kind)
         }
     }
-    try no_views_in_growables(input, inout c)
-    try check_effects(input, inout c)
     // Stable: problems at one place keep the order they were found.
     let sorted: [..]Found = try sort_found(alloc, c.found)
     var diagnostics: [..]program.Diagnostic = make(alloc)
@@ -263,22 +233,8 @@ fn decl_of(input: Input, decl: maps.DeclRef) -> syntax.Decl {
 // Types.
 
 fn lower(input: Input, c: inout Checker, file: u32, id: syntax.TypeId) -> TyId ! OutOfMemory {
-    let first: bool = match c.files[usize.(file)].types[usize.(id)] {
-        some(value: _) { false }
-        none { true }
-    }
     let ty: TyId = try lower_type(input, inout c, file, id)
     c.files[usize.(file)].types[usize.(id)] = some.(value: ty)
-    if first {
-        match get(c.types, ty) {
-            growable(elem: TyId) {
-                let start: u32 = input.program.files[usize.(file)].ast.types[usize.(id)].span.start
-                try push(inout c.growables, GrowableUse.(file: file, start: start, elem: elem))
-            }
-            _ {
-            }
-        }
-    }
     return ok.(value: ty)
 }
 
@@ -1107,9 +1063,6 @@ fn new_fx(c: Checker, file: u32) -> Fx {
         defers: make(c.alloc),
         collecting: false,
         mentioned: make(c.alloc),
-        decl: none,
-        callees: maps.new_ints(c.alloc),
-        viewed: maps.new_ints(c.alloc),
     )
 }
 
@@ -1119,7 +1072,6 @@ fn check_decl(input: Input, c: inout Checker, decl: maps.DeclRef, kind: syntax.D
     let ast: syntax.Ast = input.program.files[usize.(fx.file)].ast
     match kind {
         function(is_unsafe: _, name: syntax.Span, params: syntax.List, result: ?syntax.TypeId, body: syntax.Block) {
-            fx.decl = some.(value: decl)
             let _: TyId = try decl_fn_ty(input, inout c, decl)
             fx.result = try lower_opt(input, inout c, file, result)
             match result {
@@ -1148,7 +1100,6 @@ fn check_decl(input: Input, c: inout Checker, decl: maps.DeclRef, kind: syntax.D
                 }
             }
             let diverges: bool = try check_block(input, inout c, inout fx, body)
-            try check_borrows(input, inout c, fx, params, body)
             match fx.result {
                 some(value as r: TyId) {
                     if !diverges {
@@ -1211,20 +1162,16 @@ fn check_decl(input: Input, c: inout Checker, decl: maps.DeclRef, kind: syntax.D
         extern_var(mutable: _, name: _, ty as t: syntax.TypeId) {
             let ty: TyId = try lower(input, inout c, file, t)
             try no_format(input, inout c, file, ast.types[usize.(t)].span.start, ty)
-            try no_view(input, inout c, file, ast.types[usize.(t)].span.start, ty, "a C global")
         }
         type_decl(name: _, def: syntax.TypeDef) {
             let ty: TyId = try named_type(input, inout c, NamedId.decl.(decl: decl))
             try no_format_in_type(input, inout c, file, def, ty)
         }
-        global(is_shared: bool, local: syntax.Local) {
+        global(is_shared: _, local: syntax.Local) {
             match local.binding {
                 single(name: _, ty as t: syntax.TypeId) {
                     let ty: TyId = try lower(input, inout c, file, t)
                     try no_format(input, inout c, file, ast.types[usize.(t)].span.start, ty)
-                    if local.mutable || is_shared {
-                        try no_view(input, inout c, file, ast.types[usize.(t)].span.start, ty, "a `var` global")
-                    }
                     let _: TyId = try check_expect(input, inout c, inout fx, local.value, ty)
                 }
                 destructure(fields: syntax.List) {
@@ -1664,7 +1611,6 @@ fn assign_stmt(input: Input, c: inout Checker, fx: inout Fx, left: syntax.ExprId
         try mark(inout fx.written, u32.(e), -1)
     }
     try require_mutable(input, inout c, fx, left, "assign to")
-    try writes(input, inout c, fx, left)
     if op == syntax.AssignOp.set {
         let _: TyId = try check_expect(input, inout c, inout fx, right, ty)
         try fresh(input, inout c, inout fx, right, ty)

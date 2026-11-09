@@ -117,7 +117,7 @@ impl Checker<'_> {
     }
 
     /// The storage a place expression names, as a root and steps.
-    pub(super) fn access_path(&self, fx: &Fx, e: ExprId) -> Option<(Root, Vec<Step>)> {
+    fn access_path(&self, fx: &Fx, e: ExprId) -> Option<(Root, Vec<Step>)> {
         let res = self.names.files[fx.file.0 as usize].exprs[e.index()];
         match &fx.ast.expr(e).kind {
             ExprKind::Paren(inner) => self.access_path(fx, *inner),
@@ -389,69 +389,6 @@ impl Checker<'_> {
         }
     }
 
-    // Views are not stored (rule 3).
-
-    /// Whether a value of `ty` holds a view. Such a value is a local, a
-    /// parameter or a result, where rule 2 follows what it borrows. A
-    /// pointer and a function value hold none that the checker follows.
-    pub(super) fn holds_view(&mut self, ty: TyId) -> bool {
-        if let Some(&known) = self.views.get(&ty) {
-            return known;
-        }
-        // A type that holds itself does so through a `[..]T` or a
-        // pointer, which never hold a view.
-        self.views.insert(ty, false);
-        let parts: Vec<TyId> = match self.types.get(ty).clone() {
-            Ty::View(_)
-            | Ty::Named(NamedId::Builtin(BuiltinNamed::Format | BuiltinNamed::PanicInfo)) => {
-                self.views.insert(ty, true);
-                return true;
-            }
-            Ty::Tuple(fields) => fields.iter().map(|(_, t)| *t).collect(),
-            Ty::Array(_, elem) | Ty::Optional(elem) => vec![elem],
-            Ty::Result(value, error) => value.into_iter().chain([error]).collect(),
-            Ty::Named(_) => match self.named_info(ty).map(|i| &i.def) {
-                Some(NamedDef::Plain { underlying, .. }) => vec![*underlying],
-                Some(NamedDef::Enum(info)) => {
-                    info.variants.iter().filter_map(|v| v.payload).collect()
-                }
-                Some(NamedDef::Union(fields)) => fields.iter().map(|(_, t)| *t).collect(),
-                None => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
-        let holds = parts.into_iter().any(|t| self.holds_view(t));
-        self.views.insert(ty, holds);
-        holds
-    }
-
-    /// `ty` is the type of `place`, which outlives every frame: a
-    /// `[..]T` element or a `var` global. A `Format` is reported by the
-    /// `Format` rule instead.
-    pub(super) fn no_view(&mut self, file: FileId, span: Span, ty: TyId, place: &str) {
-        if self.types.is_error(ty) || self.holds_format(ty) || !self.holds_view(ty) {
-            return;
-        }
-        let shown = self.show(ty);
-        let message = if matches!(self.types.get(ty), Ty::View(_)) {
-            format!(
-                "{place} cannot be a view: it can outlive what `{shown}` points into, so store owned values or indexes"
-            )
-        } else {
-            format!(
-                "{place} cannot hold a view, and `{shown}` holds one: it can outlive what the view points into, so store owned values or indexes"
-            )
-        };
-        self.error(file, span, message);
-    }
-
-    /// Every written `[..]T`, once every type is known.
-    pub(super) fn no_views_in_growables(&mut self) {
-        for (file, span, elem) in std::mem::take(&mut self.growables) {
-            self.no_view(file, span, elem, "a `[..]T` element");
-        }
-    }
-
     // Constant initializers.
 
     /// A global's initializer is computed before the program runs, so it
@@ -540,7 +477,7 @@ impl Checker<'_> {
 /// Whether two access paths can name the same storage: the same root, and
 /// no step where they go to different fields or different constant
 /// indexes.
-pub(super) fn overlaps(a: &(Root, Vec<Step>), b: &(Root, Vec<Step>)) -> bool {
+fn overlaps(a: &(Root, Vec<Step>), b: &(Root, Vec<Step>)) -> bool {
     if a.0 != b.0 {
         return false;
     }
